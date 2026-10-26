@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Specification revision 0.2.0 builds out every capability revision 0.1.0 deferred: multiple
+outputs and `count`, the `upscale` task with the `esrgan` family, loader capabilities and the
+offline `convert` subcommand, automatic settings with authorized fallbacks, device identity,
+network mode over mutual TLS, image-to-video, text-to-audio, targeted optimization gates and the
+owned native engine behind a protocol conformance suite. `docs/implementation-plan.md` orders them
+into releases 0.4.0 through 1.0.0 with protocol minors 1.2 and 1.3. No code changed.
+
 ## 0.3.0 — 2026-10-26
 
 LoRA adapters as a separately advertised capability (`capabilities.adapters`). A load request may
