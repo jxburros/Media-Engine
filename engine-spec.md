@@ -62,6 +62,12 @@ It MUST NOT choose a different model, compose application prompts, route tasks, 
 
 A standalone caller may operate the public engine API directly, but it then owns durable job recording and output collection. The worker provides execution handles, not a permanent media library.
 
+## Dependency policy
+
+The worker relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (TLS, GPU kernels and tensor execution, deflate, video codecs), is pinned by checksum, and is isolated in one module so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification; a dependency without a ledger entry is a defect.
+
+The reference backend is the deliberate exception: it exists to be a thick Diffusers and PyTorch oracle, so its dependency list is the point. The owned pipeline and the native engine are where the policy bites, and each ownership stage MUST remove dependencies, never add them, unless the ledger records why. No external service is used at any stage: no telemetry, no downloads, no registries, no encoder executables found on `PATH`.
+
 ## Model bundles
 
 The initial loader accepts a complete local Diffusers-format bundle for the supported pipeline. A file ending in `.safetensors` is not sufficient evidence of compatibility. Other architectures, quantizations and single-file conversions require explicit loader capabilities.
@@ -267,11 +273,12 @@ Upscaling is deterministic for a given bundle and precision up to backend floati
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Inputs     | `image`; width/height MUST equal the input and fall within the family's advertised sizes (the reference bundle trains at 1024×576)                    |
 | Parameters | `seed`, `steps`, `frames` (bundle default), `fps`, `motion` (motion bucket 1–255), `noise_augmentation` (0–1), `decode_chunk` (frames per VAE decode) |
-| Outputs    | `video` as `video/mp4` (H.264, yuv420p, constant frame rate at `fps`) and `poster` as the first frame in PNG                                           |
-| Stages     | `encoding` (image conditioning), `sampling` with step progress, `decoding` with per-chunk progress, `encoding_container`, `saving`                     |
-| Encoder    | A pinned PyAV wheel in the `inference-video` extra; the worker never searches `PATH` for an ffmpeg executable                                          |
+| Outputs    | `frames` as `application/zip` (one lossless PNG per frame, `000001.png` …, plus `frames.json` with `fps`, `width`, `height`, `frames`) and `poster` as the first frame in PNG |
+| Optional   | `video` as `video/mp4` (H.264, yuv420p, constant frame rate at `fps`) only when the worker advertises it in `output_formats`; requires the optional pinned encoder extra |
+| Stages     | `encoding` (image conditioning), `sampling` with step progress, `decoding` with per-chunk progress, `packaging`, `saving`                              |
+| Encoder    | The baseline needs none: PNG and ZIP come from the standard library. An MP4 encoder is never searched for on `PATH` and never required                 |
 
-Frame count and frame rate are explicit parameters recorded in the output record and run metadata. The worker MUST NOT drop frames, re-time or re-encode at a different rate to fit a size limit; an oversized result is `storage_full` or a validation failure, decided before sampling from the advertised per-frame estimate.
+Frame count and frame rate are explicit parameters recorded in the output record, in `frames.json` and in run metadata, so a caller or the runtime can encode any container later without re-running inference. The worker MUST NOT drop frames, re-time or re-encode at a different rate to fit a size limit; an oversized result is `storage_full` or a validation failure, decided before sampling from the advertised per-frame estimate.
 
 ### Text-to-audio
 
@@ -294,7 +301,7 @@ The reference worker exposes only options it can apply. Diffusers defaults are m
 
 Pin the Python version, Diffusers/PyTorch builds, CUDA requirements and supporting libraries per supported platform. Package environments independently from Studio and the runtime. Source revision, package checksums and dependency identity travel with releases. Backend license terms and model-weight licenses remain distinct.
 
-Additional media families add optional extras (`inference-video`, `inference-audio`) rather than enlarging the base inference environment. A worker whose extras are absent still serves the protocol and reports the missing dependency per task in `capabilities.missing_dependencies`; the task is then not advertised.
+Additional media families add optional extras (`inference-audio` where the family needs more than PyTorch; `inference-video` only for the optional MP4 output) rather than enlarging the base inference environment. The owned pipeline writes PNG, ZIP and WAV with the standard library and loads safetensors directly, so it needs neither an image library nor the loading helpers the reference backend uses. A worker whose extras are absent still serves the protocol and reports the missing dependency per task in `capabilities.missing_dependencies`; the task is then not advertised.
 
 ## Progressive inference ownership
 
@@ -315,7 +322,7 @@ Before any backend beyond the two delivered ones is advertised, the engine repos
 
 ### Owned native engine
 
-The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. The recommended implementation is Rust on the candle tensor library with custom CUDA kernels through cudarc where the optimization stage needs them; the decision is recorded when work starts. Go is not a candidate for the engine because GPU kernels cannot be written in it, and the control plane that suits Go is Media Runtime. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
+The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. Its dependency ledger is short by design: tensor execution and GPU kernels (candle and cudarc), TLS (rustls) and deflate for PNG. The HTTP/1.1 and SSE server, the CLIP tokenizer, the WAV and ZIP writers and all validation are owned code, as they are in the Python worker's standard-library server. The recommended implementation is Rust on the candle tensor library with custom CUDA kernels through cudarc where the optimization stage needs them; the decision is recorded when work starts. Go is not a candidate for the engine because GPU kernels cannot be written in it, and the control plane that suits Go is Media Runtime. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
 
 ### Targeted optimization
 
@@ -329,6 +336,6 @@ The supervisor interacts through public startup, discovery and HTTP behavior. It
 
 ## Decisions and next steps
 
-The delivered reference target is one SDXL base bundle on Linux x64/NVIDIA; the recorded pins are in the repository's implementation decisions. Open decisions for the deferred stages, to be recorded when each starts: the exact upscaler, video and audio reference weights and their licenses; whether the MP4 encoder dependency is acceptable for the base extra or stays optional; confirmation of Rust for the native engine; the first optimization worth advertising; and the certificate tooling expected of operators in network mode.
+The delivered reference target is one SDXL base bundle on Linux x64/NVIDIA; the recorded pins are in the repository's implementation decisions. Open decisions for the deferred stages, to be recorded when each starts: the exact upscaler, video and audio reference weights and their licenses; whether an optional MP4 encoder extra is worth shipping at all given the lossless frame archive; confirmation of Rust for the native engine; the first optimization worth advertising; and the certificate tooling expected of operators in network mode.
 
 The next implementation step is protocol 1.2 in the Python worker: multiple outputs, the upscale task with the `esrgan` family and loader capabilities, the conversion subcommand, automatic settings with authorized fallbacks and device identity, together with the conformance suite that every later backend must pass. The [implementation plan](docs/implementation-plan.md) sequences the rest.

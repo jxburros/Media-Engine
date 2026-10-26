@@ -68,7 +68,7 @@ Build the suite first so every later change, and every later backend, is measure
 - Add `tests/test_conformance_fixture.py` that launches `tests/serve_fixture.py` and runs the
   suite against it, so the suite itself is tested in CI without hardware.
 - Document in `docs/protocol.md` that a backend is advertised only when the suite passes; record
-  the suite version in the compatibility record (E1.8).
+  the suite version in the compatibility record (E1.9).
 
 Acceptance: the suite passes against the fixture backend and, where hardware exists, against
 `diffusers-sdxl` and `owned-sdxl`; each later phase adds its sections here before touching the
@@ -207,7 +207,26 @@ generation parameter; the unauthorized behavior is byte-for-byte the 0.3.0 behav
 - `server.py`: include it in `/v1/info` and the startup record (no private paths are involved).
 - Tests: shape and stability within a process; the fixture backend returns a deterministic value.
 
-### E1.8 Documentation, schema and release
+### E1.8 Owned-pipeline dependency trim
+
+The dependency policy in the spec says each ownership stage removes dependencies. Apply it to
+the owned pipeline now, before new families are added on top of it.
+
+- New `src/media_engine/png.py`: a PNG writer (8-bit RGB, `zlib` and `struct` from the standard
+  library, filter type 0) and the existing signature reader; the owned pipeline and the upscale
+  path write outputs through it. The reference backend may keep Pillow for its own decoding.
+- `pipeline.py`: load component weights with `safetensors` directly into the installed model
+  classes (no `accelerate` loading helpers); `peft` is not imported on the owned path (it already
+  merges LoRA itself).
+- `pyproject.toml`: split extras so `inference-owned` pins torch, diffusers (model classes
+  only), transformers, safetensors and numpy, while `inference` keeps the full reference set.
+  `capabilities.dependencies` reports what is actually importable per backend.
+- Tests: the owned CPU inference test runs with only `inference-owned` installed and its PNG is
+  byte-identical to the previous Pillow-written output for the same tensor.
+- Add `docs/decisions.md` with the dependency ledger (every pinned package, which backend needs
+  it, why it is not owned code) and keep it current in every release.
+
+### E1.9 Documentation, schema and release
 
 - `docs/protocol.md`: add a "What changed in 1.2" table and sections for multi-output, loaders,
   upscale, conversion provenance, auto/fallbacks and device identity, mirroring the 1.1 section.
@@ -247,9 +266,9 @@ HTTP, and no code path serves plain HTTP on a non-loopback address.
 
 ## Phase E3 — Engine 0.6.0, protocol 1.3, image-to-video
 
-- `pyproject.toml`: extra `inference-video = ["av==<pinned>"]` (PyAV wheels bundle FFmpeg; no
-  PATH lookup). `backend.py` `missing_dependencies()` reports `av` per task so `image-to-video`
-  is simply absent from `tasks` when the extra is missing.
+- No new dependency for the baseline: frames are written as PNGs through `png.py` and packed
+  with the standard library `zipfile` (stored, not deflated again). `backend.py`
+  `missing_dependencies()` reports only the family's model classes for this task.
 - `contracts.py`: family `svd` (roles `unet` → `UNetSpatioTemporalConditionModel`, `vae` →
   `AutoencoderKLTemporalDecoder`, `image_encoder` → `CLIPVisionModelWithProjection`,
   `feature_extractor` → `CLIPImageProcessor`, `scheduler` → `EulerDiscreteScheduler`), format
@@ -257,27 +276,32 @@ HTTP, and no code path serves plain HTTP on a non-loopback address.
   `frames` (bundle default from `unet` config, 1–64), `fps` (1–30, default 7), `motion` (1–255,
   default 127), `noise_augmentation` (0–1, default 0.02), `decode_chunk` (1–16, default 8);
   width/height equal the input and must be in `LIMITS["video_sizes"]` advertised from the bundle
-  (reference 1024×576 and 576×1024). `OUTPUTS["image-to-video"] = ["video", "poster"]`.
+  (reference 1024×576 and 576×1024). `OUTPUTS["image-to-video"] = ["frames", "poster"]`; `video` is appended only when the
+  optional encoder is importable and is then listed in `output_formats`.
 - `backend.py` `DiffusersBackend`: load `StableVideoDiffusionPipeline` from the verified
   components; `generate()` emits `encoding` (image conditioning), `sampling` with step callback,
-  `decoding` with per-chunk progress (`unit:"frames"`), `encoding_container` while PyAV writes
-  H.264/yuv420p at `fps` with constant frame rate to a temporary file, then `saving`; the poster
+  `decoding` with per-chunk progress (`unit:"frames"`), `packaging` while frames are written
+  and zipped with `frames.json` (`fps`, `width`, `height`, `frames`), then `saving`; the poster
   PNG is frame 0. The output record carries `frames`, `fps`, `duration_seconds`, `width`,
   `height`. Memory estimate adds the per-frame latent term with its basis.
-- New `src/media_engine/video.py`: the MP4 writer and a signature check used by tests
-  (`ftyp` box). Cancellation is checked per step, per decode chunk and before container encoding.
+- New `src/media_engine/video.py`: the frame archive writer and its reader used by tests.
+  Cancellation is checked per step, per decode chunk and before packaging.
+- Optional, decided separately and not part of 0.6.0's acceptance: an `inference-video` extra
+  with one pinned encoder wheel adding `video` (`video/mp4`, H.264, yuv420p) as an advertised
+  output format. It is built only if the frame archive proves insufficient for real callers,
+  and it is a ledger entry with its own justification.
 - `pipeline.py`: the owned pipeline does not serve `svd` in 0.6.0; `capabilities.loaders` lists
   `svd` only for `diffusers-sdxl`, and a request to the owned backend is `unsupported`. Owned
   `svd` is a later optimization-stage item once the reference path is validated on hardware.
 - Tests: `tests/fixture.py` gains `make_svd_bundle()` with tiny random weights and the fixture
-  backend produces a two-frame MP4 through `video.py`; `tests/test_inference.py` runs a real CPU
-  `image-to-video` at 64×64, 2 frames, 2 steps and validates the container, frame count and
-  poster; `test_worker.py` covers validation and 1.2-caller refusal.
+  backend produces a two-frame archive through `video.py`; `tests/test_inference.py` runs a real
+  CPU `image-to-video` at 64×64, 2 frames, 2 steps and validates the archive, `frames.json`,
+  frame count and poster; `test_worker.py` covers validation and 1.2-caller refusal.
 - Docs: protocol 1.3 section, README (video extra, reference bundle, license), compatibility row,
   decisions entry recording the reference weights.
 
-Acceptance: a video execution produces a playable MP4 and poster with correct metadata; a worker
-without the extra does not advertise the task; 1.2 callers are unaffected.
+Acceptance: a video execution produces a lossless frame archive and poster with correct
+metadata and no dependency beyond the base inference extra; 1.2 callers are unaffected.
 
 ## Phase E4 — Engine 0.7.0, protocol 1.3, text-to-audio
 
@@ -325,9 +349,13 @@ Acceptance: every advertised optimization has a cited benchmark; none is applied
 
 - Decision record: confirm Rust on candle (recommended; C++ on ggml is the fallback if candle's
   CUDA coverage proves insufficient on the reference hardware), the tensor/GPU libraries
-  retained (candle, cudarc for custom kernels, the `tokenizers` crate, rustls, axum or hyper for
-  HTTP and SSE, `image`/`png`/`hound` for output formats), and the build/release identity scheme; record it in `docs/decisions.md` (add that
-  file to this repository, mirroring Runtime's).
+  retained (candle, cudarc for custom kernels, rustls for TLS, `png` for deflate-backed PNG
+  output) and the code that is owned instead of depended on (the HTTP/1.1 and SSE server, as the
+  Python worker already owns it on the standard library; the CLIP BPE tokenizer; WAV and ZIP
+  writers; validation), and the build/release identity scheme; record it in `docs/decisions.md`
+  with a ledger entry per crate. The T5 tokenizer for the audio family is the one place a
+  `tokenizers` crate is justified, and audio on the native engine waits until that entry is
+  accepted.
 - Repository layout: `native/` with its own build, producing `media-engine-native`, sharing
   `schemas/worker.schema.json` and the catalog/bundle formats. It implements the launch contract
   (`--probe`, startup record, `--catalog`, `--directory`, inherited credential, `--port 0`,
@@ -347,6 +375,9 @@ native worker unchanged.
 
 ## Cross-cutting work
 
+- **Dependency ledger.** `docs/decisions.md` lists every pinned package and crate with the
+  backend that needs it and why it is not owned code. A release that adds a dependency without a
+  ledger entry fails review; each ownership stage is expected to shorten the list.
 - **Fixture backend parity.** Runtime's integration tests launch `tests/serve_fixture.py`. Every
   phase extends `TestBackend` (and the fixture bundle builders) in the same change so Runtime can
   test against the new protocol surface without hardware. Fixture outputs stay identified in
@@ -372,7 +403,7 @@ native worker unchanged.
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | Single-file conversion coverage        | Diffusers' key mapping covers SDXL base variants but not every fine-tune layout                       | Fail on unmapped keys with names; no partial bundles             |
 | Upscaler weights                       | Real-ESRGAN releases are `.pth`; operators must convert                                               | Document; worker refuses anything but safetensors                |
-| PyAV dependency size                   | Adds a large wheel to the environment                                                                 | Separate `inference-video` extra; task absent without it         |
+| MP4 output demand                      | Callers may expect a container rather than a frame archive                                           | Optional encoder extra, decided on evidence; archive is lossless |
 | Audio reference weights and license    | Candidate weights carry a community license                                                           | Record in decisions; operators supply weights                    |
 | TLS operator burden                    | Certificate generation and rotation are outside the worker                                            | Document minimal `openssl` commands; refuse ambiguous launches   |
 | Native engine scope                    | A full native SDXL implementation is large                                                            | Gate on the conformance suite; ship `sdxl-base` text-to-image first |
