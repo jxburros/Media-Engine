@@ -6,7 +6,7 @@ import unittest
 import urllib.request
 import urllib.error
 from pathlib import Path
-from fixture import TestBackend, make_bundle
+from fixture import TestBackend, make_bundle, make_png
 from media_engine.server import Worker, create_server
 from media_engine.contracts import PROTOCOL, WorkerError, DEFAULTS, bundle_path
 
@@ -133,6 +133,58 @@ class WorkerTests(unittest.TestCase):
             run = self.worker.submit(self.request())
             self.wait(run["execution_id"])
             headers = {"Authorization": "Bearer " + token, "Last-Event-ID": "2"}
+            # image-to-image through the opaque input handle; 1.0 callers cannot use it.
+            upload = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/v1/inputs",
+                data=make_png(64, 64),
+                method="POST",
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "image/png",
+                },
+            )
+            record = json.load(urllib.request.urlopen(upload))
+            self.assertEqual((record["width"], record["height"]), (64, 64))
+            img2img = self.request("attempt_img2img", steps=4)
+            img2img.update(task="image-to-image")
+            img2img["inputs"]["image"] = record["input_id"]
+            img2img["parameters"]["strength"] = 0.5
+            with self.assertRaises(WorkerError) as caught:
+                self.worker.submit({**img2img, "protocol": "media-worker/1.0"})
+            self.assertEqual(caught.exception.field, "task")
+            wrong_size = json.loads(json.dumps(img2img))
+            wrong_size["parameters"]["width"] = 128
+            with self.assertRaises(WorkerError) as caught:
+                self.worker.submit(wrong_size)
+            self.assertEqual(caught.exception.field, "width")
+            edited = self.wait(self.worker.submit(img2img)["execution_id"])
+            self.assertEqual(edited["state"], "succeeded")
+            self.assertEqual(edited["task"], "image-to-image")
+            self.assertEqual(edited["effective_settings"]["effective_steps"], 2)
+            self.assertEqual(edited["progress"]["total_steps"], 2)
+            self.assertNotIn("image_path", edited)
+            self.worker.release_input(record["input_id"])
+            with self.assertRaises(WorkerError):
+                self.worker.input_record(record["input_id"])
+            estimate = json.load(
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/v1/validate",
+                        data=json.dumps(
+                            {
+                                "protocol": "media-worker/1.0",
+                                "bundle": self.bundle,
+                                "options": self.backend.capabilities()["load_defaults"],
+                            }
+                        ).encode(),
+                        method="POST",
+                        headers={"Authorization": "Bearer " + token},
+                    )
+                )
+            )["memory_estimate"]
+            self.assertEqual(estimate["source"], "safetensors_headers")
+            self.assertEqual(estimate["roles"]["unet"]["parameters"], 8)
+            self.assertIn("activations", estimate["uncertainty"])
             events = (
                 get("/v1/executions/" + run["execution_id"] + "/events", headers)
                 .read()

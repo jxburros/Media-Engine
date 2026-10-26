@@ -14,8 +14,10 @@ server = create_server(worker, os.environ["MEDIA_ENGINE_TOKEN"], 0)
 print(
     json.dumps(
         {
-            "protocol": "media-worker/1.0",
-            "worker_version": "0.1.0-test-fixture",
+            "protocol": "media-worker/1.1",
+            "supported_protocols": ["media-worker/1.0", "media-worker/1.1"],
+            "worker_version": "0.2.0-test-fixture",
+            "backend_id": worker.backend.backend_id,
             "session_id": worker.session_id,
             "pid": os.getpid(),
             "port": server.server_port,

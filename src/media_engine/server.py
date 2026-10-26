@@ -1,4 +1,4 @@
-"""media-worker/1.0: authenticated loopback, one warm pipeline, no waiting queue."""
+"""media-worker/1.1: authenticated loopback, one warm pipeline, no waiting queue."""
 
 import argparse
 import copy
@@ -16,10 +16,14 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
-from .backend import DiffusersBackend, Cancelled
+from .backend import Cancelled, backend_class
 from .contracts import (
     PROTOCOL,
+    SUPPORTED_PROTOCOLS,
+    WORKER_VERSION,
     WorkerError,
+    effective_steps,
+    png_dimensions,
     strict,
     protocol,
     bundle_path,
@@ -40,18 +44,26 @@ def error(code, field=None):
 
 class Worker:
     def __init__(
-        self, directory, backend, catalog, max_retained=128, max_storage_mb=1024
+        self,
+        directory,
+        backend,
+        catalog,
+        max_retained=128,
+        max_storage_mb=1024,
+        max_input_mb=32,
     ):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (self.directory / "inputs").mkdir(exist_ok=True, mode=0o700)
         self.backend, self.catalog = backend, catalog
         self.session_id = str(uuid.uuid4())
         self.lock = threading.RLock()
-        self.executions, self.attempts, self.operations = {}, {}, {}
+        self.executions, self.attempts, self.operations, self.inputs = {}, {}, {}, {}
         self.active = None
         self.state = "ready"
         self.loaded = None
         self.max_retained, self.max_storage_mb = max_retained, max_storage_mb
+        self.max_input_mb = max_input_mb
 
     def capabilities(self):
         return {
@@ -59,11 +71,13 @@ class Worker:
             "session_id": self.session_id,
             "formats": ["diffusers-safetensors"],
             "output_formats": ["png"],
+            "input_formats": ["image/png"],
             "progress": True,
             "cancellation": True,
             "retention": "until-discard-or-session-end",
             "max_retained_executions": self.max_retained,
             "max_storage_mb": self.max_storage_mb,
+            "max_input_mb": self.max_input_mb,
             "required_roles": [
                 "unet",
                 "vae",
@@ -80,8 +94,10 @@ class Worker:
         with self.lock:
             return {
                 "protocol": PROTOCOL,
-                "worker_version": "0.1.0",
+                "supported_protocols": list(SUPPORTED_PROTOCOLS),
+                "worker_version": WORKER_VERSION,
                 "backend_id": self.backend.backend_id,
+                "ownership": self.backend.ownership,
                 "session_id": self.session_id,
                 "state": self.state,
                 "service_ready": self.state != "error",
@@ -89,7 +105,7 @@ class Worker:
                 "model_ready": self.loaded is not None,
                 "loaded_bundle": self.loaded,
                 "device": caps["device"],
-                "build": {"package": "media-engine", "version": "0.1.0"},
+                "build": {"package": "media-engine", "version": WORKER_VERSION},
             }
 
     def validate_load(self, body, verify=True):
@@ -137,13 +153,16 @@ class Worker:
                         self.loaded = None
                     if action == "load":
                         root_verified = self.validate_load(body)
+                        estimate = self.backend.estimate(root_verified, body["options"])
                         self.backend.load(root_verified, body["options"])
                         with self.lock:
                             self.loaded = {
                                 "bundle_digest": body["bundle"]["bundle_digest"],
                                 "bundle": body["bundle"],
                                 "options": body["options"],
+                                "memory_estimate": estimate,
                             }
+                            operation["memory_estimate"] = estimate
                     with self.lock:
                         operation["state"] = "succeeded"
                         self.state = "ready"
@@ -194,12 +213,68 @@ class Worker:
                 {
                     k: v
                     for k, v in self.executions[execution_id].items()
-                    if k not in {"cancel", "request"}
+                    if k not in {"cancel", "request", "image_path"}
                 }
             )
 
+    def storage_used(self):
+        return sum(
+            p.stat().st_size
+            for pattern in ("*.png", "inputs/*.png")
+            for p in self.directory.glob(pattern)
+        )
+
+    def store_input(self, data):
+        width, height = png_dimensions(data)
+        with self.lock:
+            if self.state == "error":
+                raise WorkerError(409, "busy")
+            if (
+                len(self.inputs) + len(self.executions) >= self.max_retained
+                or self.storage_used() + len(data) > self.max_storage_mb * 1024**2
+            ):
+                raise WorkerError(503, "storage_full")
+            input_id = "input_" + uuid.uuid4().hex
+            path = self.directory / "inputs" / (input_id + ".png")
+            temporary = path.with_suffix(".part")
+            with temporary.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+            record = {
+                "input_id": input_id,
+                "session_id": self.session_id,
+                "mime_type": "image/png",
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "width": width,
+                "height": height,
+            }
+            self.inputs[input_id] = record
+            return dict(record)
+
+    def input_record(self, input_id):
+        with self.lock:
+            record = self.inputs.get(input_id)
+            if not record:
+                raise WorkerError(404, "input_not_found")
+            return dict(record)
+
+    def release_input(self, input_id):
+        with self.lock:
+            self.input_record(input_id)
+            if any(
+                e["request"]["inputs"].get("image") == input_id
+                and e["state"] not in TERMINAL
+                for e in self.executions.values()
+            ):
+                raise WorkerError(409, "busy")
+            (self.directory / "inputs" / (input_id + ".png")).unlink(missing_ok=True)
+            del self.inputs[input_id]
+
     def submit(self, body):
-        validate_parameters(body)
+        task = validate_parameters(body)
         attempt = body["attempt_id"]
         with self.lock:
             if attempt in self.attempts:
@@ -211,13 +286,24 @@ class Worker:
                 raise WorkerError(409, "busy")
             if not self.loaded or self.loaded["bundle_digest"] != body["bundle_digest"]:
                 raise WorkerError(409, "model_not_ready")
-            used = sum(p.stat().st_size for p in self.directory.glob("*.png"))
+            image_path = None
+            if task == "image-to-image":
+                record = self.inputs.get(body["inputs"]["image"])
+                if not record:
+                    raise WorkerError(404, "input_not_found")
+                if (record["width"], record["height"]) != (
+                    body["parameters"]["width"],
+                    body["parameters"]["height"],
+                ):
+                    # The request must state the image's real size; nothing is resized silently.
+                    raise WorkerError(400, "invalid_request", "width")
+                image_path = self.directory / "inputs" / (record["input_id"] + ".png")
             reserve = (
                 body["parameters"]["width"] * body["parameters"]["height"] * 4 + 65536
             )
             if (
-                len(self.executions) >= self.max_retained
-                or used + reserve > self.max_storage_mb * 1024**2
+                len(self.executions) + len(self.inputs) >= self.max_retained
+                or self.storage_used() + reserve > self.max_storage_mb * 1024**2
             ):
                 raise WorkerError(503, "storage_full")
             execution_id = "exec_" + uuid.uuid4().hex
@@ -227,12 +313,17 @@ class Worker:
                 "attempt_id": attempt,
                 "execution_id": execution_id,
                 "session_id": self.session_id,
+                "protocol": body["protocol"],
+                "task": task,
                 "state": "running",
                 "stage": "encoding",
                 "progress": None,
                 "events": [],
                 "last_sequence": 0,
-                "effective_settings": body["parameters"],
+                "effective_settings": {
+                    **body["parameters"],
+                    "effective_steps": effective_steps(body["parameters"], task),
+                },
                 "bundle_digest": body["bundle_digest"],
                 "implementation": self.capabilities(),
                 "cancel_requested": False,
@@ -240,6 +331,7 @@ class Worker:
                 "error": None,
                 "cancel": threading.Event(),
                 "request": body,
+                "image_path": image_path,
             }
             self.emit(execution_id, "state", {"state": "running"})
             threading.Thread(target=self.run, args=(execution_id,), daemon=True).start()
@@ -255,6 +347,7 @@ class Worker:
                 temporary,
                 lambda kind, data: self.emit(execution_id, kind, data),
                 entry["cancel"],
+                entry["image_path"],
             )
             with temporary.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -336,11 +429,14 @@ def create_server(worker, token, port=7811):
             self.end_headers()
             self.wfile.write(data)
 
-        def body(self):
+        def raw(self, limit):
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 4 * 1024 * 1024:
-                raise WorkerError(400, "invalid_request")
-            return json.loads(self.rfile.read(size))
+            if not 0 < size <= limit:
+                raise WorkerError(400 if size <= limit else 413, "invalid_request")
+            return self.rfile.read(size)
+
+        def body(self):
+            return json.loads(self.raw(4 * 1024 * 1024))
 
         def events(self, execution_id):
             snap = worker.snapshot(execution_id)
@@ -387,10 +483,27 @@ def create_server(worker, token, port=7811):
                 if self.command == "POST" and path == "/v1/validate":
                     body = self.body()
                     if "bundle" in body:
-                        worker.validate_load(body)
-                    else:
-                        validate_parameters(body)
-                    return self.respond(200, {"valid": True})
+                        root = worker.validate_load(body)
+                        return self.respond(
+                            200,
+                            {
+                                "valid": True,
+                                "memory_estimate": worker.backend.estimate(
+                                    root, body["options"]
+                                ),
+                            },
+                        )
+                    task = validate_parameters(body)
+                    return self.respond(
+                        200,
+                        {
+                            "valid": True,
+                            "task": task,
+                            "effective_steps": effective_steps(
+                                body["parameters"], task
+                            ),
+                        },
+                    )
                 if self.command == "POST" and path in {
                     "/v1/model/load",
                     "/v1/model/unload",
@@ -410,6 +523,20 @@ def create_server(worker, token, port=7811):
                         if self.command == "GET":
                             return self.respond(200, op)
                     raise WorkerError(409, "busy")
+                if self.command == "POST" and path == "/v1/inputs":
+                    if self.headers.get("Content-Type") != "image/png":
+                        raise WorkerError(400, "unsupported", "image")
+                    data = self.raw(worker.max_input_mb * 1024**2)
+                    return self.respond(201, worker.store_input(data))
+                input_match = re.fullmatch(r"/v1/inputs/(input_[a-f0-9]{32})", path)
+                if input_match:
+                    input_id = input_match.group(1)
+                    if self.command == "GET":
+                        return self.respond(200, worker.input_record(input_id))
+                    if self.command == "DELETE":
+                        worker.release_input(input_id)
+                        return self.respond(200, {"released": True})
+                    raise WorkerError(404, "not_found")
                 if self.command == "POST" and path == "/v1/executions":
                     return self.respond(202, worker.submit(self.body()))
                 if self.command == "GET" and path == "/v1/executions":
@@ -474,23 +601,34 @@ def main():
     parser = argparse.ArgumentParser(
         description="Offline SDXL worker for Media Runtime"
     )
-    parser.add_argument("--version", action="version", version="media-engine 0.1.0")
+    parser.add_argument(
+        "--version", action="version", version="media-engine " + WORKER_VERSION
+    )
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--port", type=int, default=7811)
     parser.add_argument("--directory", default=".engine")
     parser.add_argument("--catalog")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--backend",
+        default="diffusers-sdxl",
+        choices=["diffusers-sdxl", "owned-sdxl"],
+        help="diffusers-sdxl is the reference pipeline; owned-sdxl runs this project's own loop",
+    )
     parser.add_argument("--memory-budget-mb", type=int)
     parser.add_argument("--max-retained", type=int, default=128)
     parser.add_argument("--max-storage-mb", type=int, default=1024)
+    parser.add_argument("--max-input-mb", type=int, default=32)
     args = parser.parse_args()
     if args.probe:
         print(
             json.dumps(
                 {
                     "protocol": PROTOCOL,
-                    "worker_version": "0.1.0",
-                    "backend_id": "diffusers-sdxl",
+                    "supported_protocols": list(SUPPORTED_PROTOCOLS),
+                    "worker_version": WORKER_VERSION,
+                    "backend_id": args.backend,
+                    "backends": ["diffusers-sdxl", "owned-sdxl"],
                 }
             )
         )
@@ -499,7 +637,12 @@ def main():
         parser.error("device must be cpu or cuda:N")
     if any(
         v is not None and v < 1
-        for v in (args.memory_budget_mb, args.max_retained, args.max_storage_mb)
+        for v in (
+            args.memory_budget_mb,
+            args.max_retained,
+            args.max_storage_mb,
+            args.max_input_mb,
+        )
     ):
         parser.error("resource limits must be positive")
     if not args.catalog:
@@ -512,7 +655,7 @@ def main():
     token = os.environ.get("MEDIA_ENGINE_TOKEN", "")
     if len(token) < 32:
         parser.error("Set MEDIA_ENGINE_TOKEN to at least 32 random characters")
-    backend = DiffusersBackend(args.device, args.memory_budget_mb)
+    backend = backend_class(args.backend)(args.device, args.memory_budget_mb)
     # A private per-session directory prevents another process/session's outputs being collected.
     worker = Worker(
         Path(args.directory) / uuid.uuid4().hex,
@@ -520,6 +663,7 @@ def main():
         catalog,
         args.max_retained,
         args.max_storage_mb,
+        args.max_input_mb,
     )
     server = create_server(worker, token, args.port)
 
@@ -543,7 +687,9 @@ def main():
         json.dumps(
             {
                 "protocol": PROTOCOL,
-                "worker_version": "0.1.0",
+                "supported_protocols": list(SUPPORTED_PROTOCOLS),
+                "worker_version": WORKER_VERSION,
+                "backend_id": backend.backend_id,
                 "session_id": worker.session_id,
                 "port": server.server_port,
                 "pid": os.getpid(),
