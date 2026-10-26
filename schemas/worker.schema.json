@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jxburros/Media-Engine/schemas/worker.schema.json",
+  "title": "Media Worker 1.0 request schemas",
+  "$defs": {
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "bundle_id": {
+          "type": "string"
+        },
+        "bundle_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "family": {
+          "const": "sdxl-base"
+        },
+        "pipeline": {
+          "const": "text-to-image"
+        },
+        "components": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "role": {
+                "enum": [
+                  "unet",
+                  "vae",
+                  "text_encoder",
+                  "text_encoder_2",
+                  "tokenizer",
+                  "tokenizer_2",
+                  "scheduler"
+                ]
+              },
+              "artifact_handle": {
+                "type": "string"
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^sha256:[a-f0-9]{64}$"
+              },
+              "tensor_format": {
+                "enum": [
+                  "safetensors",
+                  "json"
+                ]
+              }
+            },
+            "required": [
+              "role",
+              "artifact_handle",
+              "digest",
+              "tensor_format"
+            ]
+          }
+        },
+        "configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "artifact_handle": {
+              "type": "string"
+            },
+            "files": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          },
+          "required": [
+            "artifact_handle",
+            "files"
+          ]
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "license": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      "required": [
+        "schema_version",
+        "bundle_id",
+        "bundle_digest",
+        "family",
+        "pipeline",
+        "components",
+        "configuration",
+        "source"
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "media-worker/1.0"
+        },
+        "attempt_id": {
+          "type": "string",
+          "pattern": "^attempt_[A-Za-z0-9_-]{1,80}$"
+        },
+        "bundle_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "task": {
+          "const": "text-to-image"
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 10000
+            },
+            "negative_prompt": {
+              "type": "string",
+              "maxLength": 10000
+            }
+          },
+          "required": [
+            "prompt"
+          ]
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 2048,
+              "multipleOf": 8
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 2048,
+              "multipleOf": 8
+            },
+            "steps": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 150
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "guidance": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 30
+            },
+            "sampler": {
+              "const": "euler"
+            },
+            "scheduler": {
+              "const": "euler"
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "steps",
+            "seed",
+            "guidance",
+            "sampler",
+            "scheduler"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "attempt_id",
+        "bundle_digest",
+        "task",
+        "inputs",
+        "parameters"
+      ]
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "media-worker/1.0"
+        },
+        "bundle": {
+          "$ref": "#/$defs/bundle"
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "precision": {
+              "enum": [
+                "float16",
+                "float32"
+              ]
+            },
+            "attention": {
+              "const": "sdpa"
+            },
+            "offload": {
+              "const": "none"
+            }
+          },
+          "required": [
+            "precision",
+            "attention",
+            "offload"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "bundle",
+        "options"
+      ]
+    },
+    "unload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "media-worker/1.0"
+        }
+      },
+      "required": [
+        "protocol"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/execution"
+    },
+    {
+      "$ref": "#/$defs/load"
+    },
+    {
+      "$ref": "#/$defs/unload"
+    }
+  ]
+}
