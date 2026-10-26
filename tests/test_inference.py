@@ -151,6 +151,40 @@ def tiny_sdxl_bundle(root):
     return bundle_dir, {**bundle, "bundle_digest": digest(bundle)}
 
 
+def tiny_lora(root, unet_dir, rank=4):
+    """A random PEFT-layout LoRA touching two UNet attention projections and one CLIP projection."""
+    import torch
+    from diffusers import UNet2DConditionModel
+    from safetensors.torch import save_file
+
+    torch.manual_seed(1)
+    unet = UNet2DConditionModel.from_pretrained(str(unet_dir), subfolder="unet")
+    tensors = {}
+    chosen = [n for n, m in unet.named_modules() if n.endswith("attn1.to_q") or n.endswith("attn2.to_v")][:2]
+    for name in chosen:
+        layer = unet.get_submodule(name)
+        tensors[f"unet.{name}.lora_A.weight"] = torch.randn(rank, layer.in_features) * 0.5
+        tensors[f"unet.{name}.lora_B.weight"] = torch.randn(layer.out_features, rank) * 0.5
+    tensors["text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_A.weight"] = torch.randn(rank, 32) * 0.5
+    tensors["text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_B.weight"] = torch.randn(32, rank) * 0.5
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(root / "adapter.safetensors"))
+    files = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in root.rglob("*")
+        if p.is_file()
+    }
+    record = {
+        "schema_version": 1,
+        "adapter_id": "tiny-lora",
+        "artifact_handle": "tiny-lora",
+        "files": files,
+        "source": {"license": "test-only random weights"},
+    }
+    return {**record, "digest": digest(record)}
+
+
 @unittest.skipUnless(HAVE_INFERENCE, "inference extra is not installed")
 class InferenceTests(unittest.TestCase):
     @classmethod
@@ -158,6 +192,7 @@ class InferenceTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
         cls.model_dir, cls.bundle = tiny_sdxl_bundle(cls.root)
+        cls.adapter = tiny_lora(cls.root / "lora", cls.model_dir)
 
     @classmethod
     def tearDownClass(cls):
@@ -169,7 +204,9 @@ class InferenceTests(unittest.TestCase):
 
         backend = backend_class(backend_id)("cpu")
         return Worker(
-            self.root / "work" / backend_id, backend, {"tiny": str(self.model_dir)}
+            self.root / "work" / backend_id,
+            backend,
+            {"tiny": str(self.model_dir), "tiny-lora": str(self.root / "lora")},
         )
 
     def finish(self, worker, operation=None, execution=None):
@@ -201,7 +238,7 @@ class InferenceTests(unittest.TestCase):
             body["parameters"]["strength"] = 0.7
         return body
 
-    def exercise(self, backend_id):
+    def exercise(self, backend_id, adapters=()):
         from PIL import Image
 
         worker = self.worker(backend_id)
@@ -210,7 +247,12 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(caps["backend_id"], backend_id)
         op = worker.control(
             "load",
-            {"protocol": PROTOCOL, "bundle": self.bundle, "options": caps["load_defaults"]},
+            {
+                "protocol": PROTOCOL,
+                "bundle": self.bundle,
+                "options": caps["load_defaults"],
+                "adapters": list(adapters),
+            },
         )
         result = self.finish(worker, operation=op["operation_id"])
         self.assertEqual(result["state"], "succeeded", result)
@@ -298,6 +340,22 @@ class InferenceTests(unittest.TestCase):
             - numpy.asarray(Image.open(io.BytesIO(owned["image-to-image"])), dtype=float)
         )
         self.assertLessEqual(difference.max(), 2)
+
+    def test_lora_adapters_change_output_and_agree_across_backends(self):
+        """LoRA is a load-time identity: the library's PEFT layers (reference) and the owned
+        in-place merge produce the same pictures, and both differ from the base model."""
+        import io
+
+        import numpy
+        from PIL import Image
+
+        adapters = [{"adapter": self.adapter, "scale": 1.0}]
+        base = self.exercise("owned-sdxl")["text-to-image"]
+        reference = self.exercise("diffusers-sdxl", adapters)["text-to-image"]
+        owned = self.exercise("owned-sdxl", adapters)["text-to-image"]
+        load = lambda png: numpy.asarray(Image.open(io.BytesIO(png)), dtype=float)
+        self.assertGreater(numpy.abs(load(base) - load(owned)).mean(), 1)
+        self.assertLessEqual(numpy.abs(load(reference) - load(owned)).max(), 2)
 
 
 if __name__ == "__main__":

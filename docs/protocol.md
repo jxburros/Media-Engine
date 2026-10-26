@@ -1,6 +1,6 @@
 # media-worker/1.1 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.2.0 speaks
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.3.0 speaks
 `media-worker/1.1` and still accepts `media-worker/1.0` requests; `/v1/info`, `/v1/capabilities`
 and the startup record list `supported_protocols`. A supervisor picks the highest minor both sides
 support and sends that value in every request's `protocol` field. A different major is rejected
@@ -26,6 +26,7 @@ generation readiness.
 | `memory_estimate`                          | Parameter bytes per role from safetensors headers at the load precision          |
 | `effective_steps`                          | Actual sampling steps; for image-to-image it is `floor(steps × strength)`        |
 | `backend_id` `owned-sdxl`                  | The project-owned pipeline stage, selected explicitly at launch                  |
+| `adapters` (0.3.0)                         | LoRA adapters on the load body; advertised in `capabilities.adapters`            |
 
 A 1.0 request cannot name `image-to-image`; the worker returns `unsupported` with field `task`.
 
@@ -68,6 +69,24 @@ filesystem sandbox.
 `GET /v1/operations/{operation_id}` reports running/succeeded/failed; a succeeded load carries the
 estimate. A failed load leaves an empty worker; no substitute model is loaded. Extension: DELETE
 on a terminal operation discards its record.
+
+## Adapters
+
+`capabilities.adapters` advertises `{formats:["peft-lora"], targets:[unet, text_encoder,
+text_encoder_2], max_adapters:4, scale:[0,2], identity:"load"}`. A load body (and `/v1/validate`)
+may carry `adapters: [{adapter, scale}]`, 1.1 only. An adapter record is
+`{schema_version:1, adapter_id, artifact_handle, files, digest, source}` built like a bundle: the
+handle names an approved directory in the launch catalog, `files` maps every relative file to its
+SHA-256, exactly one top-level `.safetensors` file exists, and `digest` hashes the record without
+itself. Validation reads the safetensors header and accepts only the PEFT layout
+(`unet.<module>.lora_A.weight` / `lora_B.weight`, optional `alpha`, with `text_encoder.` and
+`text_encoder_2.` prefixes); Kohya `lora_unet_*` and legacy processor layouts return `unsupported`
+with field `adapter`. The response and the successful load operation report each adapter's layout
+(targets, module count, ranks, parameters) and the memory estimate includes adapter parameters.
+
+Adapters are load identity: `loaded_bundle.adapters` lists `{adapter_id, digest, scale, layout}`,
+and a supervisor that wants a different set, scale or none at all issues a new load. Executions do
+not name adapters. `/v1/validate` with `{protocol, adapters}` and no bundle validates adapters alone.
 
 ## Inputs
 

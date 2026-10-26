@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+LoRA adapters as a separately advertised capability (`capabilities.adapters`). A load request may
+name up to four registered adapters with scales; they are validated like bundles (catalog handle,
+per-file digests, one PEFT-layout safetensors file) and become part of the loaded identity. The
+reference backend applies them through the library's PEFT layers; the owned pipeline folds
+scale × B·A into the target weights itself. Kohya and legacy layouts are refused with
+`unsupported` until converted. Memory estimates include adapter parameters. `peft` is pinned in
+the inference extra. The CPU inference test checks that adapters change the output and that both
+backends agree.
+
 ## 0.2.0 — 2026-10-26
 
 Protocol `media-worker/1.1` with minor negotiation (1.0 requests still served). Added the

@@ -306,6 +306,29 @@
             "attention",
             "offload"
           ]
+        },
+        "adapters": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "media-worker/1.1 only; LoRA adapters that become part of the loaded identity",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {
+                "$ref": "#/$defs/adapter"
+              },
+              "scale": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              }
+            },
+            "required": [
+              "adapter",
+              "scale"
+            ]
+          }
         }
       },
       "required": [
@@ -412,6 +435,93 @@
         "source",
         "uncertainty"
       ]
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "adapter_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,80}$"
+        },
+        "artifact_handle": {
+          "type": "string"
+        },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "license": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "adapter_id",
+        "artifact_handle",
+        "files",
+        "digest",
+        "source"
+      ]
+    },
+    "validate_adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "media-worker/1.1"
+        },
+        "adapters": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "media-worker/1.1 only; LoRA adapters that become part of the loaded identity",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {
+                "$ref": "#/$defs/adapter"
+              },
+              "scale": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              }
+            },
+            "required": [
+              "adapter",
+              "scale"
+            ]
+          }
+        }
+      },
+      "required": [
+        "protocol",
+        "adapters"
+      ]
     }
   },
   "oneOf": [
@@ -423,6 +533,9 @@
     },
     {
       "$ref": "#/$defs/unload"
+    },
+    {
+      "$ref": "#/$defs/validate_adapters"
     }
   ]
 }

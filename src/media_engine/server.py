@@ -27,6 +27,7 @@ from .contracts import (
     strict,
     protocol,
     bundle_path,
+    validate_adapters,
     validate_parameters,
 )
 
@@ -109,8 +110,8 @@ class Worker:
             }
 
     def validate_load(self, body, verify=True):
-        strict(body, ("protocol", "bundle", "options"))
-        protocol(body)
+        strict(body, ("protocol", "bundle", "options"), ("adapters",))
+        version = protocol(body)
         strict(body["options"], ("precision", "attention", "offload"))
         options = body["options"]
         caps = self.capabilities()
@@ -120,7 +121,11 @@ class Worker:
             or options["offload"] != "none"
         ):
             raise WorkerError(400, "unsupported", "options")
-        return bundle_path(body["bundle"], self.catalog, verify)
+        root = bundle_path(body["bundle"], self.catalog, verify)
+        adapters = validate_adapters(
+            body.get("adapters", []), self.catalog, version, verify
+        )
+        return root, adapters
 
     def control(self, action, body):
         if action == "load":
@@ -152,14 +157,25 @@ class Worker:
                         operation["measurements"] = measurements
                         self.loaded = None
                     if action == "load":
-                        root_verified = self.validate_load(body)
-                        estimate = self.backend.estimate(root_verified, body["options"])
-                        self.backend.load(root_verified, body["options"])
+                        root_verified, adapters = self.validate_load(body)
+                        estimate = self.backend.estimate(
+                            root_verified, body["options"], adapters
+                        )
+                        self.backend.load(root_verified, body["options"], adapters)
                         with self.lock:
                             self.loaded = {
                                 "bundle_digest": body["bundle"]["bundle_digest"],
                                 "bundle": body["bundle"],
                                 "options": body["options"],
+                                "adapters": [
+                                    {
+                                        "adapter_id": record["adapter_id"],
+                                        "digest": record["digest"],
+                                        "scale": scale,
+                                        "layout": layout,
+                                    }
+                                    for record, _r, _w, scale, layout in adapters
+                                ],
                                 "memory_estimate": estimate,
                             }
                             operation["memory_estimate"] = estimate
@@ -483,14 +499,34 @@ def create_server(worker, token, port=7811):
                 if self.command == "POST" and path == "/v1/validate":
                     body = self.body()
                     if "bundle" in body:
-                        root = worker.validate_load(body)
+                        root, adapters = worker.validate_load(body)
                         return self.respond(
                             200,
                             {
                                 "valid": True,
                                 "memory_estimate": worker.backend.estimate(
-                                    root, body["options"]
+                                    root, body["options"], adapters
                                 ),
+                                "adapters": [
+                                    {"adapter_id": r["adapter_id"], "layout": layout}
+                                    for r, _a, _w, _s, layout in adapters
+                                ],
+                            },
+                        )
+                    if "adapters" in body:
+                        strict(body, ("protocol", "adapters"))
+                        version = protocol(body)
+                        adapters = validate_adapters(
+                            body["adapters"], worker.catalog, version
+                        )
+                        return self.respond(
+                            200,
+                            {
+                                "valid": True,
+                                "adapters": [
+                                    {"adapter_id": r["adapter_id"], "layout": layout}
+                                    for r, _a, _w, _s, layout in adapters
+                                ],
                             },
                         )
                     task = validate_parameters(body)

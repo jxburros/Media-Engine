@@ -6,8 +6,11 @@ import os
 import resource
 
 from .contracts import (
+    ADAPTER_FORMAT,
+    ADAPTER_TARGETS,
     DEFAULTS,
     LIMITS,
+    MAX_ADAPTERS,
     PROTOCOL,
     SUPPORTED_PROTOCOLS,
     TASK_DEFAULTS,
@@ -24,6 +27,7 @@ DEPENDENCIES = (
     ("accelerate", "accelerate"),
     ("safetensors", "safetensors"),
     ("Pillow", "PIL"),
+    ("peft", "peft"),
 )
 
 
@@ -105,6 +109,13 @@ class TorchBackend:
                     "input_formats": ["image/png"],
                 },
             },
+            "adapters": {
+                "formats": [ADAPTER_FORMAT],
+                "targets": list(ADAPTER_TARGETS),
+                "max_adapters": MAX_ADAPTERS,
+                "scale": LIMITS["adapter_scale"],
+                "identity": "load",
+            },
             "defaults": DEFAULTS,
             "task_defaults": TASK_DEFAULTS,
             "load_defaults": {
@@ -118,9 +129,20 @@ class TorchBackend:
             else ["float16", "float32"],
         }
 
-    def estimate(self, root, options):
-        self.loaded_estimate = memory_estimate(root, options["precision"], self.device)
-        return self.loaded_estimate
+    def estimate(self, root, options, adapters=()):
+        estimate = memory_estimate(root, options["precision"], self.device)
+        bytes_per_element = {"float16": 2, "float32": 4}[options["precision"]]
+        estimate["adapters"] = [
+            {
+                "adapter_id": record["adapter_id"],
+                "parameters": layout["parameters"],
+                "loaded_mb": layout["parameters"] * bytes_per_element // 1024**2,
+            }
+            for record, _root, _weights, _scale, layout in adapters
+        ]
+        estimate["value_mb"] += sum(a["loaded_mb"] for a in estimate["adapters"])
+        self.loaded_estimate = estimate
+        return estimate
 
     def apply_budget(self):
         import torch
@@ -198,7 +220,7 @@ class DiffusersBackend(TorchBackend):
         self.pipe = None
         self.img2img = None
 
-    def load(self, root, options):
+    def load(self, root, options, adapters=()):
         offline_environment()
         import torch
         from diffusers import StableDiffusionXLPipeline
@@ -214,6 +236,19 @@ class DiffusersBackend(TorchBackend):
         )
         pipe.unet.set_attn_processor(AttnProcessor2_0())
         pipe.vae.set_attn_processor(AttnProcessor2_0())
+        if adapters:
+            # The library injects PEFT layers; adapters are part of this load's identity.
+            for record, adapter_root, weights, _scale, _layout in adapters:
+                pipe.load_lora_weights(
+                    str(adapter_root),
+                    weight_name=weights.name,
+                    adapter_name=record["adapter_id"],
+                    local_files_only=True,
+                )
+            pipe.set_adapters(
+                [record["adapter_id"] for record, *_ in adapters],
+                [float(scale) for _r, _a, _w, scale, _l in adapters],
+            )
         pipe.to(self.device)
         pipe.set_progress_bar_config(disable=True)
         self.pipe = pipe

@@ -53,6 +53,42 @@ def make_png(width, height):
     )
 
 
+def make_adapter(root, adapter_id="fixture-lora", handle="fixture-lora"):
+    """A PEFT-layout LoRA safetensors file with tiny zero tensors; never trained weights."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight": [2, 4],
+        "unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_B.weight": [4, 2],
+        "text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_A.weight": [2, 4],
+        "text_encoder.text_model.encoder.layers.0.self_attn.q_proj.lora_B.weight": [4, 2],
+    }
+    header, offset = {}, 0
+    for name, shape in tensors.items():
+        size = 4 * shape[0] * shape[1]
+        header[name] = {"dtype": "F32", "shape": shape, "data_offsets": [offset, offset + size]}
+        offset += size
+    encoded = json.dumps(header).encode()
+    (root / "adapter.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + bytes(offset)
+    )
+    import hashlib
+
+    files = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in root.rglob("*")
+        if p.is_file()
+    }
+    record = {
+        "schema_version": 1,
+        "adapter_id": adapter_id,
+        "artifact_handle": handle,
+        "files": files,
+        "source": {"license": "test-only"},
+    }
+    return {**record, "digest": digest(record)}
+
+
 def make_bundle(root):
     root = Path(root)
     roles = {
@@ -121,7 +157,7 @@ class TestBackend:
         return {
             "protocol": PROTOCOL,
             "supported_protocols": list(SUPPORTED_PROTOCOLS),
-            "worker_version": "0.2.0-test-fixture",
+            "worker_version": "0.3.0-test-fixture",
             "backend_id": self.backend_id,
             "ownership": self.ownership,
             "test_fixture": True,
@@ -150,14 +186,26 @@ class TestBackend:
                 },
             },
             "model_families": ["sdxl-base"],
+            "adapters": {
+                "formats": ["peft-lora"],
+                "targets": ["unet", "text_encoder", "text_encoder_2"],
+                "max_adapters": 4,
+                "scale": [0, 2],
+                "identity": "load",
+            },
         }
 
-    def estimate(self, root, options):
+    def estimate(self, root, options, adapters=()):
         self.loaded_estimate = memory_estimate(root, options["precision"], "test-only")
+        self.loaded_estimate["adapters"] = [
+            {"adapter_id": r["adapter_id"], "parameters": layout["parameters"]}
+            for r, _a, _w, _s, layout in adapters
+        ]
         return self.loaded_estimate
 
-    def load(self, root, options):
+    def load(self, root, options, adapters=()):
         self.loads += 1
+        self.adapters = [(r["adapter_id"], scale) for r, _a, _w, scale, _l in adapters]
         time.sleep(0.02)
 
     def unload(self):

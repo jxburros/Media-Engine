@@ -8,7 +8,7 @@ from pathlib import Path
 
 PROTOCOL = "media-worker/1.1"
 SUPPORTED_PROTOCOLS = ("media-worker/1.0", "media-worker/1.1")
-WORKER_VERSION = "0.2.0"
+WORKER_VERSION = "0.3.0"
 TASKS = ("text-to-image", "image-to-image")
 ROLES = (
     "unet",
@@ -29,12 +29,16 @@ DEFAULTS = {
     "scheduler": "euler",
 }
 TASK_DEFAULTS = {"image-to-image": {"strength": 0.75}}
+MAX_ADAPTERS = 4
+ADAPTER_TARGETS = ("unet", "text_encoder", "text_encoder_2")
+ADAPTER_FORMAT = "peft-lora"
 LIMITS = {
     "width": [64, 2048],
     "height": [64, 2048],
     "steps": [1, 150],
     "guidance": [0, 30],
     "strength": [0, 1],
+    "adapter_scale": [0, 2],
     "size_multiple": 8,
 }
 APPROVED_CLASSES = {
@@ -327,3 +331,116 @@ def validate_parameters(body):
     if params["sampler"] != "euler" or params["scheduler"] != "euler":
         raise WorkerError(400, "unsupported", "scheduler")
     return task
+
+
+def adapter_path(adapter, catalog, verify=True):
+    """Resolve a registered LoRA adapter to its approved directory and single weight file."""
+    strict(
+        adapter,
+        ("schema_version", "adapter_id", "artifact_handle", "files", "digest", "source"),
+    )
+    if adapter["schema_version"] != 1:
+        raise WorkerError(400, "unsupported", "adapter")
+    if not isinstance(adapter["adapter_id"], str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,80}", adapter["adapter_id"]
+    ):
+        raise WorkerError(400, "invalid_request", "adapter_id")
+    if digest({k: v for k, v in adapter.items() if k != "digest"}) != adapter["digest"]:
+        raise WorkerError(400, "artifact_changed", "adapter")
+    strict(adapter["source"], (), ("repository", "revision", "license"))
+    if any(not isinstance(v, str) for v in adapter["source"].values()):
+        raise WorkerError(400, "invalid_request", "source")
+    handle = adapter["artifact_handle"]
+    if not isinstance(handle, str) or handle not in catalog:
+        raise WorkerError(400, "missing_component", "adapter")
+    root = Path(catalog[handle]).resolve()
+    files = adapter["files"]
+    if not isinstance(files, dict) or not files or not root.is_dir():
+        raise WorkerError(400, "missing_component", "adapter")
+    actual = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise WorkerError(400, "unsupported", "symlink")
+        if path.is_file():
+            if path.suffix in {".py", ".pkl", ".pickle", ".bin", ".pt", ".pth"}:
+                raise WorkerError(400, "unsupported", "tensor_format")
+            actual[str(path.relative_to(root))] = path
+    if set(actual) != set(files):
+        raise WorkerError(400, "artifact_changed", "adapter")
+    weights = [k for k in files if k.endswith(".safetensors")]
+    if len(weights) != 1 or "/" in weights[0]:
+        raise WorkerError(400, "unsupported", "adapter")
+    for relative, expected in files.items():
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise WorkerError(400, "invalid_request", "digest")
+        if verify:
+            with actual[relative].open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
+                    raise WorkerError(400, "artifact_changed", "adapter")
+    return root, actual[weights[0]]
+
+
+def lora_layout(path):
+    """Classify a LoRA safetensors file from its header; only the PEFT layout is supported."""
+    with Path(path).open("rb") as stream:
+        (length,) = struct.unpack("<Q", stream.read(8))
+        if not 0 < length <= 64 * 1024 * 1024:
+            raise WorkerError(400, "unsupported", "adapter")
+        header = json.loads(stream.read(length))
+    modules = {}
+    parameters = 0
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            continue
+        match = re.fullmatch(
+            r"(unet|text_encoder|text_encoder_2)\.(.+)\.(lora_A\.weight|lora_B\.weight|alpha)",
+            name,
+        )
+        if not match:
+            # Kohya/"lora_unet_" and legacy processor layouts need conversion first.
+            raise WorkerError(400, "unsupported", "adapter")
+        target, module, part = match.groups()
+        entry = modules.setdefault((target, module), {})
+        entry[part] = tensor["shape"]
+        count = 1
+        for dim in tensor["shape"]:
+            count *= dim
+        parameters += count
+    if not modules:
+        raise WorkerError(400, "unsupported", "adapter")
+    ranks = set()
+    for (target, module), parts in modules.items():
+        if "lora_A.weight" not in parts or "lora_B.weight" not in parts:
+            raise WorkerError(400, "unsupported", "adapter")
+        if parts["lora_A.weight"][0] != parts["lora_B.weight"][1]:
+            raise WorkerError(400, "unsupported", "adapter")
+        ranks.add(parts["lora_A.weight"][0])
+    return {
+        "format": ADAPTER_FORMAT,
+        "targets": sorted({t for t, _ in modules}),
+        "modules": len(modules),
+        "ranks": sorted(ranks),
+        "parameters": parameters,
+    }
+
+
+def validate_adapters(adapters, catalog, version, verify=True):
+    """Validate the load body's adapters list; returns resolved (record, root, file, scale) tuples."""
+    if not isinstance(adapters, list) or len(adapters) > MAX_ADAPTERS:
+        raise WorkerError(400, "invalid_request", "adapters")
+    if adapters and version == "media-worker/1.0":
+        raise WorkerError(400, "invalid_request", "adapters")
+    resolved = []
+    seen = set()
+    for entry in adapters:
+        strict(entry, ("adapter", "scale"))
+        scale = entry["scale"]
+        low, high = LIMITS["adapter_scale"]
+        if type(scale) not in (int, float) or not low <= scale <= high:
+            raise WorkerError(400, "invalid_request", "scale")
+        root, weights = adapter_path(entry["adapter"], catalog, verify)
+        if entry["adapter"]["adapter_id"] in seen:
+            raise WorkerError(400, "invalid_request", "adapter_id")
+        seen.add(entry["adapter"]["adapter_id"])
+        resolved.append((entry["adapter"], root, weights, scale, lora_layout(weights)))
+    return resolved

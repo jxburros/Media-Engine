@@ -56,6 +56,12 @@ version, random session ID, port and PID; the supervisor must still check `/v1/i
 `/v1/capabilities`. All endpoints except coarse `/health` require the per-launch bearer credential.
 Browser origins are rejected. `--device cpu` explicitly selects CPU/float32; it is never a fallback.
 
+LoRA adapters are registered like bundles: an approved catalog directory holding one PEFT-layout
+safetensors file, hashed and named by an opaque handle. Up to four adapters with scales travel on
+the load request and form part of the loaded identity. The reference backend applies them through
+PEFT; the owned pipeline merges the low-rank deltas into the weights itself. Kohya-format files must
+be converted first; the worker refuses layouts it cannot verify rather than guessing.
+
 Image-to-image uploads a PNG to `POST /v1/inputs` first and references the returned handle; the
 worker never reads caller paths or URLs. The request must state the image's real size, and
 `strength` sets the effective step count (`floor(steps × strength)`, at least one).
@@ -101,10 +107,11 @@ SDXL-shaped bundle; it is skipped unless the inference extra is installed (`uv s
 inference` then `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`). It proves the
 owned loop and the reference pipeline execute the same contract and, for the same seed and settings,
 produce byte-identical text-to-image output and image-to-image output within one 8-bit level on that
-CPU stack; it says nothing about image quality. Run the Runtime
+CPU stack, and that LoRA adapters change the output identically on both backends; it says nothing
+about image quality. Run the Runtime
 repository's `npm test` with both repositories beside each other for cross-process durable-job tests.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.2.0 speaks `media-worker/1.1` and serves `media-worker/1.0` callers such as Runtime 0.1.0.
+Engine 0.3.0 speaks `media-worker/1.1` and serves `media-worker/1.0` callers such as Runtime 0.1.0.
 
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
 SDXL base weights carry CreativeML Open RAIL++-M terms and are supplied by the operator.

@@ -8,6 +8,7 @@ pipeline classes. Request semantics match the reference backend; matching bytes 
 """
 
 import json
+import re
 from pathlib import Path
 
 from .backend import Cancelled, TorchBackend, offline_environment
@@ -21,9 +22,41 @@ class OwnedPipelineBackend(TorchBackend):
     def __init__(self, device="cuda:0", memory_budget_mb=None):
         super().__init__(device, memory_budget_mb)
         self.components = None
+        self.merged_adapters = []
+
+    # ----- adapters --------------------------------------------------------------------------
+    @staticmethod
+    def merge_lora(models, weights, scale):
+        """Fold scale × B·A (times alpha/rank when present) into the target weights in place.
+
+        Merging keeps inference cost identical to the base model; the adapters therefore belong
+        to the load identity, and a different adapter set means a fresh load.
+        """
+        import torch
+        from safetensors.torch import load_file
+
+        state = load_file(str(weights))
+        groups = {}
+        for name, tensor in state.items():
+            target, module, part = re.fullmatch(
+                r"(unet|text_encoder|text_encoder_2)\.(.+)\.(lora_A\.weight|lora_B\.weight|alpha)",
+                name,
+            ).groups()
+            groups.setdefault((target, module), {})[part] = tensor
+        merged = 0
+        with torch.no_grad():
+            for (target, module), parts in groups.items():
+                layer = models[target].get_submodule(module)
+                down, up = parts["lora_A.weight"].float(), parts["lora_B.weight"].float()
+                rank = down.shape[0]
+                alpha = float(parts["alpha"]) if "alpha" in parts else float(rank)
+                delta = (up.flatten(1) @ down.flatten(1)).view(layer.weight.shape)
+                layer.weight.add_((scale * alpha / rank * delta).to(layer.weight.dtype))
+                merged += 1
+        return merged
 
     # ----- lifecycle -------------------------------------------------------------------------
-    def load(self, root, options):
+    def load(self, root, options, adapters=()):
         offline_environment()
         import torch
         from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
@@ -48,19 +81,30 @@ class OwnedPipelineBackend(TorchBackend):
         vae.to(vae_dtype)
         unet.set_attn_processor(AttnProcessor2_0())
         vae.set_attn_processor(AttnProcessor2_0())
+        text_encoder = CLIPTextModel.from_pretrained(
+            root, subfolder="text_encoder", **weights
+        )
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            root, subfolder="text_encoder_2", **weights
+        )
+        targets = {
+            "unet": unet,
+            "text_encoder": text_encoder,
+            "text_encoder_2": text_encoder_2,
+        }
+        self.merged_adapters = [
+            {
+                "adapter_id": record["adapter_id"],
+                "scale": scale,
+                "modules": self.merge_lora(targets, adapter_weights, scale),
+            }
+            for record, _root, adapter_weights, scale, _layout in adapters
+        ]
         self.components = {
             "unet": unet.to(self.device).eval(),
             "vae": vae.to(self.device).eval(),
-            "text_encoder": CLIPTextModel.from_pretrained(
-                root, subfolder="text_encoder", **weights
-            )
-            .to(self.device)
-            .eval(),
-            "text_encoder_2": CLIPTextModelWithProjection.from_pretrained(
-                root, subfolder="text_encoder_2", **weights
-            )
-            .to(self.device)
-            .eval(),
+            "text_encoder": text_encoder.to(self.device).eval(),
+            "text_encoder_2": text_encoder_2.to(self.device).eval(),
             "tokenizer": CLIPTokenizer.from_pretrained(
                 root, subfolder="tokenizer", **common
             ),
