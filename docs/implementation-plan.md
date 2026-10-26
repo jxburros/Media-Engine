@@ -323,8 +323,10 @@ Acceptance: every advertised optimization has a cited benchmark; none is applied
 
 ## Phase E6 — Engine 1.0.0, owned native engine
 
-- Decision record: choose the language (C++ or Rust) with the reasons, the tensor/GPU libraries
-  retained, and the build/release identity scheme; record it in `docs/decisions.md` (add that
+- Decision record: confirm Rust on candle (recommended; C++ on ggml is the fallback if candle's
+  CUDA coverage proves insufficient on the reference hardware), the tensor/GPU libraries
+  retained (candle, cudarc for custom kernels, the `tokenizers` crate, rustls, axum or hyper for
+  HTTP and SSE, `image`/`png`/`hound` for output formats), and the build/release identity scheme; record it in `docs/decisions.md` (add that
   file to this repository, mirroring Runtime's).
 - Repository layout: `native/` with its own build, producing `media-engine-native`, sharing
   `schemas/worker.schema.json` and the catalog/bundle formats. It implements the launch contract

@@ -315,7 +315,7 @@ Before any backend beyond the two delivered ones is advertised, the engine repos
 
 ### Owned native engine
 
-The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. The implementation language is an open decision recorded when work starts; C++ and Rust are the candidates. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
+The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. The recommended implementation is Rust on the candle tensor library with custom CUDA kernels through cudarc where the optimization stage needs them; the decision is recorded when work starts. Go is not a candidate for the engine because GPU kernels cannot be written in it, and the control plane that suits Go is Media Runtime. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
 
 ### Targeted optimization
 
@@ -329,6 +329,6 @@ The supervisor interacts through public startup, discovery and HTTP behavior. It
 
 ## Decisions and next steps
 
-The delivered reference target is one SDXL base bundle on Linux x64/NVIDIA; the recorded pins are in the repository's implementation decisions. Open decisions for the deferred stages, to be recorded when each starts: the exact upscaler, video and audio reference weights and their licenses; whether the MP4 encoder dependency is acceptable for the base extra or stays optional; the native engine language; the first optimization worth advertising; and the certificate tooling expected of operators in network mode.
+The delivered reference target is one SDXL base bundle on Linux x64/NVIDIA; the recorded pins are in the repository's implementation decisions. Open decisions for the deferred stages, to be recorded when each starts: the exact upscaler, video and audio reference weights and their licenses; whether the MP4 encoder dependency is acceptable for the base extra or stays optional; confirmation of Rust for the native engine; the first optimization worth advertising; and the certificate tooling expected of operators in network mode.
 
 The next implementation step is protocol 1.2 in the Python worker: multiple outputs, the upscale task with the `esrgan` family and loader capabilities, the conversion subcommand, automatic settings with authorized fallbacks and device identity, together with the conformance suite that every later backend must pass. The [implementation plan](docs/implementation-plan.md) sequences the rest.
