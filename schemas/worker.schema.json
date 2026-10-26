@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jxburros/Media-Engine/schemas/worker.schema.json",
-  "title": "Media Worker 1.0 request schemas",
+  "title": "Media Worker 1.1 request schemas",
   "$defs": {
     "bundle": {
       "type": "object",
@@ -118,7 +118,10 @@
       "additionalProperties": false,
       "properties": {
         "protocol": {
-          "const": "media-worker/1.0"
+          "enum": [
+            "media-worker/1.0",
+            "media-worker/1.1"
+          ]
         },
         "attempt_id": {
           "type": "string",
@@ -129,7 +132,10 @@
           "pattern": "^sha256:[a-f0-9]{64}$"
         },
         "task": {
-          "const": "text-to-image"
+          "enum": [
+            "text-to-image",
+            "image-to-image"
+          ]
         },
         "inputs": {
           "type": "object",
@@ -143,6 +149,11 @@
             "negative_prompt": {
               "type": "string",
               "maxLength": 10000
+            },
+            "image": {
+              "type": "string",
+              "pattern": "^input_[a-f0-9]{32}$",
+              "description": "Opaque handle returned by POST /v1/inputs; required for image-to-image and forbidden otherwise"
             }
           },
           "required": [
@@ -185,6 +196,12 @@
             },
             "scheduler": {
               "const": "euler"
+            },
+            "strength": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "description": "image-to-image only; effective steps are floor(steps \u00d7 strength) and must be at least 1"
             }
           },
           "required": [
@@ -205,6 +222,53 @@
         "task",
         "inputs",
         "parameters"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "task": {
+                "const": "image-to-image"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.1"
+              },
+              "inputs": {
+                "required": [
+                  "prompt",
+                  "image"
+                ]
+              },
+              "parameters": {
+                "required": [
+                  "strength"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "inputs": {
+                "not": {
+                  "required": [
+                    "image"
+                  ]
+                }
+              },
+              "parameters": {
+                "not": {
+                  "required": [
+                    "strength"
+                  ]
+                }
+              }
+            }
+          }
+        }
       ]
     },
     "load": {
@@ -212,7 +276,10 @@
       "additionalProperties": false,
       "properties": {
         "protocol": {
-          "const": "media-worker/1.0"
+          "enum": [
+            "media-worker/1.0",
+            "media-worker/1.1"
+          ]
         },
         "bundle": {
           "$ref": "#/$defs/bundle"
@@ -239,6 +306,29 @@
             "attention",
             "offload"
           ]
+        },
+        "adapters": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "media-worker/1.1 only; LoRA adapters that become part of the loaded identity",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {
+                "$ref": "#/$defs/adapter"
+              },
+              "scale": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              }
+            },
+            "required": [
+              "adapter",
+              "scale"
+            ]
+          }
         }
       },
       "required": [
@@ -252,11 +342,185 @@
       "additionalProperties": false,
       "properties": {
         "protocol": {
-          "const": "media-worker/1.0"
+          "enum": [
+            "media-worker/1.0",
+            "media-worker/1.1"
+          ]
         }
       },
       "required": [
         "protocol"
+      ]
+    },
+    "input_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Response of POST /v1/inputs and GET /v1/inputs/{input_id}",
+      "properties": {
+        "input_id": {
+          "type": "string",
+          "pattern": "^input_[a-f0-9]{32}$"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "mime_type": {
+          "const": "image/png"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2048,
+          "multipleOf": 8
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 2048,
+          "multipleOf": 8
+        }
+      },
+      "required": [
+        "input_id",
+        "session_id",
+        "mime_type",
+        "size",
+        "sha256",
+        "width",
+        "height"
+      ]
+    },
+    "memory_estimate": {
+      "type": "object",
+      "description": "Returned by /v1/validate for a load body and recorded on a successful load operation",
+      "properties": {
+        "value_mb": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "basis": {
+          "type": "string"
+        },
+        "precision": {
+          "enum": [
+            "float16",
+            "float32"
+          ]
+        },
+        "device": {
+          "type": "string"
+        },
+        "uncertainty": {
+          "type": "string"
+        },
+        "roles": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "value_mb",
+        "source",
+        "uncertainty"
+      ]
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "adapter_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,80}$"
+        },
+        "artifact_handle": {
+          "type": "string"
+        },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "license": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "adapter_id",
+        "artifact_handle",
+        "files",
+        "digest",
+        "source"
+      ]
+    },
+    "validate_adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "media-worker/1.1"
+        },
+        "adapters": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "media-worker/1.1 only; LoRA adapters that become part of the loaded identity",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {
+                "$ref": "#/$defs/adapter"
+              },
+              "scale": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              }
+            },
+            "required": [
+              "adapter",
+              "scale"
+            ]
+          }
+        }
+      },
+      "required": [
+        "protocol",
+        "adapters"
       ]
     }
   },
@@ -269,6 +533,9 @@
     },
     {
       "$ref": "#/$defs/unload"
+    },
+    {
+      "$ref": "#/$defs/validate_adapters"
     }
   ]
 }

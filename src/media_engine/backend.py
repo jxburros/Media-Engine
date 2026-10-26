@@ -1,128 +1,161 @@
-"""Offline Diffusers adapter. No inference dependencies are imported by the API server."""
+"""Offline Diffusers adapters. No inference dependencies are imported by the API server."""
 
 import importlib.util
 import importlib.metadata
 import os
 import resource
 
-from .contracts import DEFAULTS
+from .contracts import (
+    ADAPTER_FORMAT,
+    ADAPTER_TARGETS,
+    DEFAULTS,
+    LIMITS,
+    MAX_ADAPTERS,
+    PROTOCOL,
+    SUPPORTED_PROTOCOLS,
+    TASK_DEFAULTS,
+    TASKS,
+    WORKER_VERSION,
+    effective_steps,
+    memory_estimate,
+)
+
+DEPENDENCIES = (
+    ("torch", "torch"),
+    ("diffusers", "diffusers"),
+    ("transformers", "transformers"),
+    ("accelerate", "accelerate"),
+    ("safetensors", "safetensors"),
+    ("Pillow", "PIL"),
+    ("peft", "peft"),
+)
 
 
 class Cancelled(Exception):
     pass
 
 
-class DiffusersBackend:
-    backend_id = "diffusers-sdxl"
+def offline_environment():
+    os.environ.update(
+        HF_HUB_OFFLINE="1",
+        TRANSFORMERS_OFFLINE="1",
+        HF_HUB_DISABLE_TELEMETRY="1",
+        DO_NOT_TRACK="1",
+    )
+
+
+class TorchBackend:
+    """Shared readiness, device and measurement behavior for both SDXL backends."""
+
+    backend_id = "torch"
+    ownership = "reference"
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
-        self.pipe = None
         self.device = device
         self.memory_budget_mb = memory_budget_mb
+        self.loaded_estimate = None
+
+    def missing_dependencies(self):
+        return [
+            name
+            for name, module in DEPENDENCIES
+            if importlib.util.find_spec(module) is None
+        ]
+
+    def device_available(self):
+        if self.missing_dependencies():
+            return False
+        import torch
+
+        return self.device == "cpu" or (
+            torch.cuda.is_available()
+            and int(self.device.split(":")[1]) < torch.cuda.device_count()
+        )
 
     def capabilities(self):
-        missing = [
-            m
-            for m in (
-                "torch",
-                "diffusers",
-                "transformers",
-                "accelerate",
-                "safetensors",
-                "PIL",
-            )
-            if importlib.util.find_spec(m) is None
-        ]
-        ready = not missing
-        device_available = False
-        if ready:
-            import torch
-
-            device_available = self.device == "cpu" or (
-                torch.cuda.is_available()
-                and int(self.device.split(":")[1]) < torch.cuda.device_count()
-            )
+        missing = self.missing_dependencies()
+        device_available = self.device_available()
         return {
-            "protocol": "media-worker/1.0",
-            "worker_version": "0.1.0",
+            "protocol": PROTOCOL,
+            "supported_protocols": list(SUPPORTED_PROTOCOLS),
+            "worker_version": WORKER_VERSION,
             "backend_id": self.backend_id,
-            "ready": ready and device_available,
+            "ownership": self.ownership,
+            "ready": not missing and device_available,
             "missing_dependencies": missing,
             "device": self.device,
             "device_available": device_available,
             "memory_budget_mb": self.memory_budget_mb,
-            "memory_estimate": {
+            "memory_estimate": self.loaded_estimate
+            or {
                 "value_mb": None,
                 "source": "unavailable",
-                "uncertainty": "unknown",
+                "uncertainty": "no bundle validated or loaded in this session",
             },
             "dependencies": {
                 name: importlib.metadata.version(name)
                 if importlib.util.find_spec(module) is not None
                 else None
-                for name, module in (
-                    ("torch", "torch"),
-                    ("diffusers", "diffusers"),
-                    ("transformers", "transformers"),
-                    ("accelerate", "accelerate"),
-                    ("safetensors", "safetensors"),
-                    ("Pillow", "PIL"),
-                )
+                for name, module in DEPENDENCIES
             },
             "max_concurrency": 1,
             "model_families": ["sdxl-base"],
-            "tasks": ["text-to-image"],
+            "tasks": list(TASKS),
+            "task_parameters": {
+                "text-to-image": {"inputs": ["prompt", "negative_prompt"]},
+                "image-to-image": {
+                    "inputs": ["prompt", "negative_prompt", "image"],
+                    "parameters": ["strength"],
+                    "input_formats": ["image/png"],
+                },
+            },
+            "adapters": {
+                "formats": [ADAPTER_FORMAT],
+                "targets": list(ADAPTER_TARGETS),
+                "max_adapters": MAX_ADAPTERS,
+                "scale": LIMITS["adapter_scale"],
+                "identity": "load",
+            },
             "defaults": DEFAULTS,
+            "task_defaults": TASK_DEFAULTS,
             "load_defaults": {
                 "precision": "float32" if self.device == "cpu" else "float16",
                 "attention": "sdpa",
                 "offload": "none",
             },
-            "limits": {
-                "width": [64, 2048],
-                "height": [64, 2048],
-                "steps": [1, 150],
-                "guidance": [0, 30],
-                "size_multiple": 8,
-            },
+            "limits": LIMITS,
             "precisions": ["float32"]
             if self.device == "cpu"
             else ["float16", "float32"],
         }
 
-    def load(self, root, options):
-        os.environ.update(
-            HF_HUB_OFFLINE="1",
-            TRANSFORMERS_OFFLINE="1",
-            HF_HUB_DISABLE_TELEMETRY="1",
-            DO_NOT_TRACK="1",
-        )
+    def estimate(self, root, options, adapters=()):
+        estimate = memory_estimate(root, options["precision"], self.device)
+        bytes_per_element = {"float16": 2, "float32": 4}[options["precision"]]
+        estimate["adapters"] = [
+            {
+                "adapter_id": record["adapter_id"],
+                "parameters": layout["parameters"],
+                "loaded_mb": layout["parameters"] * bytes_per_element // 1024**2,
+            }
+            for record, _root, _weights, _scale, layout in adapters
+        ]
+        estimate["value_mb"] += sum(a["loaded_mb"] for a in estimate["adapters"])
+        self.loaded_estimate = estimate
+        return estimate
+
+    def apply_budget(self):
         import torch
-        from diffusers import StableDiffusionXLPipeline
-        from diffusers.models.attention_processor import AttnProcessor2_0
 
         if self.device.startswith("cuda") and self.memory_budget_mb:
             total = torch.cuda.get_device_properties(self.device).total_memory
             torch.cuda.set_per_process_memory_fraction(
                 min(1.0, self.memory_budget_mb * 1024**2 / total), self.device
             )
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            str(root),
-            local_files_only=True,
-            use_safetensors=True,
-            torch_dtype=getattr(torch, options["precision"]),
-            add_watermarker=False,
-        )
-        pipe.unet.set_attn_processor(AttnProcessor2_0())
-        pipe.vae.set_attn_processor(AttnProcessor2_0())
-        pipe.to(self.device)
-        pipe.set_progress_bar_config(disable=True)
-        self.pipe = pipe
 
-    def unload(self):
+    def release_device(self):
         import gc
 
-        self.pipe = None
         gc.collect()
         if importlib.util.find_spec("torch") is not None:
             import torch
@@ -135,22 +168,109 @@ class DiffusersBackend:
                 }
         return {"allocated_mb": None, "reserved_mb": None}
 
-    def generate(self, request, destination, emit, cancelled):
+    def measurements(self):
         import torch
 
-        params = request["parameters"]
-        pipe = self.pipe
-        if pipe is None:
-            raise RuntimeError("Model not loaded")
+        cuda = self.device.startswith("cuda")
+        return {
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(self.device) // 1024**2
+            if cuda
+            else None,
+            "peak_reserved_mb": torch.cuda.max_memory_reserved(self.device) // 1024**2
+            if cuda
+            else None,
+            "process_peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            / 1024,
+        }
+
+    def begin(self, cancelled):
+        import torch
+
         if self.device.startswith("cuda"):
             torch.cuda.reset_peak_memory_stats(self.device)
         if cancelled.is_set():
             raise Cancelled()
+
+    def finish(self):
+        import torch
+
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
+    def load_image(self, path, width, height):
+        """Decode the approved PNG input; a size other than the request is an error, not a resize."""
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image.load()
+            if image.size != (width, height):
+                raise ValueError("input image size does not match the request")
+            return image.convert("RGB")
+
+
+class DiffusersBackend(TorchBackend):
+    """Reference worker stage: the complete Diffusers pipelines execute inference."""
+
+    backend_id = "diffusers-sdxl"
+    ownership = "reference"
+
+    def __init__(self, device="cuda:0", memory_budget_mb=None):
+        super().__init__(device, memory_budget_mb)
+        self.pipe = None
+        self.img2img = None
+
+    def load(self, root, options, adapters=()):
+        offline_environment()
+        import torch
+        from diffusers import StableDiffusionXLPipeline
+        from diffusers.models.attention_processor import AttnProcessor2_0
+
+        self.apply_budget()
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            str(root),
+            local_files_only=True,
+            use_safetensors=True,
+            torch_dtype=getattr(torch, options["precision"]),
+            add_watermarker=False,
+        )
+        pipe.unet.set_attn_processor(AttnProcessor2_0())
+        pipe.vae.set_attn_processor(AttnProcessor2_0())
+        if adapters:
+            # The library injects PEFT layers; adapters are part of this load's identity.
+            for record, adapter_root, weights, _scale, _layout in adapters:
+                pipe.load_lora_weights(
+                    str(adapter_root),
+                    weight_name=weights.name,
+                    adapter_name=record["adapter_id"],
+                    local_files_only=True,
+                )
+            pipe.set_adapters(
+                [record["adapter_id"] for record, *_ in adapters],
+                [float(scale) for _r, _a, _w, scale, _l in adapters],
+            )
+        pipe.to(self.device)
+        pipe.set_progress_bar_config(disable=True)
+        self.pipe = pipe
+        self.img2img = None
+
+    def unload(self):
+        self.pipe = None
+        self.img2img = None
+        return self.release_device()
+
+    def generate(self, request, destination, emit, cancelled, image_path=None):
+        import torch
+
+        params = request["parameters"]
+        task = request["task"]
+        pipe = self.pipe
+        if pipe is None:
+            raise RuntimeError("Model not loaded")
+        self.begin(cancelled)
         try:
             pipe.set_progress_bar_config(disable=True)
-            pipe.to(self.device)
-            if cancelled.is_set():
-                raise Cancelled()
+            total = effective_steps(params, task)
             emit("stage", {"stage": "encoding"})
             with torch.inference_mode():
                 embeddings = pipe.encode_prompt(
@@ -159,6 +279,8 @@ class DiffusersBackend:
                     negative_prompt=request["inputs"].get("negative_prompt"),
                     do_classifier_free_guidance=params["guidance"] > 1,
                 )
+                if cancelled.is_set():
+                    raise Cancelled()
                 emit("stage", {"stage": "sampling"})
 
                 def step(pipeline, index, timestep, values):
@@ -169,19 +291,17 @@ class DiffusersBackend:
                         {
                             "stage": "sampling",
                             "completed_steps": index + 1,
-                            "total_steps": params["steps"],
+                            "total_steps": total,
                             "scope": "stage",
                         },
                     )
                     return values
 
-                latent = pipe(
+                common = dict(
                     prompt_embeds=embeddings[0],
                     negative_prompt_embeds=embeddings[1],
                     pooled_prompt_embeds=embeddings[2],
                     negative_pooled_prompt_embeds=embeddings[3],
-                    width=params["width"],
-                    height=params["height"],
                     num_inference_steps=params["steps"],
                     guidance_scale=params["guidance"],
                     generator=torch.Generator(device=self.device).manual_seed(
@@ -189,7 +309,23 @@ class DiffusersBackend:
                     ),
                     callback_on_step_end=step,
                     output_type="latent",
-                ).images
+                )
+                if task == "image-to-image":
+                    from diffusers import StableDiffusionXLImg2ImgPipeline
+
+                    if self.img2img is None:
+                        self.img2img = StableDiffusionXLImg2ImgPipeline.from_pipe(
+                            pipe, requires_aesthetics_score=False
+                        )
+                        self.img2img.set_progress_bar_config(disable=True)
+                    image = self.load_image(image_path, params["width"], params["height"])
+                    latent = self.img2img(
+                        image=image, strength=params["strength"], **common
+                    ).images
+                else:
+                    latent = pipe(
+                        width=params["width"], height=params["height"], **common
+                    ).images
                 if cancelled.is_set():
                     raise Cancelled()
                 emit("stage", {"stage": "decoding"})
@@ -206,23 +342,17 @@ class DiffusersBackend:
                     raise Cancelled()
                 emit("stage", {"stage": "saving"})
                 output.save(destination, format="PNG")
-                measured = (
-                    torch.cuda.max_memory_allocated(self.device) // 1024**2
-                    if self.device.startswith("cuda")
-                    else None
-                )
-                return {
-                    "peak_allocated_mb": measured,
-                    "peak_reserved_mb": torch.cuda.max_memory_reserved(self.device)
-                    // 1024**2
-                    if self.device.startswith("cuda")
-                    else None,
-                    "process_peak_rss_mb": resource.getrusage(
-                        resource.RUSAGE_SELF
-                    ).ru_maxrss
-                    / 1024,
-                }
+                return {"effective_steps": total, **self.measurements()}
         finally:
-            if self.device.startswith("cuda"):
-                torch.cuda.synchronize(self.device)
-                torch.cuda.empty_cache()
+            self.finish()
+
+
+BACKENDS = {}
+
+
+def backend_class(backend_id):
+    from .pipeline import OwnedPipelineBackend
+
+    BACKENDS.setdefault(DiffusersBackend.backend_id, DiffusersBackend)
+    BACKENDS.setdefault(OwnedPipelineBackend.backend_id, OwnedPipelineBackend)
+    return BACKENDS[backend_id]
