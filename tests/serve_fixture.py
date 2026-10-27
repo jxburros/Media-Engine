@@ -12,6 +12,12 @@ plus ROOT/catalog.json (handle â†’ directory), ROOT/registrations.json (handle â
 adapter registration) and ROOT/conformance.json (the conformance suite's registration document).
 Every option also reads an environment variable so a supervisor's test can set it without
 changing the launch command.
+
+Network mode takes the worker's own flags and rules (media_engine.server.network_configuration):
+--bind, --tls-cert, --tls-key, --tls-client-ca and --no-parent-watch, also read from
+MEDIA_ENGINE_FIXTURE_BIND, _TLS_CERT, _TLS_KEY, _TLS_CLIENT_CA and _NO_PARENT_WATCH=1.
+tests/certs holds a fixture CA, server and client certificates; copy server.key to a 0600 file
+first, because the worker refuses a key readable by group or others.
 """
 
 import argparse
@@ -29,7 +35,14 @@ from fixture import (
     make_esrgan_bundle,
 )
 from media_engine.contracts import SUPPORTED_PROTOCOLS
-from media_engine.server import Worker, create_server, launch_protocol
+from media_engine.server import (
+    NetworkError,
+    Worker,
+    add_network_arguments,
+    create_server,
+    launch_protocol,
+    network_configuration,
+)
 
 
 def env(name, default=None):
@@ -72,7 +85,19 @@ parser.add_argument(
 parser.add_argument("--output-side", type=int, default=number("OUTPUT_SIDE"))
 parser.add_argument("--max-retained", type=int, default=number("MAX_RETAINED") or 128)
 parser.add_argument("--max-storage-mb", type=int, default=number("MAX_STORAGE_MB") or 1024)
+add_network_arguments(parser)
+parser.set_defaults(
+    bind=env("BIND", "127.0.0.1"),
+    tls_cert=env("TLS_CERT"),
+    tls_key=env("TLS_KEY"),
+    tls_client_ca=env("TLS_CLIENT_CA"),
+    no_parent_watch=env("NO_PARENT_WATCH") == "1",
+)
 args = parser.parse_args()
+try:
+    bind, tls = network_configuration(args)
+except NetworkError as exc:
+    parser.error(str(exc))
 protocols = SUPPORTED_PROTOCOLS[: SUPPORTED_PROTOCOLS.index(args.protocol) + 1]
 precisions = [p for p in args.precisions.split(",") if p]
 if not precisions or any(p not in ("float16", "float32") for p in precisions):
@@ -124,7 +149,14 @@ worker = Worker(
     max_storage_mb=args.max_storage_mb,
     protocols=protocols,
 )
-server = create_server(worker, os.environ["MEDIA_ENGINE_TOKEN"], 0)
+server = create_server(
+    worker,
+    os.environ["MEDIA_ENGINE_TOKEN"],
+    0,
+    bind,
+    tls,
+    ownership_available=not args.no_parent_watch,
+)
 record = {
     "protocol": launch_protocol(protocols),  # see media_engine.server.startup_record
     "supported_protocols": list(protocols),
@@ -138,6 +170,7 @@ record = {
 }
 if worker.speaks_1_2:
     record["device_identity"] = worker.device_identity()
+    record.update(worker.transport)
 print(json.dumps(record), flush=True)
 sys.stdout.flush()
 server.serve_forever()

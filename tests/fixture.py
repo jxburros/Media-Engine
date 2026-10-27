@@ -27,7 +27,7 @@ from media_engine.contracts import (
 from media_engine import png as png_module
 from media_engine.upscale import architecture, tile_count, validate_config
 
-FIXTURE_VERSION = "0.4.0-test-fixture"
+FIXTURE_VERSION = "0.5.0-test-fixture"
 NOTICE = "TEST FIXTURE ONLY - NOT MODEL WEIGHTS"
 
 

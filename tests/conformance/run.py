@@ -4,6 +4,9 @@
     python -m tests.conformance.run --registration ROOT/conformance.json \\
         --launch python tests/serve_fixture.py ROOT
 
+Over network mode (an https:// URL, or a launched worker whose startup record says
+`scheme: "https"`) pass --tls-ca, --tls-cert and --tls-key for mutual TLS.
+
 With --url the credential is read from the environment variable named by --token-env. With
 --launch the suite starts the worker itself (generating a credential, reading the startup record)
 and stops it afterwards; only a launched worker can pass the startup-record check. A worker is
@@ -68,6 +71,16 @@ def launch(command, token):
     return process, json.loads(line)
 
 
+def launched_url(record):
+    """The URL of a worker the suite launched, from its startup record."""
+    host = record.get("bind") or "127.0.0.1"
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{record.get('scheme', 'http')}://{host}:{record['port']}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="media-worker protocol conformance suite")
     parser.add_argument("--url")
@@ -75,14 +88,20 @@ def main(argv=None):
     parser.add_argument("--registration", help="JSON {bundle, upscaler?, options?}")
     parser.add_argument("--startup-record", help="file holding the worker's startup record")
     parser.add_argument("--launch", nargs=argparse.REMAINDER, help="command that starts the worker")
+    parser.add_argument("--tls-ca", help="PEM CA that issued the worker's certificate")
+    parser.add_argument("--tls-cert", help="PEM client certificate for mutual TLS")
+    parser.add_argument("--tls-key", help="private key of --tls-cert")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+    for name, value in (("CA", args.tls_ca), ("CERT", args.tls_cert), ("KEY", args.tls_key)):
+        if value:
+            os.environ["MEDIA_ENGINE_TLS_" + name] = os.path.abspath(value)
     process = None
     if args.launch:
         token = secrets.token_hex(32)
         process, record = launch(args.launch, token)
         os.environ.update(
-            MEDIA_ENGINE_URL=f"http://127.0.0.1:{record['port']}",
+            MEDIA_ENGINE_URL=launched_url(record),
             MEDIA_ENGINE_TOKEN=token,
             MEDIA_ENGINE_STARTUP_RECORD=json.dumps(record),
         )
