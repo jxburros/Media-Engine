@@ -6,7 +6,8 @@ authenticated loopback HTTP, with asynchronous load/unload, a warm pipeline, one
 text-to-image and image-to-image, real sampling callbacks, cooperative cancellation, resumable SSE,
 opaque input/output handles and header-based memory estimates.
 
-The authoritative product scope is [engine-spec.md](engine-spec.md). This release delivers two of
+The authoritative product scope is [engine-spec.md](engine-spec.md); the deferred capabilities it
+specifies are sequenced in [docs/implementation-plan.md](docs/implementation-plan.md). This release delivers two of
 its backend stages behind one protocol: the **reference worker** (`diffusers-sdxl`, the complete
 Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this project assembles the
 components and runs the denoising loop itself). Native engines, LoRA, other families and custom GPU
