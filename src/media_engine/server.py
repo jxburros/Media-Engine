@@ -1,14 +1,18 @@
-"""media-worker/1.2: authenticated loopback, one warm pipeline, no waiting queue."""
+"""media-worker/1.2: authenticated loopback (or mutual-TLS network mode), one warm pipeline, no queue."""
 
 import argparse
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
+import ssl
+import stat
 import sys
 import threading
 import time
@@ -42,6 +46,10 @@ from .contracts import (
 TERMINAL = {"succeeded", "failed", "cancelled"}
 PRIVATE = {"cancel", "request", "image_path", "expected_outputs"}
 OUTPUT_ID = r"[a-z][a-z0-9_]{0,31}"
+DEFAULT_BIND = "127.0.0.1"
+PEM_CERTIFICATE = re.compile(
+    rb"-----BEGIN CERTIFICATE-----\r?\n.+?\r?\n-----END CERTIFICATE-----", re.DOTALL
+)
 
 
 def error(code, field=None):
@@ -84,6 +92,8 @@ class Worker:
         self.loaded_facts = {}
         self.max_retained, self.max_storage_mb = max_retained, max_storage_mb
         self.max_input_mb = max_input_mb
+        # Replaced by create_server with the transport actually served.
+        self.transport = transport_fields(DEFAULT_BIND)
 
     @property
     def speaks_1_2(self):
@@ -144,6 +154,7 @@ class Worker:
             }
         if self.speaks_1_2:
             info["device_identity"] = self.device_identity()
+            info.update(self.transport)
         return info
 
     def validate_load(self, body, verify=True):
@@ -616,14 +627,147 @@ class Worker:
             del self.executions[execution_id]
 
 
-def create_server(worker, token, port=7811):
+class NetworkError(ValueError):
+    """A launch transport the worker refuses; the message is for the operator, never a client."""
+
+
+class TLSMaterial:
+    """The server TLS context and certificate fingerprint, built once at launch."""
+
+    def __init__(self, context, certificate_sha256):
+        self.context, self.certificate_sha256 = context, certificate_sha256
+
+
+def transport_fields(bind, tls=None, ownership_available=True):
+    """The network-mode fields of the startup record and /v1/info (1.2 response additions)."""
+    return {
+        "scheme": "https" if tls else "http",
+        "bind": bind,
+        "certificate_sha256": tls.certificate_sha256 if tls else None,
+        "ownership_available": ownership_available,
+    }
+
+
+def add_network_arguments(parser):
+    group = parser.add_argument_group(
+        "network mode",
+        "A non-loopback --bind requires all three TLS files; the worker never serves plain HTTP "
+        "there. TLS is 1.3 with client certificates verified against --tls-client-ca.",
+    )
+    group.add_argument(
+        "--bind", default=DEFAULT_BIND, help="IP address to listen on (default 127.0.0.1)"
+    )
+    group.add_argument("--tls-cert", help="server certificate chain, PEM, leaf first (not group/other writable)")
+    group.add_argument("--tls-key", help="server private key, PEM, unencrypted, mode 0600")
+    group.add_argument("--tls-client-ca", help="CA certificate(s), PEM, that client certificates must chain to")
+    group.add_argument(
+        "--no-parent-watch",
+        action="store_true",
+        help="do not exit when inherited stdin closes (service-manager launches); "
+        "advertises ownership_available: false",
+    )
+
+
+def _read_launch_file(path, flag, private):
+    """Read a TLS file once, refusing modes that let other users change (or, for keys, read) it."""
+    try:
+        with open(path, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise NetworkError(f"{flag} must name a regular file")
+            data = stream.read()
+    except OSError:
+        raise NetworkError(f"{flag} could not be read") from None
+    if private and info.st_mode & 0o077:
+        raise NetworkError(
+            f"{flag} is accessible by group or others (mode {stat.S_IMODE(info.st_mode):04o}); "
+            "run chmod 600 on it"
+        )
+    if not private and info.st_mode & 0o022:
+        raise NetworkError(
+            f"{flag} is writable by group or others (mode {stat.S_IMODE(info.st_mode):04o}); "
+            "run chmod 644 on it"
+        )
+    return data
+
+
+def _no_password():
+    raise NetworkError("--tls-key must be an unencrypted private key")
+
+
+def tls_material(cert, key, client_ca):
+    """Build the mutual-TLS server context: TLS 1.3 minimum, client certificates required."""
+    certificate = _read_launch_file(cert, "--tls-cert", private=False)
+    _read_launch_file(key, "--tls-key", private=True)
+    authority = _read_launch_file(client_ca, "--tls-client-ca", private=False)
+    leaf = PEM_CERTIFICATE.search(certificate)
+    if not leaf:
+        raise NetworkError("--tls-cert must contain a PEM certificate")
+    try:
+        der = ssl.PEM_cert_to_DER_cert(leaf.group(0).decode("ascii"))
+    except (ValueError, UnicodeDecodeError):
+        raise NetworkError("--tls-cert must contain a PEM certificate") from None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.verify_mode = ssl.CERT_REQUIRED
+    try:
+        context.load_cert_chain(cert, key, password=_no_password)
+    except ssl.SSLError:
+        raise NetworkError("--tls-cert and --tls-key are not a matching certificate and key") from None
+    try:
+        context.load_verify_locations(cadata=authority.decode("ascii"))
+    except (ssl.SSLError, ValueError, UnicodeDecodeError):
+        raise NetworkError("--tls-client-ca must contain PEM CA certificates") from None
+    return TLSMaterial(context, hashlib.sha256(der).hexdigest())
+
+
+def network_configuration(args):
+    """Validate --bind and the TLS arguments; returns (bind, TLSMaterial or None)."""
+    try:
+        address = ipaddress.ip_address(args.bind)
+    except ValueError:
+        raise NetworkError(
+            "--bind must be an IP address such as 127.0.0.1 or 0.0.0.0, not a host name"
+        ) from None
+    material = (args.tls_cert, args.tls_key, args.tls_client_ca)
+    if any(material) and not all(material):
+        raise NetworkError("--tls-cert, --tls-key and --tls-client-ca must be given together")
+    if not address.is_loopback and not all(material):
+        raise NetworkError(
+            f"refusing to listen on non-loopback address {address} without --tls-cert, "
+            "--tls-key and --tls-client-ca: network mode requires mutual TLS and never "
+            "serves plain HTTP"
+        )
+    return str(address), tls_material(*material) if all(material) else None
+
+
+class _IPv4Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A failed or abandoned TLS handshake (plain HTTP, no or untrusted client certificate)
+        # just closes that connection; it is not a worker error.
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, OSError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _IPv6Server(_IPv4Server):
+    address_family = socket.AF_INET6
+
+
+def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownership_available=True):
     if len(token) < 32:
         raise ValueError("Worker token must contain at least 32 characters")
+    address = ipaddress.ip_address(bind)
+    if not address.is_loopback and tls is None:
+        raise NetworkError("a non-loopback address is only served over mutual TLS")
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
+            self.request.settimeout(15)
+            if isinstance(self.request, ssl.SSLSocket):
+                # In the handler thread, so a slow peer never blocks accepting others.
+                self.request.do_handshake()
             super().setup()
-            self.connection.settimeout(15)
 
         def log_message(self, *args):
             pass
@@ -800,7 +944,14 @@ def create_server(worker, token, port=7811):
 
         do_GET = do_POST = do_DELETE = handle_request
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server_class = _IPv4Server if address.version == 4 else _IPv6Server
+    server = server_class((str(address), port), Handler)
+    if tls is not None:
+        server.socket = tls.context.wrap_socket(
+            server.socket, server_side=True, do_handshake_on_connect=False
+        )
+    worker.transport = transport_fields(str(address), tls, ownership_available)
+    return server
 
 
 def main(argv=None):
@@ -826,6 +977,7 @@ def main(argv=None):
     parser.add_argument("--max-retained", type=int, default=128)
     parser.add_argument("--max-storage-mb", type=int, default=1024)
     parser.add_argument("--max-input-mb", type=int, default=32)
+    add_network_arguments(parser)
     commands = parser.add_subparsers(dest="command", metavar="{convert}")
     from .convert import add_arguments
 
@@ -856,6 +1008,11 @@ def main(argv=None):
             )
         )
         return
+    try:
+        # Before anything else is read, so an ambiguous network launch fails fast.
+        bind, tls = network_configuration(args)
+    except NetworkError as exc:
+        parser.error(str(exc))
     if not re.fullmatch(r"cuda:\d+|cpu", args.device):
         parser.error("device must be cpu or cuda:N")
     if any(
@@ -888,7 +1045,9 @@ def main(argv=None):
         args.max_storage_mb,
         args.max_input_mb,
     )
-    server = create_server(worker, token, args.port)
+    server = create_server(
+        worker, token, args.port, bind, tls, ownership_available=not args.no_parent_watch
+    )
 
     def stop(*_):
         with worker.lock:
@@ -899,8 +1058,9 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    if os.environ.get("MEDIA_ENGINE_SUPERVISED") == "1":
+    if os.environ.get("MEDIA_ENGINE_SUPERVISED") == "1" and not args.no_parent_watch:
         # The supervisor owns stdin; EOF means its process exited (including a crash).
+        # --no-parent-watch (service-manager launches) leaves only SIGTERM/SIGINT.
         def parent_watch():
             sys.stdin.buffer.read()
             stop()
@@ -940,6 +1100,7 @@ def startup_record(worker, server, **extra):
     }
     if worker.speaks_1_2:
         record["device_identity"] = worker.device_identity()
+        record.update(worker.transport)
     return record
 
 
