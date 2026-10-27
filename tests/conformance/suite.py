@@ -8,6 +8,13 @@ Configuration comes from the environment so the same suite measures any backend:
                                "upscaler": <esrgan registration, needed when upscale is
                                advertised>, "options": <optional load options>}
   MEDIA_ENGINE_STARTUP_RECORD  the worker's startup record (JSON text) when the suite launched it
+  MEDIA_ENGINE_TLS_CA          for an https:// URL (network mode): PEM CA that issued the
+                               worker's certificate (default: the system trust store)
+  MEDIA_ENGINE_TLS_CERT        for an https:// URL: PEM client certificate presented to the
+  MEDIA_ENGINE_TLS_KEY         worker, and its private key (mutual TLS)
+
+Transport settings change how the suite connects, never what it asserts: a worker passes the same
+sections over mutual TLS as over loopback HTTP.
 
 A section that cannot run for lack of configuration is skipped, and a skipped section means the
 worker is not reported conformant (see run.py). A section about a minor or task the worker does
@@ -19,6 +26,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -47,10 +55,21 @@ def make_png(width, height, color=(0x20, 0x90, 0x50)):
     )
 
 
+def tls_context():
+    """The client side of network mode: verify the worker and present a client certificate."""
+    context = ssl.create_default_context(cafile=os.environ.get("MEDIA_ENGINE_TLS_CA") or None)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    cert = os.environ.get("MEDIA_ENGINE_TLS_CERT")
+    if cert:
+        context.load_cert_chain(cert, os.environ.get("MEDIA_ENGINE_TLS_KEY") or None)
+    return context
+
+
 class Client:
     def __init__(self, url, token):
         self.url, self.token = url.rstrip("/"), token
         self.errors = []  # every error body seen, for the privacy section
+        self.tls = tls_context() if urlsplit(self.url).scheme == "https" else None
 
     def call(self, method, path, body=None, data=None, headers=None, auth=True):
         headers = dict(headers or {})
@@ -61,7 +80,7 @@ class Client:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60, context=self.tls) as response:
                 payload = response.read()
                 status, response_headers = response.status, response.headers
         except urllib.error.HTTPError as exc:
@@ -83,6 +102,8 @@ class Client:
         """Read the SSE stream to its end; returns (status, [event dicts])."""
         parts = urlsplit(self.url)
         connection = socket.create_connection((parts.hostname, parts.port), timeout=60)
+        if self.tls:
+            connection = self.tls.wrap_socket(connection, server_hostname=parts.hostname)
         headers = f"Authorization: Bearer {self.token}\r\nHost: {parts.hostname}\r\n"
         if last_event_id is not None:
             headers += f"Last-Event-ID: {last_event_id}\r\n"

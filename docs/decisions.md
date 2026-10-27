@@ -5,6 +5,46 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
 0.4.0.
 
+## 0.5.0 — network mode (protocol 1.2)
+
+- **No new dependency.** TLS is the standard-library `ssl` module over the OpenSSL that CPython
+  links; nothing is added to `pyproject.toml`, the extras or `uv.lock` (only the package's own
+  version line changed). The ledger below is unchanged.
+- **The minor stays 1.2.** `scheme`, `bind`, `certificate_sha256` and `ownership_available` are
+  response additions, which 1.2 permits; no request, event or error changed. They are reported only
+  by a worker that speaks 1.2, like `device_identity`, so the 1.1-pinned fixture still reproduces
+  the 0.3.0 surface. The startup record's `protocol` stays `media-worker/1.1`.
+- **`--bind` takes an IP address literal, never a host name.** Whether a host name is loopback
+  depends on resolution at launch; refusing names keeps "non-loopback needs TLS" unambiguous.
+  `0.0.0.0`, `::` and every non-`127.0.0.0/8`, non-`::1` address count as non-loopback.
+- **TLS on loopback is accepted without a warning.** The plan calls it allowed but pointless; tests
+  and a future local TLS supervisor need it, and refusing would only add a flag. Partial TLS
+  material (one or two of the three files) is refused on every address.
+- **File modes are checked as permission bits, not exact values.** The key must have no group or
+  other bits (0600, 0400 …); certificate and CA must not be group/other writable (0644, 0444 …).
+  Ownership is not checked. Encrypted keys are refused instead of prompting on a service launch.
+  Python's `load_cert_chain` takes paths, so the certificate and key are opened again by OpenSSL
+  immediately after the mode check; both happen once, at launch, and nothing reloads them.
+- **The handshake runs in the connection's thread** (`do_handshake_on_connect=False`, then an
+  explicit handshake under the existing 15 s socket timeout), so a stalled peer cannot block the
+  accept loop. A failed handshake closes the connection without logging.
+- **`certificate_sha256` is the lowercase hex SHA-256 of the leaf certificate's DER** (the first
+  certificate in `--tls-cert`), `null` without TLS. It is what a supervisor pins and what
+  `getpeercert(binary_form=True)` returns.
+- **`ownership_available` is `false` exactly when `--no-parent-watch` is given**, even on
+  loopback. Without the flag it is `true`: the local launcher's SIGTERM (and, when
+  `MEDIA_ENGINE_SUPERVISED=1`, stdin close) still stop the worker; a remote supervisor must not
+  read `true` as owning the process itself.
+- **No revocation, OCSP or reload.** Rotation and revocation are restarts with new files; the
+  README states the operator's responsibilities.
+- **Test certificates are committed** under `tests/certs` with their regeneration commands; the CA
+  key was discarded, so nothing can be issued from that CA. Git drops file modes, so tests copy
+  the key to a 0600 file before launching.
+- **The conformance suite stays `media-worker-conformance/1.0`.** Only how it connects changed
+  (`MEDIA_ENGINE_TLS_*`, `run.py --tls-*`); no assertion was added or changed, so results over
+  TLS and loopback HTTP are directly comparable. Network-field assertions live in
+  `tests/test_network.py`.
+
 ## 0.4.0 — protocol 1.2
 
 - **Startup record `protocol` stays `media-worker/1.1`.** Runtime 0.3.0 refuses a startup record
@@ -48,7 +88,7 @@ or impractical to own, is pinned by checksum, and is isolated in one module so i
 Every dependency is listed below with the backend that needs it and the reason it is not owned
 code. A dependency without an entry is a defect. No external service is used at any stage.
 
-## Ledger — Python worker (0.4.0)
+## Ledger — Python worker (0.5.0, unchanged since 0.4.0)
 
 | Package       | Extra(s)                    | Imported by                                   | Why it is not owned code                                        | Next change                                      |
 | ------------- | --------------------------- | --------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
@@ -69,7 +109,7 @@ converter in an environment built from `inference-owned` alone (no accelerate, n
 
 Standard-library-only by design: the HTTP/SSE server (`http.server`), JSON, hashing, PNG reading
 and writing (`png.py`: `zlib`, `struct`), the conformance suite (`unittest`, `urllib`, `socket`),
-and later TLS in network mode (`ssl`), WAV (`wave`) and ZIP (`zipfile`). Test-only tooling not in
+TLS in network mode (`ssl`, from 0.5.0), and later WAV (`wave`) and ZIP (`zipfile`). Test-only tooling not in
 any extra: `jsonschema` was used ad hoc to check the schema against real bodies and is not a
 dependency.
 

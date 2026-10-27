@@ -1,0 +1,20 @@
+# X.509 extensions for the fixture certificates; see README.md for the commands that use them.
+[ca]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+[server]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = IP:127.0.0.1, DNS:localhost
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+
+[client]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid

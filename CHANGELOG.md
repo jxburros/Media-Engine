@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.5.0 — 2026-10-27
+
+Network mode over mutual TLS (phase E2). Protocol minor stays `media-worker/1.2`: no request,
+event or error changed, and the new fields are response additions 1.2 permits.
+
+- **Launch flags** `--bind` (IP address, default `127.0.0.1`), `--tls-cert`, `--tls-key`,
+  `--tls-client-ca` and `--no-parent-watch`. A non-loopback bind without all three TLS files is
+  refused at launch, partial TLS material is refused everywhere, and `create_server` itself
+  refuses to serve plain HTTP off loopback. TLS on loopback is allowed.
+- **Mutual TLS** with the standard-library `ssl` module: TLS 1.3 minimum, client certificate
+  required and verified against the operator's CA, handshake in the connection's thread with the
+  existing 15 s timeout. Plain HTTP, certificate-less, untrusted and TLS 1.2 clients get no HTTP
+  response. The bearer credential is still required on everything but `/health`.
+- **Launch file checks**: the key must not be accessible by group or others (0600), certificate
+  and CA must not be group/other writable (0644); encrypted keys and mismatched pairs are refused
+  with a message naming the flag. Files are read once at start and never reloaded.
+- **Transport fields** in `/v1/info` and the startup record: `scheme`, `bind`,
+  `certificate_sha256` (SHA-256 of the server certificate DER, `null` without TLS) and
+  `ownership_available` (`false` with `--no-parent-watch`). The inherited-stdin watch is skipped
+  with `--no-parent-watch`; SIGTERM handling is unchanged. A 1.1-pinned fixture omits the fields.
+- `tests/serve_fixture.py` takes the same flags (and `MEDIA_ENGINE_FIXTURE_BIND`, `_TLS_CERT`,
+  `_TLS_KEY`, `_TLS_CLIENT_CA`, `_NO_PARENT_WATCH`) so supervisors can run integration tests in
+  network mode; its defaults and existing options are unchanged.
+- `tests/certs`: committed test CA, server (SAN `127.0.0.1`, `localhost`), client and untrusted
+  client certificates (EC P-256, 10 years) with the regeneration commands; never generated at
+  test time. They ship in the sdist.
+- The conformance suite (still `media-worker-conformance/1.0`; no assertion changed) connects over
+  `https` with `MEDIA_ENGINE_TLS_CA`/`_CERT`/`_KEY` or `run.py --tls-ca/--tls-cert/--tls-key`.
+  `tests/test_network.py` runs it over mutual TLS and asserts the same section results as loopback
+  HTTP, plus the refusals, file modes, transport fields and parent watch.
+- Schema `$defs.transport`; README "Network mode"; `docs/protocol.md` Transport section;
+  compatibility row; `docs/decisions.md` 0.5.0 entry. No new dependency.
+
+Validation, stated plainly: TLS was exercised on loopback only (`127.0.0.1`, and `0.0.0.0`
+reached through loopback) on one Linux x64 host; no traffic crossed a real network, and no
+remote supervisor exists yet (Runtime 0.7.0 is the consumer). Runtime 0.4.0 and 0.5.0 (Go)
+integration suites pass unchanged against this release over loopback HTTP. The inference extras
+are not installed in this workspace, so the CPU inference, conversion and real-backend
+conformance runs were not repeated for 0.5.0 (no inference code changed). There is no GPU here;
+the 0.4.0 GPU checklist is still open and network mode adds its own checklist in
+`docs/compatibility.md`.
+
 ## 0.4.0 — 2026-10-27
 
 Protocol `media-worker/1.2` (1.0 and 1.1 still served unchanged; every new behavior is gated on

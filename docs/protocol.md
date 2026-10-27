@@ -1,14 +1,15 @@
 # media-worker/1.2 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.4.0 speaks
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.5.0 speaks
 `media-worker/1.2` and still accepts `media-worker/1.0` and `media-worker/1.1` requests;
 `/v1/info`, `/v1/capabilities` and the startup record list `supported_protocols`. Every 1.2
 behavior is gated on the request's `protocol` minor: a 1.0/1.1 request sees exactly the 0.3.0
 responses (response objects may gain fields, never lose or change them). A supervisor picks the highest minor both sides
 support and sends that value in every request's `protocol` field. A different major is rejected
 with `protocol_mismatch`. Request schemas are in `schemas/worker.schema.json`; unknown fields and
-options are errors. Authentication is a bearer credential supplied through the launch environment,
-and all sockets bind loopback.
+options are errors. Authentication is a bearer credential supplied through the launch environment.
+Sockets bind loopback unless the operator launches network mode over mutual TLS (see
+[Transport](#transport)); Engine 0.5.0 added that without a new minor.
 
 `GET /v1/info` reports service state independently of device/dependency readiness and loaded model
 identity, plus the backend's `ownership` stage. `GET /v1/capabilities` advertises implemented tasks,
@@ -47,6 +48,7 @@ A 1.0 request cannot name `image-to-image`; the worker returns `unsupported` wit
 | `device_identity`                                | `/v1/info` and the startup record: device, index, name, memory, hashed `host_id`, pid         |
 | `bundle.source.conversion`                       | Provenance of a `media-engine convert` output, checked against its `conversion.json`          |
 | `highest_protocol` (startup record)              | The highest minor served; the record's `protocol` stays `media-worker/1.1` (see Discovery)    |
+| `scheme`, `bind`, `certificate_sha256`, `ownership_available` (0.5.0) | `/v1/info` and the startup record: the transport served (see [Transport](#transport)) |
 
 A 1.1 caller sees none of this: `count` is `unsupported` (field `count`), `upscale` is
 `unsupported` (field `task`), `precision: "auto"` is `unsupported` (field `options`, as any
@@ -61,7 +63,7 @@ section; [compatibility.md](compatibility.md) records the result.
 ### Discovery in 1.2
 
 The startup record is `{protocol, supported_protocols, highest_protocol, worker_version,
-backend_id, session_id, port, pid, device_identity}`. Its `protocol` field names the launch-record
+backend_id, session_id, port, pid, device_identity}`, plus the transport fields from Engine 0.5.0. Its `protocol` field names the launch-record
 minor and stays `media-worker/1.1`: the record's shape only gained fields in 1.2, and Runtime 0.3.0
 refuses a startup record whose `protocol` it does not know. Supervisors negotiate from
 `supported_protocols` (identical in the record, `/v1/info` and `/v1/capabilities`); `/v1/info`
@@ -284,6 +286,54 @@ keeps the requested `options` (so a supervisor's load-identity comparison is unc
 `applied_fallbacks`. After a CPU fallback `capabilities.ready` is true while `device_available`
 stays false.
 
+
+## Transport
+
+Engine 0.5.0 adds network mode as response fields within minor 1.2; no request, event or error
+changes, and a supervisor that ignores the new fields sees 0.4.0 behavior. The launch flags are:
+
+| Flag                 | Meaning                                                                                       |
+| -------------------- | --------------------------------------------------------------------------------------------- |
+| `--bind ADDRESS`     | IP address literal to listen on (default `127.0.0.1`); a host name is refused                 |
+| `--tls-cert FILE`    | PEM server certificate chain, leaf first; not writable by group or others                     |
+| `--tls-key FILE`     | PEM unencrypted private key; not readable or writable by group or others (mode 0600)           |
+| `--tls-client-ca FILE` | PEM CA certificates client certificates must chain to; not writable by group or others      |
+| `--no-parent-watch`  | Do not stop when inherited stdin closes; advertises `ownership_available: false`              |
+
+Rules:
+
+- A non-loopback `--bind` without all three TLS files is refused at launch (exit 2, a message on
+  stderr naming the missing flags); partial TLS material is refused on any address. Nothing on a
+  non-loopback address is ever served as plain HTTP, `/health` included. TLS on loopback is
+  allowed.
+- TLS 1.3 is the minimum. The client certificate is required and verified against
+  `--tls-client-ca`; a client without one, with an untrusted one, or speaking plain HTTP or an
+  older TLS version fails the handshake and receives no HTTP response. The bearer credential is
+  still required on every endpoint except `/health`: the certificate authenticates the peer, the
+  credential authorizes the session (`401 unauthorized` otherwise, exactly as on loopback).
+- The certificate, key and CA files are read once at launch and never reloaded; rotation is a
+  restart. Mode violations, unreadable files, a key that does not match the certificate or an
+  encrypted key are refused at launch with a message naming the flag.
+- SIGTERM handling is unchanged. The inherited-stdin watch (`MEDIA_ENGINE_SUPERVISED=1`) is
+  skipped with `--no-parent-watch`. A remote supervisor cannot own the process; when
+  `ownership_available` is `false` it must record a lost connection as interruption, not
+  confirmed cancellation.
+
+`/v1/info` and the startup record of a 1.2 worker carry:
+
+```json
+{"scheme": "https", "bind": "0.0.0.0",
+ "certificate_sha256": "<64 hex: SHA-256 of the server certificate's DER>",
+ "ownership_available": false}
+```
+
+On loopback HTTP they are `{"scheme": "http", "bind": "127.0.0.1", "certificate_sha256": null,
+"ownership_available": true}`. `certificate_sha256` hashes the leaf certificate the handshake
+presents, so a supervisor can pin it. The private work directory, catalog and credential stay on
+the worker host. A worker pinned to 1.1 (the test fixture's `--protocol media-worker/1.1`) omits
+these fields, as it omits `device_identity`. The conformance suite connects over `https` with
+`MEDIA_ENGINE_TLS_CA`, `MEDIA_ENGINE_TLS_CERT` and `MEDIA_ENGINE_TLS_KEY` and asserts the same
+sections either way.
 
 ## Backends
 

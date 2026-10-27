@@ -8,7 +8,7 @@ from pathlib import Path
 
 PROTOCOL = "media-worker/1.2"
 SUPPORTED_PROTOCOLS = ("media-worker/1.0", "media-worker/1.1", "media-worker/1.2")
-WORKER_VERSION = "0.4.0"
+WORKER_VERSION = "0.5.0"
 TASKS = ("text-to-image", "image-to-image", "upscale")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
 TASK_SINCE = {"text-to-image": 0, "image-to-image": 1, "upscale": 2}
