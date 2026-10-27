@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/jxburros/Media-Engine/schemas/worker.schema.json",
-  "title": "Media Worker 1.1 request schemas",
+  "$id": "https://github.com/jxburros/Media-Engine/schemas/worker-1.2.schema.json",
+  "title": "Media Worker 1.2 request and record schemas (1.0 and 1.1 shapes remain valid)",
   "$defs": {
     "bundle": {
       "type": "object",
@@ -18,14 +18,20 @@
           "pattern": "^sha256:[a-f0-9]{64}$"
         },
         "family": {
-          "const": "sdxl-base"
+          "enum": [
+            "sdxl-base",
+            "esrgan"
+          ]
         },
         "pipeline": {
-          "const": "text-to-image"
+          "enum": [
+            "text-to-image",
+            "upscale"
+          ]
         },
         "components": {
           "type": "array",
-          "minItems": 7,
+          "minItems": 2,
           "maxItems": 7,
           "items": {
             "type": "object",
@@ -39,7 +45,9 @@
                   "text_encoder_2",
                   "tokenizer",
                   "tokenizer_2",
-                  "scheduler"
+                  "scheduler",
+                  "network",
+                  "configuration"
                 ]
               },
               "artifact_handle": {
@@ -97,9 +105,19 @@
             },
             "license": {
               "type": "string"
+            },
+            "conversion": {
+              "$ref": "#/$defs/conversion"
             }
           },
           "required": []
+        },
+        "format": {
+          "enum": [
+            "diffusers-safetensors",
+            "single-file-safetensors"
+          ],
+          "description": "media-worker/1.2 only; absent means diffusers-safetensors"
         }
       },
       "required": [
@@ -111,6 +129,103 @@
         "components",
         "configuration",
         "source"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "sdxl-base"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "pipeline": {
+                "const": "text-to-image"
+              },
+              "format": {
+                "const": "diffusers-safetensors"
+              },
+              "components": {
+                "minItems": 7,
+                "maxItems": 7,
+                "items": {
+                  "properties": {
+                    "role": {
+                      "enum": [
+                        "unet",
+                        "vae",
+                        "text_encoder",
+                        "text_encoder_2",
+                        "tokenizer",
+                        "tokenizer_2",
+                        "scheduler"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "esrgan"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "format"
+            ],
+            "properties": {
+              "pipeline": {
+                "const": "upscale"
+              },
+              "format": {
+                "const": "single-file-safetensors"
+              },
+              "source": {
+                "not": {
+                  "required": [
+                    "conversion"
+                  ]
+                }
+              },
+              "components": {
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "properties": {
+                    "role": {
+                      "enum": [
+                        "network",
+                        "configuration"
+                      ]
+                    }
+                  }
+                }
+              },
+              "configuration": {
+                "properties": {
+                  "files": {
+                    "minProperties": 2,
+                    "maxProperties": 2,
+                    "required": [
+                      "config.json"
+                    ],
+                    "propertyNames": {
+                      "pattern": "^[^/]+$"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       ]
     },
     "execution": {
@@ -120,7 +235,8 @@
         "protocol": {
           "enum": [
             "media-worker/1.0",
-            "media-worker/1.1"
+            "media-worker/1.1",
+            "media-worker/1.2"
           ]
         },
         "attempt_id": {
@@ -134,7 +250,8 @@
         "task": {
           "enum": [
             "text-to-image",
-            "image-to-image"
+            "image-to-image",
+            "upscale"
           ]
         },
         "inputs": {
@@ -156,9 +273,7 @@
               "description": "Opaque handle returned by POST /v1/inputs; required for image-to-image and forbidden otherwise"
             }
           },
-          "required": [
-            "prompt"
-          ]
+          "required": []
         },
         "parameters": {
           "type": "object",
@@ -201,17 +316,33 @@
               "type": "number",
               "exclusiveMinimum": 0,
               "maximum": 1,
-              "description": "image-to-image only; effective steps are floor(steps \u00d7 strength) and must be at least 1"
+              "description": "image-to-image only; effective steps are floor(steps × strength) and must be at least 1"
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4,
+              "description": "media-worker/1.2 text-to-image only; outputs image, image_2 … image_N with seeds seed … seed+N−1"
+            },
+            "tile": {
+              "enum": [
+                0,
+                256,
+                512,
+                1024
+              ],
+              "description": "upscale only; 0 = one whole-image tile"
+            },
+            "tile_overlap": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 64,
+              "description": "upscale only; default 16"
             }
           },
           "required": [
             "width",
-            "height",
-            "steps",
-            "seed",
-            "guidance",
-            "sampler",
-            "scheduler"
+            "height"
           ]
         }
       },
@@ -235,7 +366,10 @@
           "then": {
             "properties": {
               "protocol": {
-                "const": "media-worker/1.1"
+                "enum": [
+                  "media-worker/1.1",
+                  "media-worker/1.2"
+                ]
               },
               "inputs": {
                 "required": [
@@ -245,14 +379,52 @@
               },
               "parameters": {
                 "required": [
+                  "width",
+                  "height",
+                  "steps",
+                  "seed",
+                  "guidance",
+                  "sampler",
+                  "scheduler",
                   "strength"
-                ]
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "count"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "tile"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "tile_overlap"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "task": {
+                "const": "text-to-image"
               }
             }
           },
-          "else": {
+          "then": {
             "properties": {
               "inputs": {
+                "required": [
+                  "prompt"
+                ],
                 "not": {
                   "required": [
                     "image"
@@ -260,11 +432,100 @@
                 }
               },
               "parameters": {
+                "required": [
+                  "width",
+                  "height",
+                  "steps",
+                  "seed",
+                  "guidance",
+                  "sampler",
+                  "scheduler"
+                ],
                 "not": {
-                  "required": [
-                    "strength"
+                  "anyOf": [
+                    {
+                      "required": [
+                        "strength"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "tile"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "tile_overlap"
+                      ]
+                    }
                   ]
                 }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "task": {
+                "const": "upscale"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.2"
+              },
+              "inputs": {
+                "required": [
+                  "image"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "prompt"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "negative_prompt"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "parameters": {
+                "propertyNames": {
+                  "enum": [
+                    "width",
+                    "height",
+                    "tile",
+                    "tile_overlap"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "parameters": {
+                "required": [
+                  "count"
+                ]
+              }
+            },
+            "required": [
+              "parameters"
+            ]
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.2"
               }
             }
           }
@@ -278,7 +539,8 @@
         "protocol": {
           "enum": [
             "media-worker/1.0",
-            "media-worker/1.1"
+            "media-worker/1.1",
+            "media-worker/1.2"
           ]
         },
         "bundle": {
@@ -291,8 +553,10 @@
             "precision": {
               "enum": [
                 "float16",
-                "float32"
-              ]
+                "float32",
+                "auto"
+              ],
+              "description": "auto is media-worker/1.2 only and listed in capabilities.auto_options"
             },
             "attention": {
               "const": "sdpa"
@@ -329,12 +593,89 @@
               "scale"
             ]
           }
+        },
+        "authorized_fallbacks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "cpu",
+              "lower_precision"
+            ]
+          },
+          "description": "media-worker/1.2 only"
         }
       },
       "required": [
         "protocol",
         "bundle",
         "options"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "required": [
+                  "authorized_fallbacks"
+                ]
+              },
+              {
+                "properties": {
+                  "options": {
+                    "properties": {
+                      "precision": {
+                        "const": "auto"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.2"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "protocol": {
+                "enum": [
+                  "media-worker/1.0",
+                  "media-worker/1.1"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "bundle": {
+                "properties": {
+                  "family": {
+                    "const": "sdxl-base"
+                  },
+                  "source": {
+                    "not": {
+                      "required": [
+                        "conversion"
+                      ]
+                    }
+                  }
+                },
+                "not": {
+                  "required": [
+                    "format"
+                  ]
+                }
+              }
+            }
+          }
+        }
       ]
     },
     "unload": {
@@ -344,7 +685,8 @@
         "protocol": {
           "enum": [
             "media-worker/1.0",
-            "media-worker/1.1"
+            "media-worker/1.1",
+            "media-worker/1.2"
           ]
         }
       },
@@ -428,6 +770,14 @@
         },
         "roles": {
           "type": "object"
+        },
+        "activations_mb": {
+          "type": "integer",
+          "description": "esrgan: one largest-tile activation term"
+        },
+        "count": {
+          "type": "object",
+          "description": "1.2 sdxl-base: how count scales working memory"
         }
       },
       "required": [
@@ -492,7 +842,10 @@
       "additionalProperties": false,
       "properties": {
         "protocol": {
-          "const": "media-worker/1.1"
+          "enum": [
+            "media-worker/1.1",
+            "media-worker/1.2"
+          ]
         },
         "adapters": {
           "type": "array",
@@ -521,6 +874,321 @@
       "required": [
         "protocol",
         "adapters"
+      ]
+    },
+    "conversion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "media-worker/1.2 bundle.source.conversion: the converted directory's conversion.json provenance; every field given must equal the file's",
+      "properties": {
+        "source_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reference_bundle_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "converter": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "media_engine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "diffusers": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "torch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "safetensors": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "media_engine",
+            "diffusers",
+            "torch",
+            "safetensors"
+          ]
+        },
+        "mapped_keys": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unet": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "vae": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "text_encoder": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "text_encoder_2": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "unet",
+            "vae",
+            "text_encoder",
+            "text_encoder_2"
+          ]
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "precision": {
+          "enum": [
+            "preserved",
+            "float16",
+            "float32"
+          ]
+        },
+        "unmapped_keys": {
+          "type": "array",
+          "maxItems": 0
+        },
+        "ignored_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "source_sha256",
+        "reference_bundle_digest",
+        "converter",
+        "mapped_keys"
+      ]
+    },
+    "output_record": {
+      "type": "object",
+      "description": "Snapshot outputs[] entry and output event data",
+      "properties": {
+        "output_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,31}$"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "frames": {
+          "type": "integer"
+        },
+        "fps": {
+          "type": "number"
+        },
+        "duration_seconds": {
+          "type": "number"
+        },
+        "sample_rate": {
+          "type": "integer"
+        },
+        "channels": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "output_id",
+        "mime_type",
+        "size",
+        "sha256"
+      ]
+    },
+    "device_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "index": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_memory_mb": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "host_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "host_id_source": {
+          "enum": [
+            "machine-id",
+            "hostname",
+            "fixture"
+          ]
+        },
+        "pid": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "device",
+        "index",
+        "name",
+        "total_memory_mb",
+        "host_id",
+        "host_id_source",
+        "pid"
+      ]
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "option": {
+          "enum": [
+            "precision"
+          ]
+        },
+        "requested": {
+          "const": "auto"
+        },
+        "resolved": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "option",
+        "requested",
+        "resolved",
+        "reason"
+      ]
+    },
+    "applied_fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fallback": {
+          "enum": [
+            "cpu",
+            "lower_precision"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "device": {
+          "type": "string"
+        },
+        "precision": {
+          "enum": [
+            "float16",
+            "float32"
+          ]
+        }
+      },
+      "required": [
+        "fallback",
+        "reason",
+        "device",
+        "precision"
+      ]
+    },
+    "esrgan_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "config.json of an esrgan bundle",
+      "properties": {
+        "architecture": {
+          "const": "rrdbnet"
+        },
+        "scale": {
+          "enum": [
+            2,
+            4
+          ]
+        },
+        "in_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "out_channels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "num_feat": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "num_block": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "num_grow_ch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "upsampler": {
+          "enum": [
+            "nearest-conv",
+            "pixel-shuffle"
+          ]
+        }
+      },
+      "required": [
+        "architecture",
+        "scale",
+        "in_channels",
+        "out_channels",
+        "num_feat",
+        "num_block",
+        "num_grow_ch"
       ]
     }
   },

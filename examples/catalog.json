@@ -1,1 +1,1 @@
-{"sdxl-base": "/absolute/path/to/local/sdxl-base"}
+{"sdxl-base": "/absolute/path/to/local/sdxl-base", "upscaler": "/absolute/path/to/local/realesrgan-x4"}
