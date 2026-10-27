@@ -14,13 +14,34 @@ import time
 import unittest
 from pathlib import Path
 
-from fixture import make_png
+from fixture import describe_bundle, make_png
+from media_engine import png
 from media_engine.contracts import DEFAULTS, PROTOCOL, digest
 
-HAVE_INFERENCE = all(
+# The owned pipeline needs only the inference-owned extra; the reference backend needs the full set.
+HAVE_OWNED = all(
     importlib.util.find_spec(m) is not None
-    for m in ("torch", "diffusers", "transformers", "safetensors", "PIL")
+    for m in ("torch", "diffusers", "transformers", "safetensors")
 )
+HAVE_INFERENCE = HAVE_OWNED and all(
+    importlib.util.find_spec(m) is not None for m in ("PIL", "accelerate", "peft", "numpy")
+)
+
+
+def pixels(data):
+    """Decoded RGB bytes: file bytes differ between PNG writers, pixels must not."""
+    return png.read_rgb(data)
+
+
+def difference(a, b):
+    a, b = pixels(a), pixels(b)
+    assert a[:2] == b[:2]
+    return max(abs(x - y) for x, y in zip(a[2], b[2]))
+
+
+def mean_difference(a, b):
+    a, b = pixels(a)[2], pixels(b)[2]
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
 def tiny_sdxl_bundle(root):
@@ -117,38 +138,7 @@ def tiny_sdxl_bundle(root):
     bundle_dir = root / "model"
     pipe.save_pretrained(str(bundle_dir), safe_serialization=True)
     # The tokenizer vocabulary is a test artifact; the engine only reads JSON/text here.
-    files = {
-        str(p.relative_to(bundle_dir)): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in bundle_dir.rglob("*")
-        if p.is_file()
-    }
-    roles = [
-        "unet",
-        "vae",
-        "text_encoder",
-        "text_encoder_2",
-        "tokenizer",
-        "tokenizer_2",
-        "scheduler",
-    ]
-    bundle = {
-        "schema_version": 1,
-        "bundle_id": "tiny-sdxl",
-        "family": "sdxl-base",
-        "pipeline": "text-to-image",
-        "components": [
-            {
-                "role": r,
-                "artifact_handle": "tiny",
-                "digest": digest({k: v for k, v in files.items() if k.startswith(r + "/")}),
-                "tensor_format": "safetensors" if i < 4 else "json",
-            }
-            for i, r in enumerate(roles)
-        ],
-        "configuration": {"artifact_handle": "tiny", "files": files},
-        "source": {"license": "test-only random weights"},
-    }
-    return bundle_dir, {**bundle, "bundle_digest": digest(bundle)}
+    return bundle_dir, describe_bundle(bundle_dir, "tiny", "tiny-sdxl", source={"license": "test-only random weights"})
 
 
 def tiny_lora(root, unet_dir, rank=4):
@@ -185,14 +175,32 @@ def tiny_lora(root, unet_dir, rank=4):
     return {**record, "digest": digest(record)}
 
 
-@unittest.skipUnless(HAVE_INFERENCE, "inference extra is not installed")
-class InferenceTests(unittest.TestCase):
+def tiny_esrgan_bundle(root, scale=2):
+    """A random-weight RRDBNet in the esrgan single-file layout (Real-ESRGAN key names)."""
+    import torch
+    from safetensors.torch import save_file
+
+    from fixture import ESRGAN_CONFIG
+    from media_engine import upscale
+
+    torch.manual_seed(3)
+    config = {**ESRGAN_CONFIG, "scale": scale, "num_feat": 8, "num_grow_ch": 4}
+    network = upscale.build(upscale.validate_config(config))
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.contiguous() for k, v in network.state_dict().items()}, str(root / "network.safetensors"))
+    (root / "config.json").write_text(json.dumps(config))
+    return describe_bundle(root, "tiny-upscaler", "tiny-upscaler", "esrgan")
+
+
+class Harness:
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
         cls.model_dir, cls.bundle = tiny_sdxl_bundle(cls.root)
         cls.adapter = tiny_lora(cls.root / "lora", cls.model_dir)
+        cls.upscaler = tiny_esrgan_bundle(cls.root / "upscaler")
 
     @classmethod
     def tearDownClass(cls):
@@ -206,7 +214,11 @@ class InferenceTests(unittest.TestCase):
         return Worker(
             self.root / "work" / backend_id,
             backend,
-            {"tiny": str(self.model_dir), "tiny-lora": str(self.root / "lora")},
+            {
+                "tiny": str(self.model_dir),
+                "tiny-lora": str(self.root / "lora"),
+                "tiny-upscaler": str(self.root / "upscaler"),
+            },
         )
 
     def finish(self, worker, operation=None, execution=None):
@@ -217,7 +229,29 @@ class InferenceTests(unittest.TestCase):
                 return worker.snapshot(execution)
             time.sleep(0.02)
 
-    def request(self, attempt, task="text-to-image", image=None, guidance=6):
+    def output(self, worker, snap, output_id="image"):
+        return (worker.directory / snap["execution_id"] / (output_id + ".png")).read_bytes()
+
+    def load(self, worker, bundle, adapters=(), options=None):
+        op = worker.control(
+            "load",
+            {
+                "protocol": PROTOCOL,
+                "bundle": bundle,
+                "options": options or worker.capabilities()["load_defaults"],
+                "adapters": list(adapters),
+            },
+        )
+        result = self.finish(worker, operation=op["operation_id"])
+        self.assertEqual(result["state"], "succeeded", result)
+        return result
+
+    def run_request(self, worker, body):
+        snap = self.finish(worker, execution=worker.submit(body)["execution_id"])
+        self.assertEqual(snap["state"], "succeeded", snap.get("error"))
+        return snap
+
+    def request(self, attempt, task="text-to-image", image=None, guidance=6, seed=7, count=None):
         body = {
             "protocol": PROTOCOL,
             "attempt_id": attempt,
@@ -226,74 +260,46 @@ class InferenceTests(unittest.TestCase):
             "inputs": {"prompt": "a test portrait", "negative_prompt": "window"},
             "parameters": {
                 **DEFAULTS,
-                "seed": 7,
+                "seed": seed,
                 "width": 64,
                 "height": 64,
                 "steps": 3,
                 "guidance": guidance,
             },
         }
+        if count is not None:
+            body["parameters"]["count"] = count
         if task == "image-to-image":
             body["inputs"]["image"] = image
             body["parameters"]["strength"] = 0.7
         return body
 
     def exercise(self, backend_id, adapters=()):
-        from PIL import Image
-
         worker = self.worker(backend_id)
         caps = worker.capabilities()
         self.assertTrue(caps["ready"], caps)
         self.assertEqual(caps["backend_id"], backend_id)
-        op = worker.control(
-            "load",
-            {
-                "protocol": PROTOCOL,
-                "bundle": self.bundle,
-                "options": caps["load_defaults"],
-                "adapters": list(adapters),
-            },
-        )
-        result = self.finish(worker, operation=op["operation_id"])
-        self.assertEqual(result["state"], "succeeded", result)
+        result = self.load(worker, self.bundle, adapters)
         self.assertEqual(result["memory_estimate"]["precision"], "float32")
         self.assertGreater(result["memory_estimate"]["value_mb"], 0)
-        snap = self.finish(
-            worker, execution=worker.submit(self.request("attempt_t2i"))["execution_id"]
-        )
-        self.assertEqual(snap["state"], "succeeded", snap.get("error"))
+        snap = self.run_request(worker, self.request("attempt_t2i"))
         self.assertEqual(snap["progress"]["total_steps"], 3)
         self.assertEqual(
             [e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"],
             ["encoding", "sampling", "decoding", "saving"],
         )
-        png = worker.directory / (snap["execution_id"] + ".png")
-        with Image.open(png) as image:
-            self.assertEqual(image.size, (64, 64))
-        self.assertEqual(
-            hashlib.sha256(png.read_bytes()).hexdigest(), snap["outputs"][0]["sha256"]
-        )
+        data = self.output(worker, snap)
+        self.assertEqual(png.header(data)[:2], (64, 64))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), snap["outputs"][0]["sha256"])
         # Same seed and settings reproduce bytes on the same CPU/software stack.
-        again = self.finish(
-            worker, execution=worker.submit(self.request("attempt_again"))["execution_id"]
-        )
+        again = self.run_request(worker, self.request("attempt_again"))
         self.assertEqual(again["outputs"][0]["sha256"], snap["outputs"][0]["sha256"])
         # Guidance ≤ 1 disables classifier-free guidance without changing the contract.
-        plain = self.finish(
-            worker,
-            execution=worker.submit(self.request("attempt_plain", guidance=1))[
-                "execution_id"
-            ],
-        )
-        self.assertEqual(plain["state"], "succeeded", plain.get("error"))
+        self.run_request(worker, self.request("attempt_plain", guidance=1))
         record = worker.store_input(make_png(64, 64))
-        edited = self.finish(
-            worker,
-            execution=worker.submit(
-                self.request("attempt_i2i", "image-to-image", record["input_id"])
-            )["execution_id"],
+        edited = self.run_request(
+            worker, self.request("attempt_i2i", "image-to-image", record["input_id"])
         )
-        self.assertEqual(edited["state"], "succeeded", edited.get("error"))
         self.assertEqual(edited["effective_settings"]["effective_steps"], 2)
         self.assertEqual(edited["measurements"]["effective_steps"], 2)
         self.assertEqual(edited["progress"]["total_steps"], 2)
@@ -302,60 +308,164 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(
             self.finish(worker, execution=cancelled["execution_id"])["state"], "cancelled"
         )
+        outputs = {
+            "text-to-image": data,
+            "image-to-image": self.output(worker, edited),
+        }
         unload = worker.control("unload", {"protocol": PROTOCOL})
         self.assertEqual(
             self.finish(worker, operation=unload["operation_id"])["state"], "succeeded"
         )
         self.assertIsNone(worker.loaded)
-        return {
-            "text-to-image": (worker.directory / (snap["execution_id"] + ".png")).read_bytes(),
-            "image-to-image": (
-                worker.directory / (edited["execution_id"] + ".png")
-            ).read_bytes(),
-        }
+        return outputs
 
+    def batch(self, backend_id):
+        """count: 2 output 2 reproduces a count: 1 run at seed + 1 (and output 1 at seed)."""
+        worker = self.worker(backend_id)
+        self.load(worker, self.bundle)
+        batch = self.run_request(worker, self.request("attempt_batch", count=2))
+        self.assertEqual([o["output_id"] for o in batch["outputs"]], ["image", "image_2"])
+        self.assertNotEqual(batch["outputs"][0]["sha256"], batch["outputs"][1]["sha256"])
+        self.assertEqual(batch["effective_settings"]["count"], 2)
+        first = self.run_request(worker, self.request("attempt_first"))
+        second = self.run_request(worker, self.request("attempt_second", seed=8))
+        self.assertLessEqual(difference(self.output(worker, batch), self.output(worker, first)), 1)
+        self.assertLessEqual(
+            difference(self.output(worker, batch, "image_2"), self.output(worker, second)), 1
+        )
+        return self.output(worker, batch, "image_2"), self.output(worker, second)
+
+    def upscale_run(self, backend_id):
+        worker = self.worker(backend_id)
+        loaded = self.load(worker, self.upscaler)
+        self.assertGreater(loaded["memory_estimate"]["activations_mb"], 0)
+        self.assertEqual(worker.info()["loaded_bundle"]["tasks"], ["upscale"])
+        record = worker.store_input(make_png(64, 64))
+        body = {
+            "protocol": PROTOCOL,
+            "attempt_id": "attempt_upscale",
+            "bundle_digest": self.upscaler["bundle_digest"],
+            "task": "upscale",
+            "inputs": {"image": record["input_id"]},
+            "parameters": {"width": 64, "height": 64},
+        }
+        snap = self.run_request(worker, body)
+        self.assertEqual((snap["outputs"][0]["width"], snap["outputs"][0]["height"]), (128, 128))
+        progress = [e["data"] for e in snap["events"] if e["type"] == "progress"]
+        self.assertEqual(progress[-1]["unit"], "tiles")
+        self.assertEqual(progress[-1]["stage"], "upscaling")
+        data = self.output(worker, snap)
+        self.assertEqual(png.header(data)[:2], (128, 128))
+        tiled = self.run_request(
+            worker,
+            {**body, "attempt_id": "attempt_tiled", "parameters": {"width": 64, "height": 64, "tile": 256}},
+        )
+        self.assertEqual(tiled["outputs"][0]["sha256"], snap["outputs"][0]["sha256"])
+        return data
+
+
+@unittest.skipUnless(HAVE_OWNED, "inference-owned extra is not installed")
+class OwnedInferenceTests(Harness, unittest.TestCase):
+    def test_owned_pipeline_backend(self):
+        self.exercise("owned-sdxl")
+
+    def test_owned_batch_reproduces_single_seeds(self):
+        self.batch("owned-sdxl")
+
+    def test_owned_upscale(self):
+        self.upscale_run("owned-sdxl")
+
+    def test_tiled_upscale_agrees_with_whole_image(self):
+        """Overlapping tiles stitched by `tile()` agree with one whole-image pass within one level."""
+        import threading
+
+        import torch
+
+        from media_engine import upscale
+
+        config = upscale.read_config(self.root / "upscaler")
+        network = upscale.load(
+            self.root / "upscaler", self.root / "upscaler/network.safetensors", config, "cpu", torch.float32
+        )
+        image = png.png_to_tensor(make_png(64, 64)).unsqueeze(0)
+        image[:, :, 16:40, 8:56] = torch.linspace(0, 1, 48)
+        events = []
+        never = threading.Event()
+        with torch.inference_mode():
+            whole = upscale.tile(network, image, 2, 0, 0, lambda *e: events.append(e), never, RuntimeError)
+            tiled = upscale.tile(network, image, 2, 32, 16, lambda *e: events.append(e), never, RuntimeError)
+        self.assertEqual(tiled.shape, (1, 3, 128, 128))
+        self.assertEqual(events[-1][1]["total_steps"], 4)
+        a = png.tensor_to_png(whole[0].clamp(0, 1))
+        b = png.tensor_to_png(tiled[0].clamp(0, 1))
+        self.assertLessEqual(difference(a, b), 1)
+
+    def test_owned_load_uses_no_library_loading_helpers(self):
+        """The owned backend's declared dependencies exclude accelerate, peft, Pillow and numpy."""
+        from media_engine.pipeline import OwnedPipelineBackend
+
+        names = {name for name, _ in OwnedPipelineBackend.dependencies}
+        self.assertEqual(names, {"torch", "diffusers", "transformers", "safetensors"})
+        caps = self.worker("owned-sdxl").capabilities()
+        self.assertEqual(set(caps["dependencies"]), names)
+
+
+@unittest.skipUnless(HAVE_INFERENCE, "inference extra is not installed")
+class InferenceTests(Harness, unittest.TestCase):
     def test_reference_backend(self):
         self.exercise("diffusers-sdxl")
 
-    def test_owned_pipeline_backend(self):
-        self.exercise("owned-sdxl")
+    def test_reference_batch_reproduces_single_seeds(self):
+        self.batch("diffusers-sdxl")
+
+    def test_upscale_agrees_across_backends(self):
+        """The esrgan network is engine code on both backends, so the outputs are identical."""
+        self.assertEqual(self.upscale_run("diffusers-sdxl"), self.upscale_run("owned-sdxl"))
+
+    def test_png_writer_matches_pillow_pixels(self):
+        """The stdlib writer is lossless: decoding it gives the bytes Pillow writes for the tensor."""
+        import io
+
+        import numpy
+        import torch
+        from PIL import Image
+
+        torch.manual_seed(5)
+        tensor = torch.rand(3, 24, 40)
+        ours = png.tensor_to_png(tensor)
+        array = (tensor.permute(1, 2, 0).float().numpy() * 255).round().astype(numpy.uint8)
+        stream = io.BytesIO()
+        Image.fromarray(array).save(stream, format="PNG")
+        self.assertEqual(pixels(ours), pixels(stream.getvalue()))
+        with Image.open(io.BytesIO(ours)) as decoded:
+            self.assertEqual(decoded.tobytes(), array.tobytes())
 
     def test_owned_pipeline_preserves_reference_semantics(self):
         """Same seed and settings: the owned loop reproduces the reference pipeline's pixels.
 
-        Text-to-image is byte-identical on this CPU float32 stack; image-to-image agrees to within
-        one 8-bit level after PNG rounding. This is evidence of matching request semantics, not a
-        cross-hardware guarantee.
+        Text-to-image is pixel-identical on this CPU float32 stack (the PNG files differ only in
+        the writer's filter choices); image-to-image agrees to within two 8-bit levels. This is
+        evidence of matching request semantics, not a cross-hardware guarantee.
         """
-        import io
-
-        import numpy
-        from PIL import Image
-
         reference = self.exercise("diffusers-sdxl")
         owned = self.exercise("owned-sdxl")
-        self.assertEqual(reference["text-to-image"], owned["text-to-image"])
-        difference = numpy.abs(
-            numpy.asarray(Image.open(io.BytesIO(reference["image-to-image"])), dtype=float)
-            - numpy.asarray(Image.open(io.BytesIO(owned["image-to-image"])), dtype=float)
-        )
-        self.assertLessEqual(difference.max(), 2)
+        self.assertEqual(pixels(reference["text-to-image"]), pixels(owned["text-to-image"]))
+        self.assertLessEqual(difference(reference["image-to-image"], owned["image-to-image"]), 2)
+
+    def test_batches_agree_across_backends(self):
+        reference, _ = self.batch("diffusers-sdxl")
+        owned, _ = self.batch("owned-sdxl")
+        self.assertLessEqual(difference(reference, owned), 2)
 
     def test_lora_adapters_change_output_and_agree_across_backends(self):
         """LoRA is a load-time identity: the library's PEFT layers (reference) and the owned
         in-place merge produce the same pictures, and both differ from the base model."""
-        import io
-
-        import numpy
-        from PIL import Image
-
         adapters = [{"adapter": self.adapter, "scale": 1.0}]
         base = self.exercise("owned-sdxl")["text-to-image"]
         reference = self.exercise("diffusers-sdxl", adapters)["text-to-image"]
         owned = self.exercise("owned-sdxl", adapters)["text-to-image"]
-        load = lambda png: numpy.asarray(Image.open(io.BytesIO(png)), dtype=float)
-        self.assertGreater(numpy.abs(load(base) - load(owned)).mean(), 1)
-        self.assertLessEqual(numpy.abs(load(reference) - load(owned)).max(), 2)
+        self.assertGreater(mean_difference(base, owned), 1)
+        self.assertLessEqual(difference(reference, owned), 2)
 
 
 if __name__ == "__main__":
