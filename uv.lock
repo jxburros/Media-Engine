@@ -244,7 +244,7 @@ wheels = [
 
 [[package]]
 name = "media-engine"
-version = "0.2.0"
+version = "0.4.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -258,19 +258,31 @@ inference = [
     { name = "torch" },
     { name = "transformers" },
 ]
+inference-owned = [
+    { name = "diffusers" },
+    { name = "numpy" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "transformers" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'inference'", specifier = "==1.4.0" },
     { name = "diffusers", marker = "extra == 'inference'", specifier = "==0.32.2" },
+    { name = "diffusers", marker = "extra == 'inference-owned'", specifier = "==0.32.2" },
     { name = "numpy", marker = "extra == 'inference'", specifier = "==2.2.3" },
+    { name = "numpy", marker = "extra == 'inference-owned'", specifier = "==2.2.3" },
     { name = "peft", marker = "extra == 'inference'", specifier = "==0.14.0" },
     { name = "pillow", marker = "extra == 'inference'", specifier = "==11.1.0" },
     { name = "safetensors", marker = "extra == 'inference'", specifier = "==0.5.3" },
+    { name = "safetensors", marker = "extra == 'inference-owned'", specifier = "==0.5.3" },
     { name = "torch", marker = "extra == 'inference'", specifier = "==2.6.0" },
+    { name = "torch", marker = "extra == 'inference-owned'", specifier = "==2.6.0" },
     { name = "transformers", marker = "extra == 'inference'", specifier = "==4.49.0" },
+    { name = "transformers", marker = "extra == 'inference-owned'", specifier = "==4.49.0" },
 ]
-provides-extras = ["inference"]
+provides-extras = ["inference-owned", "inference"]
 
 [[package]]
 name = "mpmath"

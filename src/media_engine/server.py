@@ -1,4 +1,4 @@
-"""media-worker/1.1: authenticated loopback, one warm pipeline, no waiting queue."""
+"""media-worker/1.2: authenticated loopback, one warm pipeline, no waiting queue."""
 
 import argparse
 import copy
@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -16,13 +17,20 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
+from . import png
 from .backend import Cancelled, backend_class
 from .contracts import (
+    FAMILIES,
+    LIMITS,
     PROTOCOL,
     SUPPORTED_PROTOCOLS,
     WORKER_VERSION,
     WorkerError,
+    effective_settings,
     effective_steps,
+    family_facts,
+    minor,
+    output_ids,
     png_dimensions,
     strict,
     protocol,
@@ -32,6 +40,8 @@ from .contracts import (
 )
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
+PRIVATE = {"cancel", "request", "image_path", "expected_outputs"}
+OUTPUT_ID = r"[a-z][a-z0-9_]{0,31}"
 
 
 def error(code, field=None):
@@ -43,6 +53,11 @@ def error(code, field=None):
     return result
 
 
+class MissingOutput(Exception):
+    def __init__(self, output_id):
+        self.output_id = output_id
+
+
 class Worker:
     def __init__(
         self,
@@ -52,25 +67,41 @@ class Worker:
         max_retained=128,
         max_storage_mb=1024,
         max_input_mb=32,
+        protocols=SUPPORTED_PROTOCOLS,
     ):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.directory / "inputs").mkdir(exist_ok=True, mode=0o700)
         self.backend, self.catalog = backend, catalog
+        self.protocols = tuple(protocols)
         self.session_id = str(uuid.uuid4())
         self.lock = threading.RLock()
         self.executions, self.attempts, self.operations, self.inputs = {}, {}, {}, {}
         self.active = None
         self.state = "ready"
         self.loaded = None
+        self.loaded_family = None
+        self.loaded_facts = {}
         self.max_retained, self.max_storage_mb = max_retained, max_storage_mb
         self.max_input_mb = max_input_mb
 
+    @property
+    def speaks_1_2(self):
+        return "media-worker/1.2" in self.protocols
+
+    def check(self, body):
+        """A worker pinned to an older minor refuses newer minors exactly as a 0.3.0 worker would."""
+        if isinstance(body, dict):
+            version = body.get("protocol")
+            if version in SUPPORTED_PROTOCOLS and version not in self.protocols:
+                raise WorkerError(400, "protocol_mismatch", "protocol")
+
     def capabilities(self):
+        backend = self.backend.capabilities()
         return {
-            **self.backend.capabilities(),
+            **backend,
             "session_id": self.session_id,
-            "formats": ["diffusers-safetensors"],
+            "formats": backend.get("formats", ["diffusers-safetensors"]),
             "output_formats": ["png"],
             "input_formats": ["image/png"],
             "progress": True,
@@ -90,12 +121,15 @@ class Worker:
             ],
         }
 
+    def device_identity(self):
+        return self.backend.device_identity() if self.speaks_1_2 else None
+
     def info(self):
         caps = self.capabilities()
         with self.lock:
-            return {
-                "protocol": PROTOCOL,
-                "supported_protocols": list(SUPPORTED_PROTOCOLS),
+            info = {
+                "protocol": self.protocols[-1],
+                "supported_protocols": list(self.protocols),
                 "worker_version": WORKER_VERSION,
                 "backend_id": self.backend.backend_id,
                 "ownership": self.backend.ownership,
@@ -108,31 +142,92 @@ class Worker:
                 "device": caps["device"],
                 "build": {"package": "media-engine", "version": WORKER_VERSION},
             }
+        if self.speaks_1_2:
+            info["device_identity"] = self.device_identity()
+        return info
 
     def validate_load(self, body, verify=True):
-        strict(body, ("protocol", "bundle", "options"), ("adapters",))
+        self.check(body)
+        strict(body, ("protocol", "bundle", "options"), ("adapters", "authorized_fallbacks"))
         version = protocol(body)
+        level = minor(version)
+        if "authorized_fallbacks" in body and level < 2:
+            raise WorkerError(400, "unsupported", "authorized_fallbacks")
         strict(body["options"], ("precision", "attention", "offload"))
         options = body["options"]
         caps = self.capabilities()
+        precisions = list(caps["precisions"])
+        if level >= 2 and "precision" in caps.get("auto_options", []):
+            precisions.append("auto")
         if (
-            options["precision"] not in caps["precisions"]
+            options["precision"] not in precisions
             or options["attention"] != "sdpa"
             or options["offload"] != "none"
         ):
             raise WorkerError(400, "unsupported", "options")
-        root = bundle_path(body["bundle"], self.catalog, verify)
-        adapters = validate_adapters(
-            body.get("adapters", []), self.catalog, version, verify
+        authorized = body.get("authorized_fallbacks", [])
+        if (
+            not isinstance(authorized, list)
+            or any(not isinstance(f, str) or f not in caps.get("fallbacks", []) for f in authorized)
+            or len(set(authorized)) != len(authorized)
+        ):
+            raise WorkerError(400, "invalid_request", "authorized_fallbacks")
+        root = bundle_path(body["bundle"], self.catalog, verify, version)
+        family = body["bundle"]["family"]
+        adapters = validate_adapters(body.get("adapters", []), self.catalog, version, verify)
+        if adapters and family != "sdxl-base":
+            raise WorkerError(400, "unsupported", "adapters")
+        plan = self.backend.plan(root, options, adapters, family, authorized)
+        return root, adapters, family, plan
+
+    def estimate(self, root, plan, adapters, family, level):
+        estimate = self.backend.estimate(
+            root, plan["options"], adapters, family, plan["device"]
         )
-        return root, adapters
+        if level >= 2 and family == "sdxl-base":
+            estimate = {
+                **estimate,
+                "count": {
+                    "limit": LIMITS["count"],
+                    "scaling": "activation working memory grows linearly with count; activations are excluded from value_mb",
+                },
+            }
+        return estimate
+
+    def validation(self, body):
+        """The /v1/validate response for a load body."""
+        root, adapters, family, plan = self.validate_load(body)
+        level = minor(body["protocol"])
+        result = {
+            "valid": True,
+            "memory_estimate": self.estimate(root, plan, adapters, family, level),
+            "adapters": [
+                {"adapter_id": r["adapter_id"], "layout": layout}
+                for r, _a, _w, _s, layout in adapters
+            ],
+        }
+        if level >= 2:
+            result.update(
+                family=family,
+                tasks=list(FAMILIES[family]["tasks"]),
+                resolved_options=plan["options"],
+                resolutions=plan["resolutions"],
+                applied_fallbacks=plan["applied_fallbacks"],
+                **family_facts(root, family),
+            )
+        return result
 
     def control(self, action, body):
         if action == "load":
-            self.validate_load(body, verify=False)
-            if not self.capabilities()["ready"]:
+            _root, _adapters, _family, plan = self.validate_load(body, verify=False)
+            caps = self.capabilities()
+            if caps.get("missing_dependencies") or not (
+                caps["device_available"] or plan["device"] == "cpu"
+            ):
+                # An unavailable device is refused unless the caller authorized the CPU fallback.
                 raise WorkerError(503, "backend_unavailable")
         else:
+            self.check(body)
             strict(body, ("protocol",))
             protocol(body)
         with self.lock:
@@ -155,13 +250,14 @@ class Worker:
                     measurements = self.backend.unload()
                     with self.lock:
                         operation["measurements"] = measurements
-                        self.loaded = None
+                        self.loaded, self.loaded_family, self.loaded_facts = None, None, {}
                     if action == "load":
-                        root_verified, adapters = self.validate_load(body)
-                        estimate = self.backend.estimate(
-                            root_verified, body["options"], adapters
-                        )
-                        self.backend.load(root_verified, body["options"], adapters)
+                        level = minor(body["protocol"])
+                        root, adapters, family, plan = self.validate_load(body)
+                        estimate = self.estimate(root, plan, adapters, family, level)
+                        self.backend.load(root, plan["options"], adapters, family, plan["device"])
+                        self.backend.applied_fallbacks = plan["applied_fallbacks"]
+                        facts = family_facts(root, family)
                         with self.lock:
                             self.loaded = {
                                 "bundle_digest": body["bundle"]["bundle_digest"],
@@ -178,7 +274,22 @@ class Worker:
                                 ],
                                 "memory_estimate": estimate,
                             }
+                            if self.speaks_1_2:
+                                self.loaded.update(
+                                    family=family,
+                                    tasks=list(FAMILIES[family]["tasks"]),
+                                    resolved_options=plan["options"],
+                                    applied_fallbacks=plan["applied_fallbacks"],
+                                    **facts,
+                                )
+                            self.loaded_family, self.loaded_facts = family, facts
                             operation["memory_estimate"] = estimate
+                            if level >= 2:
+                                operation.update(
+                                    resolved_options=plan["options"],
+                                    resolutions=plan["resolutions"],
+                                    applied_fallbacks=plan["applied_fallbacks"],
+                                )
                     with self.lock:
                         operation["state"] = "succeeded"
                         self.state = "ready"
@@ -189,7 +300,7 @@ class Worker:
                     except Exception:
                         usable = False
                     with self.lock:
-                        self.loaded = None
+                        self.loaded, self.loaded_family, self.loaded_facts = None, None, {}
                         operation["state"] = "failed"
                         operation["error"] = (
                             error(exc.code, exc.field)
@@ -229,14 +340,14 @@ class Worker:
                 {
                     k: v
                     for k, v in self.executions[execution_id].items()
-                    if k not in {"cancel", "request", "image_path"}
+                    if k not in PRIVATE
                 }
             )
 
     def storage_used(self):
         return sum(
             p.stat().st_size
-            for pattern in ("*.png", "inputs/*.png")
+            for pattern in ("exec_*/*.png", "inputs/*.png")
             for p in self.directory.glob(pattern)
         )
 
@@ -289,21 +400,61 @@ class Worker:
             (self.directory / "inputs" / (input_id + ".png")).unlink(missing_ok=True)
             del self.inputs[input_id]
 
+    def loaded_checks(self, body, task):
+        """Checks that need the loaded bundle; they apply when the request names that bundle."""
+        if not self.loaded or self.loaded["bundle_digest"] != body["bundle_digest"]:
+            return {}
+        if task not in FAMILIES[self.loaded_family]["tasks"]:
+            raise WorkerError(400, "unsupported", "task")
+        if task != "upscale":
+            return {}
+        scale = self.loaded_facts["scale"]
+        params = body["parameters"]
+        if max(params["width"], params["height"]) * scale > self.capabilities()["limits"]["output_side"]:
+            # Decided before any computation; the worker never shrinks a result to fit.
+            raise WorkerError(400, "invalid_request", "output_side")
+        return {
+            "scale": scale,
+            "output_width": params["width"] * scale,
+            "output_height": params["height"] * scale,
+        }
+
+    def validate_execution(self, body):
+        """The /v1/validate response for an execution body."""
+        self.check(body)
+        task = validate_parameters(body)
+        level = minor(body["protocol"])
+        with self.lock:
+            facts = self.loaded_checks(body, task)
+        result = {"valid": True, "task": task}
+        if task != "upscale":
+            result["effective_steps"] = effective_steps(body["parameters"], task)
+        if level >= 2:
+            result["outputs"] = output_ids(task, body["parameters"])
+            result["effective_settings"] = {
+                **effective_settings(body["parameters"], task, body["protocol"]),
+                **facts,
+            }
+        return result
+
     def submit(self, body):
+        self.check(body)
         task = validate_parameters(body)
         attempt = body["attempt_id"]
+        level = minor(body["protocol"])
         with self.lock:
             if attempt in self.attempts:
                 entry = self.executions[self.attempts[attempt]]
                 if entry["request"] != body:
                     raise WorkerError(409, "attempt_conflict")
                 return self.snapshot(entry["execution_id"])
+            facts = self.loaded_checks(body, task)
             if self.active or self.state != "ready":
                 raise WorkerError(409, "busy")
             if not self.loaded or self.loaded["bundle_digest"] != body["bundle_digest"]:
                 raise WorkerError(409, "model_not_ready")
             image_path = None
-            if task == "image-to-image":
+            if task in ("image-to-image", "upscale"):
                 record = self.inputs.get(body["inputs"]["image"])
                 if not record:
                     raise WorkerError(404, "input_not_found")
@@ -314,9 +465,10 @@ class Worker:
                     # The request must state the image's real size; nothing is resized silently.
                     raise WorkerError(400, "invalid_request", "width")
                 image_path = self.directory / "inputs" / (record["input_id"] + ".png")
-            reserve = (
-                body["parameters"]["width"] * body["parameters"]["height"] * 4 + 65536
-            )
+            expected = output_ids(task, body["parameters"])
+            width = facts.get("output_width", body["parameters"]["width"])
+            height = facts.get("output_height", body["parameters"]["height"])
+            reserve = (width * height * 4 + 65536) * len(expected)
             if (
                 len(self.executions) + len(self.inputs) >= self.max_retained
                 or self.storage_used() + reserve > self.max_storage_mb * 1024**2
@@ -325,20 +477,20 @@ class Worker:
             execution_id = "exec_" + uuid.uuid4().hex
             self.active, self.state = execution_id, "busy"
             self.attempts[attempt] = execution_id
-            self.executions[execution_id] = {
+            entry = {
                 "attempt_id": attempt,
                 "execution_id": execution_id,
                 "session_id": self.session_id,
                 "protocol": body["protocol"],
                 "task": task,
                 "state": "running",
-                "stage": "encoding",
+                "stage": "upscaling" if task == "upscale" else "encoding",
                 "progress": None,
                 "events": [],
                 "last_sequence": 0,
                 "effective_settings": {
-                    **body["parameters"],
-                    "effective_steps": effective_steps(body["parameters"], task),
+                    **effective_settings(body["parameters"], task, body["protocol"]),
+                    **facts,
                 },
                 "bundle_digest": body["bundle_digest"],
                 "implementation": self.capabilities(),
@@ -348,59 +500,89 @@ class Worker:
                 "cancel": threading.Event(),
                 "request": body,
                 "image_path": image_path,
+                "expected_outputs": expected,
             }
+            fallbacks = getattr(self.backend, "applied_fallbacks", [])
+            if level >= 2 or fallbacks:
+                entry["applied_fallbacks"] = copy.deepcopy(fallbacks)
+            self.executions[execution_id] = entry
             self.emit(execution_id, "state", {"state": "running"})
             threading.Thread(target=self.run, args=(execution_id,), daemon=True).start()
             return self.snapshot(execution_id)
 
+    def finalize(self, execution_id, records):
+        """Verify every advertised output exists, then fsync, hash and publish each one."""
+        entry = self.executions[execution_id]
+        by_id = {r["output_id"]: r for r in records}
+        folder = self.directory / execution_id
+        outputs = []
+        for output_id in entry["expected_outputs"]:
+            record = by_id.get(output_id)
+            if record is None or not Path(record["path"]).is_file():
+                raise MissingOutput(output_id)
+            with Path(record["path"]).open("rb") as stream:
+                head = stream.read(33)
+                stream.seek(0)
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                os.fsync(stream.fileno())
+            width, height = png.header(head)[:2]
+            final = folder / (output_id + ".png")
+            Path(record["path"]).replace(final)
+            outputs.append(
+                {
+                    "output_id": output_id,
+                    "mime_type": record["mime_type"],
+                    "size": final.stat().st_size,
+                    "sha256": digest,
+                    "width": width,
+                    "height": height,
+                }
+            )
+        return outputs
+
     def run(self, execution_id):
         entry = self.executions[execution_id]
-        path = self.directory / (execution_id + ".png")
-        temporary = path.with_suffix(".part")
+        folder = self.directory / execution_id
+        temporary = folder / ".partial"
+        state, failure, outputs, measurements = "failed", None, [], None
         try:
-            measurements = self.backend.generate(
+            temporary.mkdir(parents=True, mode=0o700)
+            records, measurements = self.backend.generate(
                 entry["request"],
                 temporary,
                 lambda kind, data: self.emit(execution_id, kind, data),
                 entry["cancel"],
                 entry["image_path"],
             )
-            with temporary.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                os.fsync(stream.fileno())
-            temporary.replace(path)
-            with self.lock:
-                params = entry["effective_settings"]
-                output = {
-                    "output_id": "image",
-                    "mime_type": "image/png",
-                    "size": path.stat().st_size,
-                    "sha256": digest,
-                    "width": params["width"],
-                    "height": params["height"],
-                }
-                entry["outputs"] = [output]
-                entry["measurements"] = measurements
-                self.emit(execution_id, "output", output)
-                entry["state"] = "succeeded"
+            outputs = self.finalize(execution_id, records)
+            state = "succeeded"
         except Cancelled:
-            with self.lock:
-                entry["state"] = "cancelled"
+            state = "cancelled"
         except Exception as exc:
             code = (
                 "out_of_memory"
                 if "OutOfMemory" in type(exc).__name__
                 else "execution_failed"
             )
-            with self.lock:
-                entry["state"], entry["error"] = "failed", error(code)
-                self.emit(execution_id, "error", entry["error"])
-                if code == "out_of_memory":
-                    self.state = "error"
+            # A partial batch names the first output that was not produced.
+            failure = error(code, exc.output_id if isinstance(exc, MissingOutput) else None)
         finally:
-            temporary.unlink(missing_ok=True)
+            shutil.rmtree(temporary, ignore_errors=True)
+            if state != "succeeded":
+                shutil.rmtree(folder, ignore_errors=True)
+            # The terminal state, its events and the free slot become visible together.
             with self.lock:
-                self.emit(execution_id, "state", {"state": entry["state"]})
+                if state == "succeeded":
+                    entry["outputs"], entry["measurements"] = outputs, measurements
+                    for output in outputs:
+                        self.emit(execution_id, "output", output)
+                elif failure:
+                    entry["error"] = failure
+                    self.emit(execution_id, "error", failure)
+                    if failure["code"] == "out_of_memory":
+                        self.state = "error"
+                entry["state"] = state
+                self.emit(execution_id, "state", {"state": state})
                 self.active = None
                 if self.state != "error":
                     self.state = "ready"
@@ -414,12 +596,22 @@ class Worker:
                 entry["cancel"].set()
             return self.snapshot(execution_id)
 
+    def output_path(self, execution_id, output_id):
+        with self.lock:
+            snap = self.snapshot(execution_id)
+            if snap["state"] != "succeeded":
+                raise WorkerError(404, "output_not_found")
+            record = next((o for o in snap["outputs"] if o["output_id"] == output_id), None)
+            if record is None:
+                raise WorkerError(404, "output_not_found")
+            return self.directory / execution_id / (output_id + ".png"), record
+
     def release(self, execution_id):
         with self.lock:
             snapshot = self.snapshot(execution_id)
             if snapshot["state"] not in TERMINAL:
                 raise WorkerError(409, "busy")
-            (self.directory / (execution_id + ".png")).unlink(missing_ok=True)
+            shutil.rmtree(self.directory / execution_id, ignore_errors=True)
             del self.attempts[snapshot["attempt_id"]]
             del self.executions[execution_id]
 
@@ -499,21 +691,9 @@ def create_server(worker, token, port=7811):
                 if self.command == "POST" and path == "/v1/validate":
                     body = self.body()
                     if "bundle" in body:
-                        root, adapters = worker.validate_load(body)
-                        return self.respond(
-                            200,
-                            {
-                                "valid": True,
-                                "memory_estimate": worker.backend.estimate(
-                                    root, body["options"], adapters
-                                ),
-                                "adapters": [
-                                    {"adapter_id": r["adapter_id"], "layout": layout}
-                                    for r, _a, _w, _s, layout in adapters
-                                ],
-                            },
-                        )
+                        return self.respond(200, worker.validation(body))
                     if "adapters" in body:
+                        worker.check(body)
                         strict(body, ("protocol", "adapters"))
                         version = protocol(body)
                         adapters = validate_adapters(
@@ -529,17 +709,7 @@ def create_server(worker, token, port=7811):
                                 ],
                             },
                         )
-                    task = validate_parameters(body)
-                    return self.respond(
-                        200,
-                        {
-                            "valid": True,
-                            "task": task,
-                            "effective_steps": effective_steps(
-                                body["parameters"], task
-                            ),
-                        },
-                    )
+                    return self.respond(200, worker.validate_execution(body))
                 if self.command == "POST" and path in {
                     "/v1/model/load",
                     "/v1/model/unload",
@@ -583,7 +753,9 @@ def create_server(worker, token, port=7811):
                             raise WorkerError(404, "execution_not_found")
                         return self.respond(200, worker.snapshot(execution_id))
                 match = re.fullmatch(
-                    r"/v1/executions/(exec_[a-f0-9]{32})(/cancel|/events|/outputs/image)?",
+                    r"/v1/executions/(exec_[a-f0-9]{32})(/cancel|/events|/outputs/"
+                    + OUTPUT_ID
+                    + ")?",
                     path,
                 )
                 if not match:
@@ -599,17 +771,16 @@ def create_server(worker, token, port=7811):
                     return self.respond(200, worker.snapshot(execution_id))
                 if self.command == "GET" and suffix == "/events":
                     return self.events(execution_id)
-                if self.command == "GET" and suffix == "/outputs/image":
+                if self.command == "GET" and suffix and suffix.startswith("/outputs/"):
                     with worker.lock:
-                        snap = worker.snapshot(execution_id)
-                        if snap["state"] != "succeeded":
-                            raise WorkerError(404, "output_not_found")
-                        output = worker.directory / (execution_id + ".png")
+                        output, record = worker.output_path(
+                            execution_id, suffix.rsplit("/", 1)[1]
+                        )
                         if not output.exists():
                             raise WorkerError(410, "output_unavailable")
                         with output.open("rb") as stream:
                             self.send_response(200)
-                            self.send_header("Content-Type", "image/png")
+                            self.send_header("Content-Type", record["mime_type"])
                             self.send_header(
                                 "Content-Length", str(output.stat().st_size)
                             )
@@ -632,10 +803,10 @@ def create_server(worker, token, port=7811):
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-def main():
+def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(
-        description="Offline SDXL worker for Media Runtime"
+        description="Offline local media worker for Media Runtime. Without a subcommand it serves."
     )
     parser.add_argument(
         "--version", action="version", version="media-engine " + WORKER_VERSION
@@ -655,7 +826,22 @@ def main():
     parser.add_argument("--max-retained", type=int, default=128)
     parser.add_argument("--max-storage-mb", type=int, default=1024)
     parser.add_argument("--max-input-mb", type=int, default=32)
-    args = parser.parse_args()
+    commands = parser.add_subparsers(dest="command", metavar="{convert}")
+    from .convert import add_arguments
+
+    add_arguments(
+        commands.add_parser(
+            "convert",
+            help="convert a single-file SDXL checkpoint into a Diffusers-format bundle (offline)",
+            description="Convert one single-file SDXL safetensors checkpoint into a complete "
+            "Diffusers-format bundle using an approved reference bundle's configuration.",
+        )
+    )
+    args = parser.parse_args(argv)
+    if args.command == "convert":
+        from .convert import run
+
+        sys.exit(run(args))
     if args.probe:
         print(
             json.dumps(
@@ -665,6 +851,7 @@ def main():
                     "worker_version": WORKER_VERSION,
                     "backend_id": args.backend,
                     "backends": ["diffusers-sdxl", "owned-sdxl"],
+                    "commands": ["convert"],
                 }
             )
         )
@@ -719,20 +906,7 @@ def main():
             stop()
 
         threading.Thread(target=parent_watch, daemon=True).start()
-    print(
-        json.dumps(
-            {
-                "protocol": PROTOCOL,
-                "supported_protocols": list(SUPPORTED_PROTOCOLS),
-                "worker_version": WORKER_VERSION,
-                "backend_id": backend.backend_id,
-                "session_id": worker.session_id,
-                "port": server.server_port,
-                "pid": os.getpid(),
-            }
-        ),
-        flush=True,
-    )
+    print(json.dumps(startup_record(worker, server)), flush=True)
     try:
         server.serve_forever()
     finally:
@@ -742,6 +916,31 @@ def main():
         if not worker.active:
             worker.backend.unload()
         server.server_close()
+
+
+def launch_protocol(protocols):
+    return "media-worker/1.1" if "media-worker/1.1" in protocols else protocols[-1]
+
+
+def startup_record(worker, server, **extra):
+    """The one stdout line a supervisor reads after launch; no credentials or private paths."""
+    record = {
+        # `protocol` is the launch-record minor. The record's shape is unchanged since 1.1, and
+        # 1.1 supervisors refuse a value they do not know, so it stays media-worker/1.1; callers
+        # negotiate from `supported_protocols` (and `highest_protocol`) as they do with /v1/info.
+        "protocol": launch_protocol(worker.protocols),
+        "supported_protocols": list(worker.protocols),
+        "highest_protocol": worker.protocols[-1],
+        "worker_version": WORKER_VERSION,
+        "backend_id": worker.backend.backend_id,
+        "session_id": worker.session_id,
+        "port": server.server_port,
+        "pid": os.getpid(),
+        **extra,
+    }
+    if worker.speaks_1_2:
+        record["device_identity"] = worker.device_identity()
+    return record
 
 
 if __name__ == "__main__":
