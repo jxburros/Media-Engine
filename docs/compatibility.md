@@ -9,10 +9,42 @@ rows are never edited after release except to add later test evidence.
 
 | Engine | Protocol minors served | Startup record `protocol` | Runtime versions tested         | Platform tested                       | Families           | Extras                         | Conformance suite                |
 | ------ | ---------------------- | ------------------------- | ------------------------------- | ------------------------------------- | ------------------ | ------------------------------ | -------------------------------- |
+| 0.5.0  | 1.0, 1.1, 1.2 (network mode fields within 1.2) | `media-worker/1.1` | 0.4.0 and 0.5.0 (Go, `go test ./...`, all packages pass; the fixture over loopback HTTP, default and 1.1-pinned); no network-mode consumer yet (Runtime 0.7.0) | Linux x64, CPU only, Python 3.13 (protocol and network tests); TLS on loopback only | sdxl-base, esrgan | `inference`, `inference-owned` (unchanged; not re-run, extras not installed) | `media-worker-conformance/1.0`, over loopback HTTP and mutual TLS |
 | 0.4.0  | 1.0, 1.1, 1.2          | `media-worker/1.1`        | 0.3.0 (14/14, fixture default and fixture pinned to 1.1); 0.4.0 and 0.5.0 (Go, `go test ./...`, default and 1.1-pinned fixture) | Linux x64, CPU only, Python 3.12.3 (venv) / 3.13 (protocol tests) | sdxl-base, esrgan | `inference`, `inference-owned` | `media-worker-conformance/1.0`   |
 | 0.3.0  | 1.0, 1.1               | `media-worker/1.1`        | 0.3.0                           | Linux x64, CPU only                   | sdxl-base          | `inference`                    | — (suite introduced in 0.4.0)    |
 | 0.2.0  | 1.0, 1.1               | `media-worker/1.1`        | 0.2.0                           | Linux x64, CPU only                   | sdxl-base          | `inference`                    | —                                |
 | 0.1.0  | 1.0                    | `media-worker/1.0`        | 0.1.0                           | Linux x64, CPU only                   | sdxl-base          | `inference`                    | —                                |
+
+## Conformance results for 0.5.0
+
+| Backend                      | Transport                                   | Result     |
+| ---------------------------- | ------------------------------------------- | ---------- |
+| test fixture (1.2 default)   | loopback HTTP                               | conformant |
+| test fixture (1.2 default)   | mutual TLS 1.3 on 127.0.0.1 (`tests/certs`) | conformant, same section results as loopback HTTP |
+| test fixture (pinned to 1.1) | loopback HTTP                               | conformant |
+| `diffusers-sdxl`, `owned-sdxl` | CPU float32, loopback                     | not re-run: inference extras not installed here; no inference code changed since 0.4.0 |
+| any backend                  | mutual TLS across hosts                     | not run: single host, no real network |
+
+The fixture rows run in CI (`tests/test_conformance_fixture.py`, `tests/test_network.py`). The
+mutual-TLS row also passes through the runner:
+`python -m tests.conformance.run --registration ROOT/conformance.json --tls-ca tests/certs/ca.pem
+--tls-cert tests/certs/client.pem --tls-key tests/certs/client.key --launch python
+tests/serve_fixture.py ROOT --tls-cert … --tls-key <0600 copy> --tls-client-ca …`.
+
+## Network-mode checklist (operator, two hosts)
+
+Network mode in 0.5.0 is tested on loopback only. On a worker host and a separate supervisor host:
+
+1. Issue operator certificates (README "Network mode"); launch with `--bind <LAN address>` (and
+   once with `0.0.0.0`), the three TLS files and `--no-parent-watch` under a service manager.
+2. From the supervisor host run the conformance suite with `--url https://<host>:<port>` and the
+   client certificate; record the result here.
+3. From the supervisor host confirm plain HTTP, no client certificate and a certificate from
+   another CA all fail before any HTTP response, and a wrong bearer token gets `401`.
+4. Compare `certificate_sha256` with `openssl x509 -outform DER | sha256sum` of the served
+   certificate; drop the supervisor's connection mid-execution and confirm the worker keeps
+   running with `ownership_available: false`.
+5. Run the 0.4.0 hardware checklist below over the TLS connection on the reference RTX 4090.
 
 ## Conformance results for 0.4.0
 

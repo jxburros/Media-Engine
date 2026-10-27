@@ -2,7 +2,8 @@
 
 An independently installed, offline media inference worker for [Media Runtime](https://github.com/jxburros/Media-Runtime)
 or another local supervisor. It implements `media-worker/1.2` (and still serves 1.0 and 1.1 callers
-unchanged) over authenticated loopback HTTP, with asynchronous load/unload, a warm pipeline, one
+unchanged) over authenticated loopback HTTP (or, in network mode, mutual TLS for a supervisor on
+another host), with asynchronous load/unload, a warm pipeline, one
 execution slot, SDXL text-to-image (up to four images per execution) and image-to-image, ESRGAN
 upscaling, real sampling/tile callbacks, cooperative cancellation, resumable SSE, opaque
 input/output handles, header-based memory estimates, automatic precision with caller-authorized
@@ -13,7 +14,7 @@ specifies are sequenced in [docs/implementation-plan.md](docs/implementation-pla
 its backend stages behind one protocol: the **reference worker** (`diffusers-sdxl`, the complete
 Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this project assembles the
 components and runs the denoising loop itself). The `esrgan` upscaler network is engine code on
-both. Native engines, network mode, video/audio families and custom GPU kernels are future stages;
+both. Native engines, video/audio families and custom GPU kernels are future stages;
 they are not advertised as capabilities.
 
 ## Install
@@ -145,6 +146,68 @@ refused and no precision changes. Applied fallbacks are reported on the load ope
 startup record carry `device_identity` (device, index, name, total memory, a SHA-256 host ID from
 `/etc/machine-id` or the hostname, and pid) so a supervisor pool can tell workers apart.
 
+## Network mode
+
+By default the worker listens on `127.0.0.1` over plain HTTP. For a supervisor on another host,
+bind a non-loopback address and give all three TLS files:
+
+```sh
+.venv/bin/media-engine --catalog /absolute/catalog.json --directory /absolute/worker-data \
+  --bind 0.0.0.0 --port 7811 --no-parent-watch \
+  --tls-cert /etc/media-engine/server.pem --tls-key /etc/media-engine/server.key \
+  --tls-client-ca /etc/media-engine/clients-ca.pem
+```
+
+The worker refuses to start on a non-loopback `--bind` (an IP address, not a host name) unless
+`--tls-cert`, `--tls-key` and `--tls-client-ca` are all present, and it never serves plain HTTP
+there, `/health` included. Transport is TLS 1.3 only; every client must present a certificate that
+chains to `--tls-client-ca`, or the handshake fails before any HTTP is read. The bearer credential
+is still required on every endpoint except `/health`: the certificate authenticates the peer, the
+credential authorizes the session. TLS on loopback is accepted (useful for tests) but adds nothing
+over loopback HTTP. The startup record and `/v1/info` report `scheme` (`http`/`https`), `bind`,
+`certificate_sha256` (SHA-256 of the server certificate's DER, for pinning; `null` without TLS)
+and `ownership_available`.
+
+A remote supervisor cannot own the process: SIGTERM, stdin-close and forced termination remain
+local to the worker host. `--no-parent-watch` disables the inherited-stdin shutdown for
+service-manager launches (systemd and similar) and makes the worker advertise
+`ownership_available: false`, so the supervisor records a lost connection as interruption, never
+as confirmed cancellation. SIGTERM handling is unchanged.
+
+The operator owns the certificates; the worker never generates, fetches, rotates or reloads them.
+
+- Issue a server certificate whose subject alternative names cover every address or name remote
+  supervisors connect to, and a client certificate per supervisor from a CA you control (the
+  client CA need not be the server's CA). Keep CA private keys off the worker host.
+- `--tls-key` must be an unencrypted PEM key that is not readable by group or others
+  (`chmod 600`); `--tls-cert` and `--tls-client-ca` must not be writable by group or others
+  (`chmod 644`). The worker refuses other modes with a message naming the flag.
+- The files are read once at start. To rotate, replace them and restart the worker; supervisors
+  pinning `certificate_sha256` must learn the new fingerprint.
+- The catalog, work directory and credential stay on the worker host; deliver the per-launch
+  credential to the remote supervisor over a channel you already trust.
+- Revocation lists are not consulted: remove a client by issuing from a new client CA and
+  restarting.
+
+Minimal OpenSSL 3 commands (EC P-256, one year; adjust names, addresses and lifetimes):
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+  -subj "/CN=media clients CA" -keyout clients-ca.key -out clients-ca.pem
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+  -subj "/CN=gpu-host-1" -addext "subjectAltName=DNS:gpu-host-1.example,IP:192.0.2.10" \
+  -keyout server.key -out server.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj "/CN=runtime-1" -keyout client.key -out client.csr
+openssl x509 -req -in client.csr -CA clients-ca.pem -CAkey clients-ca.key -days 365 \
+  -extfile <(printf "extendedKeyUsage=clientAuth") -out client.pem
+chmod 600 server.key client.key clients-ca.key
+openssl x509 -in server.pem -outform DER | sha256sum   # equals certificate_sha256
+```
+
+The supervisor then trusts `server.pem` (self-signed here, or your server CA) and presents
+`client.pem`/`client.key`. `tests/certs` holds test-only material of this shape.
+
 ## Lifetime and collection
 
 The worker has no waiting queue. Loading, unloading and inference cannot overlap. An identical
@@ -158,7 +221,8 @@ and verify them, commit its own durable manifest, then discard the execution. Co
 records have an explicit discard extension too. See [the wire contract](docs/protocol.md).
 
 SIGTERM stops admission and requests cooperative cancellation with bounded cleanup. A supervised
-worker also stops when its inherited stdin closes. Cancellation acknowledgement is intent only;
+worker (`MEDIA_ENGINE_SUPERVISED=1`) also stops when its inherited stdin closes, unless launched
+with `--no-parent-watch`. Cancellation acknowledgement is intent only;
 `cancelled` is terminal only after computation exits. If completion wins the race, it stays successful.
 Standalone callers own their persistent jobs and storage; this service is not a permanent library.
 
@@ -175,7 +239,10 @@ worker: `--url URL` with the credential in `MEDIA_ENGINE_TOKEN`, or `--launch CM
 and check its startup record too. It reports each section and says "conformant" only when none
 failed or was skipped; a backend is advertised only after it passes. Results are kept in
 [docs/compatibility.md](docs/compatibility.md). `tests/serve_fixture.py ROOT` (options in its
-docstring) is the hardware-free worker supervisors' integration tests launch.
+docstring) is the hardware-free worker supervisors' integration tests launch; it takes the same
+network-mode flags as the worker. Against a network-mode worker pass `--tls-ca`, `--tls-cert` and
+`--tls-key` (or `MEDIA_ENGINE_TLS_CA`, `_CERT`, `_KEY`) for mutual TLS; `tests/test_network.py`
+runs the suite over TLS with the committed test certificates in `tests/certs`.
 
 `tests/test_worker.py` exercises protocol/lifecycle behavior without GPU downloads.
 `tests/test_inference.py` runs real CPU inference through both backends on a tiny random-weight
@@ -186,9 +253,9 @@ owned loop and the reference pipeline execute the same contract and, for the sam
 produce pixel-identical text-to-image output and image-to-image output within one 8-bit level on that
 CPU stack, and that LoRA adapters change the output identically on both backends; it says nothing
 about image quality. Run the Runtime
-repository's `npm test` with both repositories beside each other for cross-process durable-job tests.
+repository's `go test ./...` with both repositories beside each other for cross-process durable-job tests.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.4.0 speaks `media-worker/1.2` and serves `media-worker/1.0`/`1.1` callers such as Runtime 0.1.0–0.3.0;
+Engine 0.5.0 speaks `media-worker/1.2` and serves `media-worker/1.0`/`1.1` callers such as Runtime 0.1.0–0.3.0;
 its startup record keeps `protocol: "media-worker/1.1"` for those launchers and adds `highest_protocol`.
 
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
