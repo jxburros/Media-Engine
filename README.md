@@ -1,17 +1,20 @@
 # Media Engine
 
-An independently installed, offline SDXL inference worker for [Media Runtime](https://github.com/jxburros/Media-Runtime)
-or another local supervisor. It implements `media-worker/1.1` (and still serves 1.0 callers) over
-authenticated loopback HTTP, with asynchronous load/unload, a warm pipeline, one execution slot,
-text-to-image and image-to-image, real sampling callbacks, cooperative cancellation, resumable SSE,
-opaque input/output handles and header-based memory estimates.
+An independently installed, offline media inference worker for [Media Runtime](https://github.com/jxburros/Media-Runtime)
+or another local supervisor. It implements `media-worker/1.2` (and still serves 1.0 and 1.1 callers
+unchanged) over authenticated loopback HTTP, with asynchronous load/unload, a warm pipeline, one
+execution slot, SDXL text-to-image (up to four images per execution) and image-to-image, ESRGAN
+upscaling, real sampling/tile callbacks, cooperative cancellation, resumable SSE, opaque
+input/output handles, header-based memory estimates, automatic precision with caller-authorized
+fallbacks, device identity and an offline single-file checkpoint converter.
 
 The authoritative product scope is [engine-spec.md](engine-spec.md); the deferred capabilities it
 specifies are sequenced in [docs/implementation-plan.md](docs/implementation-plan.md). This release delivers two of
 its backend stages behind one protocol: the **reference worker** (`diffusers-sdxl`, the complete
 Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this project assembles the
-components and runs the denoising loop itself). Native engines, LoRA, other families and custom GPU
-kernels are future stages; they are not advertised as capabilities.
+components and runs the denoising loop itself). The `esrgan` upscaler network is engine code on
+both. Native engines, network mode, video/audio families and custom GPU kernels are future stages;
+they are not advertised as capabilities.
 
 ## Install
 
@@ -20,10 +23,16 @@ Diffusers **0.32.2**. `uv.lock` pins transitive artifacts/checksums separately f
 Installation is an explicit network action; serving never downloads models or executes remote code.
 
 ```sh
-uv sync --frozen --extra inference
+uv sync --frozen --extra inference          # both backends (reference set)
+uv sync --frozen --extra inference-owned    # owned-sdxl and the upscaler only: no accelerate, no peft
 .venv/bin/media-engine --version
 .venv/bin/media-engine --probe
 ```
+
+The `inference-owned` extra pins torch, diffusers (model classes only), transformers,
+safetensors and numpy; the owned backend never imports Pillow, numpy, accelerate or peft itself
+(PNG is written by the standard-library `png.py`). `capabilities.dependencies` reports what the
+launched backend imports.
 
 The source package without the inference extra can run the protocol server and report missing
 dependencies; it cannot generate. It never substitutes simulated output. Test backends live outside
@@ -32,11 +41,12 @@ the installed package in `tests/` and identify themselves in snapshots/provenanc
 Supply a complete local `stabilityai/stable-diffusion-xl-base-1.0` Diffusers-format bundle,
 including UNet, VAE, both CLIP encoders and tokenizers, pipeline config and Euler scheduler config.
 Use safetensors weights only; Python, pickle weights and symlinks are rejected. The service does
-not fetch weights, convert checkpoints or select a model for callers. Each local deployment is
+not fetch weights, convert checkpoints during a request (conversion is the separate offline
+`convert` command below) or select a model for callers. Each local deployment is
 identified by SHA-256 of every registered file; optional upstream revision/license metadata belongs
 to the registration. Keep approved files immutable/read-only while the worker serves them.
 
-Copy `examples/catalog.json`, replace the absolute model path and keep the same handle (`sdxl-base`)
+Copy `examples/catalog.json`, replace the absolute model paths and keep the same handles (`sdxl-base`, `upscaler`)
 in Runtime's artifact catalog. The **operator** supplies these paths at launch. Load requests carry
 only approved opaque artifact handles, component digests and relative file identities.
 
@@ -63,6 +73,10 @@ the load request and form part of the loaded identity. The reference backend app
 PEFT; the owned pipeline merges the low-rank deltas into the weights itself. Kohya-format files must
 be converted first; the worker refuses layouts it cannot verify rather than guessing.
 
+A 1.2 text-to-image request may set `count` (1–4): the execution finalizes `image`, `image_2` …
+with seeds `seed`, `seed + 1` …, so any image can be reproduced alone. Each output is downloaded
+from `/v1/executions/{id}/outputs/{output_id}`; the execution succeeds only when all of them exist.
+
 Image-to-image uploads a PNG to `POST /v1/inputs` first and references the returned handle; the
 worker never reads caller paths or URLs. The request must state the image's real size, and
 `strength` sets the effective step count (`floor(steps × strength)`, at least one).
@@ -78,6 +92,58 @@ estimate read from the safetensors headers (parameter bytes at the load precisio
 states its basis and that activations, the VAE upcast and framework overhead are excluded.
 Execution metadata reports actual peak allocated bytes where measurable. An OOM requires a fresh
 worker session; no smaller image or alternate precision is retried automatically.
+
+## Upscaling
+
+An `esrgan` bundle is one approved directory holding exactly one safetensors weights file and a
+`config.json` such as `{"architecture": "rrdbnet", "scale": 4, "in_channels": 3, "out_channels": 3,
+"num_feat": 64, "num_block": 23, "num_grow_ch": 32}` (Real-ESRGAN x4plus; x2plus is `scale: 2`).
+It is registered with `format: "single-file-safetensors"`, `family: "esrgan"`, `pipeline:
+"upscale"` and two components, `network` and `configuration` (see [the protocol](docs/protocol.md#families-and-loaders)).
+The weights header must match the configured architecture exactly. An `upscale` execution names an
+uploaded PNG and its real size, optionally `tile` (256/512/1024, 0 = whole image) and
+`tile_overlap`; the output is exactly input × scale, progress counts tiles, and a result over
+`limits.output_side` is refused before any work. Tiling is never chosen for you.
+
+Real-ESRGAN releases are `.pth` pickles, which the worker refuses. Converting one is an operator
+action outside the worker, in a separate throwaway environment, on a file you trust:
+
+```python
+import torch
+from safetensors.torch import save_file
+state = torch.load("RealESRGAN_x4plus.pth", map_location="cpu", weights_only=True)
+state = state.get("params_ema", state.get("params", state))
+save_file({k: v.contiguous() for k, v in state.items()}, "network.safetensors")
+```
+
+## Converting single-file checkpoints
+
+A single-file SDXL `.safetensors` checkpoint is not loadable as a bundle; convert it once, offline:
+
+```sh
+.venv/bin/media-engine convert --input /models/my-sdxl.safetensors --reference-handle sdxl-base \
+  --catalog /absolute/catalog.json --output /models/my-sdxl-diffusers [--precision float16]
+```
+
+The converter refuses anything that is not a safetensors container, takes the architecture,
+tokenizers and scheduler from the reference bundle's handle (nothing is downloaded), maps the keys
+with the Diffusers single-file helpers, checks every tensor against the reference model classes,
+and writes safetensors components plus `conversion.json` (source SHA-256, reference digest,
+converter versions, mapped key counts). Any key it cannot map fails the conversion by name and the
+partial output is removed. Approve and catalog the new directory like any other bundle; a 1.2
+registration may repeat the provenance as `source.conversion`, which the worker checks against
+`conversion.json`.
+
+## Automatic settings, fallbacks and device identity
+
+On 1.2 loads `precision` may be `auto` (float16 on CUDA, float32 on CPU; the reason names the
+estimate and budget) and `authorized_fallbacks` may list `cpu` (load on the host CPU in float32
+when the device is unavailable or over budget) and `lower_precision` (float16 when float32 is over
+`--memory-budget-mb`). Nothing happens without that authorization: an unavailable device is still
+refused and no precision changes. Applied fallbacks are reported on the load operation,
+`loaded_bundle` and every later snapshot, and never alter generation parameters. `/v1/info` and the
+startup record carry `device_identity` (device, index, name, total memory, a SHA-256 host ID from
+`/etc/machine-id` or the hostname, and pid) so a supervisor pool can tell workers apart.
 
 ## Lifetime and collection
 
@@ -100,19 +166,30 @@ Standalone callers own their persistent jobs and storage; this service is not a 
 
 ```sh
 PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src python -m tests.conformance.run --registration ROOT/conformance.json \
+  --launch python tests/serve_fixture.py ROOT
 ```
+
+The conformance suite (`tests/conformance`, `media-worker-conformance/1.0`) runs against any
+worker: `--url URL` with the credential in `MEDIA_ENGINE_TOKEN`, or `--launch CMD…` to start it
+and check its startup record too. It reports each section and says "conformant" only when none
+failed or was skipped; a backend is advertised only after it passes. Results are kept in
+[docs/compatibility.md](docs/compatibility.md). `tests/serve_fixture.py ROOT` (options in its
+docstring) is the hardware-free worker supervisors' integration tests launch.
 
 `tests/test_worker.py` exercises protocol/lifecycle behavior without GPU downloads.
 `tests/test_inference.py` runs real CPU inference through both backends on a tiny random-weight
-SDXL-shaped bundle; it is skipped unless the inference extra is installed (`uv sync --frozen --extra
+SDXL-shaped bundle and a tiny RRDBNet; `tests/test_convert.py` converts a tiny single-file
+checkpoint built from it. They are skipped unless the inference extra is installed (`uv sync --frozen --extra
 inference` then `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`). It proves the
 owned loop and the reference pipeline execute the same contract and, for the same seed and settings,
-produce byte-identical text-to-image output and image-to-image output within one 8-bit level on that
+produce pixel-identical text-to-image output and image-to-image output within one 8-bit level on that
 CPU stack, and that LoRA adapters change the output identically on both backends; it says nothing
 about image quality. Run the Runtime
 repository's `npm test` with both repositories beside each other for cross-process durable-job tests.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.3.0 speaks `media-worker/1.1` and serves `media-worker/1.0` callers such as Runtime 0.1.0.
+Engine 0.4.0 speaks `media-worker/1.2` and serves `media-worker/1.0`/`1.1` callers such as Runtime 0.1.0–0.3.0;
+its startup record keeps `protocol: "media-worker/1.1"` for those launchers and adds `highest_protocol`.
 
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
 SDXL base weights carry CreativeML Open RAIL++-M terms and are supplied by the operator.

@@ -3,13 +3,16 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
-version = "0.3.0"
-description = "Local, single-flight SDXL inference worker for Media Runtime"
+version = "0.4.0"
+description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling) for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
 readme = "README.md"
 dependencies = []
 [project.optional-dependencies]
+# The owned pipeline (owned-sdxl) and the esrgan upscaler: model classes, tensors, safetensors.
+inference-owned = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "safetensors==0.5.3", "numpy==2.2.3"]
+# The full reference set (diffusers-sdxl), a superset of inference-owned.
 inference = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "accelerate==1.4.0", "safetensors==0.5.3", "Pillow==11.1.0", "numpy==2.2.3", "peft==0.14.0"]
 [project.scripts]
 media-engine = "media_engine.server:main"

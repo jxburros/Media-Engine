@@ -17,23 +17,23 @@ This specification describes proposed behavior. `MUST` defines a required behavi
 
 ## Delivery status
 
-Revision 0.1.0 of this specification described the reference worker. Engine 0.3.0 delivers it, the owned SDXL pipeline backend, `media-worker/1.1`, image-to-image and LoRA adapters; [docs/protocol.md](docs/protocol.md) is the implementation contract for what ships. Revision 0.2.0 specifies the capabilities the first revision deferred so that each has an explicit stage, protocol version and acceptance rule before implementation. The [implementation plan](docs/implementation-plan.md) orders them.
+Revision 0.1.0 of this specification described the reference worker. Engine 0.4.0 adds protocol 1.2 (multiple outputs, upscaling, loaders and conversion, automatic settings and fallbacks, device identity and the conformance suite) to what Engine 0.3.0 delivered: the owned SDXL pipeline backend, `media-worker/1.1`, image-to-image and LoRA adapters; [docs/protocol.md](docs/protocol.md) is the implementation contract for what ships. Revision 0.2.0 specifies the capabilities the first revision deferred so that each has an explicit stage, protocol version and acceptance rule before implementation. The [implementation plan](docs/implementation-plan.md) orders them.
 
-| Capability                                            | Stage               | Protocol | Status in Engine 0.3.0 |
+| Capability                                            | Stage               | Protocol | Status in Engine 0.4.0 |
 | ----------------------------------------------------- | ------------------- | -------- | ---------------------- |
 | Reference worker, text-to-image, cancellation, SSE    | Reference worker    | 1.0      | Delivered              |
 | Image-to-image, owned pipeline, memory estimates      | Owned pipeline      | 1.1      | Delivered              |
 | LoRA adapters as load identity                        | Owned pipeline      | 1.1      | Delivered              |
-| Multiple outputs per execution, batch count           | Additional tasks    | 1.2      | Specified below        |
-| Upscaling task and the `esrgan` family                | Additional tasks    | 1.2      | Specified below        |
-| Loader capabilities and single-file conversion        | Additional tasks    | 1.2      | Specified below        |
-| Automatic settings and authorized fallbacks           | Additional tasks    | 1.2      | Specified below        |
-| Device identity for supervisor worker pools           | Additional tasks    | 1.2      | Specified below        |
+| Multiple outputs per execution, batch count           | Additional tasks    | 1.2      | Delivered              |
+| Upscaling task and the `esrgan` family                | Additional tasks    | 1.2      | Delivered              |
+| Loader capabilities and single-file conversion        | Additional tasks    | 1.2      | Delivered              |
+| Automatic settings and authorized fallbacks           | Additional tasks    | 1.2      | Delivered              |
+| Device identity for supervisor worker pools           | Additional tasks    | 1.2      | Delivered              |
 | Network mode for remote supervisors                   | Remote execution    | 1.2      | Specified below        |
 | Image-to-video task and the `svd` family              | Additional media    | 1.3      | Specified below        |
 | Text-to-audio task and the `stable-audio-open` family | Additional media    | 1.3      | Specified below        |
 | Targeted optimization options                         | Optimization        | 1.3      | Specified below        |
-| Owned native engine and protocol conformance suite    | Owned engine        | 1.x      | Specified below        |
+| Owned native engine and protocol conformance suite    | Owned engine        | 1.x      | Suite delivered        |
 
 Arbitrary graph import, executable recipe code, plugin marketplaces, in-process multi-device execution and model downloading remain outside this specification. Nothing in a later stage weakens a rule stated for an earlier one.
 

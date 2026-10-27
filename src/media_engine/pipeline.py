@@ -5,6 +5,9 @@ tokenization and text conditioning, latent initialization, the Euler sampling lo
 guidance, image-to-image noising, VAE encode/decode and the memory lifecycle. It retains the
 Diffusers model/scheduler component classes and PyTorch operations; it does not use the Diffusers
 pipeline classes. Request semantics match the reference backend; matching bytes are not promised.
+Component weights are read with `safetensors` and assigned to the model classes directly, and PNG
+input/output goes through the standard-library `png` module, so this path needs neither Pillow,
+numpy, accelerate nor peft.
 """
 
 import json
@@ -12,12 +15,19 @@ import re
 from pathlib import Path
 
 from .backend import Cancelled, TorchBackend, offline_environment
-from .contracts import effective_steps
+from .contracts import effective_steps, output_ids
 
 
 class OwnedPipelineBackend(TorchBackend):
     backend_id = "owned-sdxl"
     ownership = "owned-pipeline"
+    # No Pillow, numpy, accelerate or peft: PNG, weight loading and LoRA merging are owned here.
+    dependencies = (
+        ("torch", "torch"),
+        ("diffusers", "diffusers"),
+        ("transformers", "transformers"),
+        ("safetensors", "safetensors"),
+    )
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
         super().__init__(device, memory_budget_mb)
@@ -56,21 +66,86 @@ class OwnedPipelineBackend(TorchBackend):
         return merged
 
     # ----- lifecycle -------------------------------------------------------------------------
-    def load(self, root, options, adapters=()):
+    @staticmethod
+    def weight_files(folder):
+        """The component's safetensors files: an index's shards, else its one (non-variant) file."""
+        indexes = sorted(folder.glob("*.safetensors.index.json"))
+        if len(indexes) == 1:
+            shards = sorted(set(json.loads(indexes[0].read_text())["weight_map"].values()))
+            return [folder / name for name in shards]
+        files = sorted(folder.glob("*.safetensors"))
+        if len(files) == 1:
+            return files
+        standard = [f for f in files if f.name in ("diffusion_pytorch_model.safetensors", "model.safetensors")]
+        if len(standard) == 1:
+            return standard
+        raise RuntimeError("component weights are ambiguous")
+
+    def build(self, model_class, config, folder, dtype):
+        """Construct a model class on the meta device and assign its safetensors state directly.
+
+        No library loading helper runs: the weights are read with `safetensors`, cast to the load
+        precision, validated strictly against the class's parameters and assigned in place.
+        """
+        import torch
+        from safetensors.torch import load_file
+
+        with torch.device("meta"):
+            model = (
+                model_class.from_config(config)
+                if hasattr(model_class, "from_config")
+                else model_class(config)
+            )
+        state = {}
+        for path in self.weight_files(folder):
+            state.update(load_file(str(path), device="cpu"))
+        state = {
+            k: v.to(dtype) if v.is_floating_point() else v for k, v in state.items()
+        }
+        model.load_state_dict(state, strict=True, assign=True)
+        for name, buffer in list(model.named_buffers()):
+            if not buffer.is_meta:
+                continue
+            if not name.endswith("position_ids"):
+                raise RuntimeError("component has an unmaterialized buffer")
+            # CLIP's non-persistent position ids are derived, never stored.
+            owner = model.get_submodule(name.rsplit(".", 1)[0])
+            owner.register_buffer(
+                "position_ids",
+                torch.arange(buffer.shape[-1]).expand((1, -1)),
+                persistent=False,
+            )
+        return model.eval()
+
+    def load_pipeline(self, root, options, adapters=()):
         offline_environment()
         import torch
         from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
         from diffusers.models.attention_processor import AttnProcessor2_0
-        from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+        from transformers import (
+            CLIPTextConfig,
+            CLIPTextModel,
+            CLIPTextModelWithProjection,
+            CLIPTokenizer,
+        )
 
         self.apply_budget()
         dtype = getattr(torch, options["precision"])
         common = {"local_files_only": True}
-        weights = {**common, "torch_dtype": dtype, "use_safetensors": True}
-        root = str(root)
-        index = json.loads(Path(root, "model_index.json").read_text())
-        unet = UNet2DConditionModel.from_pretrained(root, subfolder="unet", **weights)
-        vae = AutoencoderKL.from_pretrained(root, subfolder="vae", **weights)
+        root = Path(root)
+        index = json.loads((root / "model_index.json").read_text())
+        unet = self.build(
+            UNet2DConditionModel,
+            UNet2DConditionModel.load_config(str(root), subfolder="unet", **common),
+            root / "unet",
+            dtype,
+        )
+        vae = self.build(
+            AutoencoderKL,
+            AutoencoderKL.load_config(str(root), subfolder="vae", **common),
+            root / "vae",
+            dtype,
+        )
         # SDXL's VAE overflows in float16; keep it float32 for the whole session so that the
         # memory lifecycle is explicit instead of an upcast hidden inside every execution.
         vae_dtype = (
@@ -81,11 +156,17 @@ class OwnedPipelineBackend(TorchBackend):
         vae.to(vae_dtype)
         unet.set_attn_processor(AttnProcessor2_0())
         vae.set_attn_processor(AttnProcessor2_0())
-        text_encoder = CLIPTextModel.from_pretrained(
-            root, subfolder="text_encoder", **weights
+        text_encoder = self.build(
+            CLIPTextModel,
+            CLIPTextConfig.from_pretrained(str(root), subfolder="text_encoder", **common),
+            root / "text_encoder",
+            dtype,
         )
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            root, subfolder="text_encoder_2", **weights
+        text_encoder_2 = self.build(
+            CLIPTextModelWithProjection,
+            CLIPTextConfig.from_pretrained(str(root), subfolder="text_encoder_2", **common),
+            root / "text_encoder_2",
+            dtype,
         )
         targets = {
             "unet": unet,
@@ -100,19 +181,20 @@ class OwnedPipelineBackend(TorchBackend):
             }
             for record, _root, adapter_weights, scale, _layout in adapters
         ]
+        device = self.run_device
         self.components = {
-            "unet": unet.to(self.device).eval(),
-            "vae": vae.to(self.device).eval(),
-            "text_encoder": text_encoder.to(self.device).eval(),
-            "text_encoder_2": text_encoder_2.to(self.device).eval(),
+            "unet": unet.to(device).eval(),
+            "vae": vae.to(device).eval(),
+            "text_encoder": text_encoder.to(device).eval(),
+            "text_encoder_2": text_encoder_2.to(device).eval(),
             "tokenizer": CLIPTokenizer.from_pretrained(
-                root, subfolder="tokenizer", **common
+                str(root), subfolder="tokenizer", **common
             ),
             "tokenizer_2": CLIPTokenizer.from_pretrained(
-                root, subfolder="tokenizer_2", **common
+                str(root), subfolder="tokenizer_2", **common
             ),
             "scheduler_config": EulerDiscreteScheduler.load_config(
-                root, subfolder="scheduler", **common
+                str(root), subfolder="scheduler", **common
             ),
             "force_zeros_for_empty_prompt": bool(
                 index.get("force_zeros_for_empty_prompt", True)
@@ -122,9 +204,8 @@ class OwnedPipelineBackend(TorchBackend):
             "vae_scale_factor": 2 ** (len(vae.config.block_out_channels) - 1),
         }
 
-    def unload(self):
+    def unload_pipeline(self):
         self.components = None
-        return self.release_device()
 
     # ----- conditioning ----------------------------------------------------------------------
     def encode_text(self, text):
@@ -142,7 +223,7 @@ class OwnedPipelineBackend(TorchBackend):
                 max_length=tokenizer.model_max_length,
                 truncation=True,
                 return_tensors="pt",
-            ).input_ids.to(self.device)
+            ).input_ids.to(self.run_device)
             output = encoder(tokens, output_hidden_states=True)
             # SDXL conditions on the penultimate layer; the pooled projection comes from encoder 2.
             pooled = output[0]
@@ -155,7 +236,7 @@ class OwnedPipelineBackend(TorchBackend):
         c = self.components
         embeds, pooled = self.encode_text(inputs["prompt"])
         time_ids = torch.tensor(
-            [[height, width, 0, 0, height, width]], device=self.device, dtype=c["dtype"]
+            [[height, width, 0, 0, height, width]], device=self.run_device, dtype=c["dtype"]
         )
         expected = c["unet"].config.get("projection_class_embeddings_input_dim")
         if expected is not None and expected != time_ids.shape[1] * c[
@@ -180,36 +261,31 @@ class OwnedPipelineBackend(TorchBackend):
         )
 
     # ----- latents ---------------------------------------------------------------------------
-    def encode_image(self, image, generator):
-        import numpy
-        import torch
+    def encode_image(self, path, width, height, generator):
+        """Encode the approved PNG input; a size other than the request is an error, not a resize."""
+        from .png import png_to_tensor
 
         c = self.components
-        array = numpy.asarray(image, dtype=numpy.float32) / 127.5 - 1.0
-        tensor = (
-            torch.from_numpy(array)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(self.device, c["vae_dtype"])
-        )
+        image = png_to_tensor(Path(path).read_bytes())
+        if tuple(image.shape[1:]) != (height, width):
+            raise ValueError("input image size does not match the request")
+        tensor = (image * 2 - 1).unsqueeze(0).to(self.run_device, c["vae_dtype"])
         posterior = c["vae"].encode(tensor).latent_dist
         return (posterior.sample(generator) * c["vae"].config.scaling_factor).to(
             c["dtype"]
         )
 
     def decode(self, latents):
-        import numpy
-        import torch
-        from PIL import Image
+        """Decode one latent to PNG bytes through the standard-library writer."""
+        from .png import tensor_to_png
 
         c = self.components
         latents = latents.to(c["vae_dtype"]) / c["vae"].config.scaling_factor
         image = c["vae"].decode(latents, return_dict=False)[0]
-        image = (image / 2 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).float().cpu().numpy()
-        return Image.fromarray((image * 255).round().astype(numpy.uint8))
+        return tensor_to_png((image / 2 + 0.5).clamp(0, 1)[0])
 
     # ----- execution -------------------------------------------------------------------------
-    def generate(self, request, destination, emit, cancelled, image_path=None):
+    def generate_images(self, request, directory, emit, cancelled, image_path=None):
         import torch
         from diffusers import EulerDiscreteScheduler
 
@@ -220,6 +296,7 @@ class OwnedPipelineBackend(TorchBackend):
         task = request["task"]
         width, height = params["width"], params["height"]
         total = effective_steps(params, task)
+        device = self.run_device
         self.begin(cancelled)
         try:
             with torch.inference_mode():
@@ -227,11 +304,14 @@ class OwnedPipelineBackend(TorchBackend):
                 embeds, pooled, time_ids, cfg = self.conditioning(
                     request["inputs"], params["guidance"], width, height
                 )
-                generator = torch.Generator(device=self.device).manual_seed(
-                    params["seed"]
-                )
+                # One generator per image, seeded seed + k − 1: each latent is drawn exactly as a
+                # count-1 run at that seed would draw it.
+                generators = [
+                    torch.Generator(device=device).manual_seed(s) for s in self.seeds(params)
+                ]
+                count = len(generators)
                 scheduler = EulerDiscreteScheduler.from_config(c["scheduler_config"])
-                scheduler.set_timesteps(params["steps"], device=self.device)
+                scheduler.set_timesteps(params["steps"], device=device)
                 shape = (
                     1,
                     c["unet"].config.in_channels,
@@ -239,24 +319,33 @@ class OwnedPipelineBackend(TorchBackend):
                     width // c["vae_scale_factor"],
                 )
                 if task == "image-to-image":
-                    image = self.load_image(image_path, width, height)
                     start = (params["steps"] - total) * scheduler.order
                     timesteps = scheduler.timesteps[start:]
                     if hasattr(scheduler, "set_begin_index"):
                         scheduler.set_begin_index(start)
                     # The posterior sample consumes the generator before the noise draw, so
                     # a seed means the same thing here as in the reference pipeline.
-                    initial = self.encode_image(image, generator)
+                    initial = self.encode_image(image_path, width, height, generators[0])
                     noise = torch.randn(
-                        shape, generator=generator, device=self.device, dtype=c["dtype"]
+                        shape, generator=generators[0], device=device, dtype=c["dtype"]
                     )
                     latents = scheduler.add_noise(initial, noise, timesteps[:1])
                 else:
                     timesteps = scheduler.timesteps
-                    noise = torch.randn(
-                        shape, generator=generator, device=self.device, dtype=c["dtype"]
+                    noise = torch.cat(
+                        [
+                            torch.randn(shape, generator=g, device=device, dtype=c["dtype"])
+                            for g in generators
+                        ]
                     )
                     latents = noise * scheduler.init_noise_sigma
+                if count > 1:
+                    # Conditioning rows follow the latent batch: [negative × N, positive × N].
+                    def batch(t):
+                        parts = t.chunk(2) if cfg else (t,)
+                        return torch.cat([part.repeat_interleave(count, dim=0) for part in parts])
+
+                    embeds, pooled, time_ids = batch(embeds), batch(pooled), batch(time_ids)
                 if cancelled.is_set():
                     raise Cancelled()
                 emit("stage", {"stage": "sampling"})
@@ -291,11 +380,27 @@ class OwnedPipelineBackend(TorchBackend):
                 if cancelled.is_set():
                     raise Cancelled()
                 emit("stage", {"stage": "decoding"})
-                output = self.decode(latents)
+                images = []
+                for latent in latents:
+                    if cancelled.is_set():
+                        raise Cancelled()
+                    images.append(self.decode(latent.unsqueeze(0)))
                 if cancelled.is_set():
                     raise Cancelled()
                 emit("stage", {"stage": "saving"})
-                output.save(destination, format="PNG")
-                return {"effective_steps": len(timesteps), **self.measurements()}
+                records = []
+                for output_id, data in zip(output_ids(task, params), images):
+                    path = Path(directory) / (output_id + ".png")
+                    path.write_bytes(data)
+                    records.append(
+                        {
+                            "output_id": output_id,
+                            "path": path,
+                            "mime_type": "image/png",
+                            "width": width,
+                            "height": height,
+                        }
+                    )
+                return records, {"effective_steps": len(timesteps), **self.measurements()}
         finally:
             self.finish()
