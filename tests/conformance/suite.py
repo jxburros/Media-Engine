@@ -6,7 +6,8 @@ Configuration comes from the environment so the same suite measures any backend:
   MEDIA_ENGINE_TOKEN           the per-launch bearer credential
   MEDIA_ENGINE_REGISTRATION    path to a JSON document {"bundle": <sdxl-base registration>,
                                "upscaler": <esrgan registration, needed when upscale is
-                               advertised>, "options": <optional load options>}
+                               advertised>, "video": <svd registration, needed when
+                               image-to-video is advertised>, "options": <optional load options>}
   MEDIA_ENGINE_STARTUP_RECORD  the worker's startup record (JSON text) when the suite launched it
   MEDIA_ENGINE_TLS_CA          for an https:// URL (network mode): PEM CA that issued the
                                worker's certificate (default: the system trust store)
@@ -33,11 +34,13 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 import zlib
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SUITE_VERSION = "media-worker-conformance/1.0"
+SUITE_VERSION = "media-worker-conformance/1.1"
 SECRET = "conformance-secret-prompt-7f3a"
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
@@ -267,6 +270,12 @@ class Discovery(Section):
             identity = self.info["device_identity"]
             for key in ("device", "index", "name", "total_memory_mb", "host_id", "host_id_source", "pid"):
                 self.assertIn(key, identity)
+        if "image-to-video" in self.caps["tasks"]:
+            self.assertGreaterEqual(self.minor(), 3)
+            video = self.caps["task_parameters"]["image-to-video"]
+            self.assertEqual(video["outputs"][:2], ["frames", "poster"])
+            self.assertEqual(video["output_formats"]["frames"], "application/zip")
+            self.assertEqual(video["output_formats"]["poster"], "image/png")
 
     def test_startup_record(self):
         if not self.startup:
@@ -311,6 +320,17 @@ class Negotiation(Section):
             body = {"protocol": older[-1], "bundle": self.bundle, "options": dict(self.options(), precision="auto")}
             status, value, _ = self.client.call("POST", "/v1/validate", body)
             self.error(status, value, "unsupported", "options")
+        older = [v for v in self.protocols if self.minor(v) < 3]
+        if "image-to-video" in self.caps["tasks"] and older:
+            # A 1.2 (or older) caller sees no video: the task and the family are unsupported.
+            body = video_request(older[-1], "attempt_n", "sha256:" + "0" * 64, "input_" + "0" * 32)
+            status, value, _ = self.client.call("POST", "/v1/validate", body)
+            self.error(status, value, "unsupported", "task")
+            video = (self.registration or {}).get("video")
+            if video and self.minor(older[-1]) >= 2:
+                body = {"protocol": older[-1], "bundle": video, "options": self.options()}
+                status, value, _ = self.client.call("POST", "/v1/validate", body)
+                self.error(status, value, "unsupported", "family")
 
 
 class Validation(Section):
@@ -329,6 +349,10 @@ class Validation(Section):
                     "inputs": {"image": "input_" + "0" * 32},
                     "parameters": {"width": 64, "height": 64},
                 }
+            elif task == "image-to-video":
+                if not (self.registration or {}).get("video"):
+                    self.skipTest("image-to-video is advertised but no video registration was supplied")
+                body = video_request(self.version, "attempt_v", self.registration["video"]["bundle_digest"], "input_" + "0" * 32)
             else:
                 body = self.request("attempt_v")
                 body["task"] = task
@@ -637,6 +661,97 @@ class Upscale(Section):
         self.ensure_loaded()
 
 
+def video_request(version, attempt, bundle_digest, input_id, width=64, height=64, **params):
+    return {
+        "protocol": version,
+        "attempt_id": attempt,
+        "bundle_digest": bundle_digest,
+        "task": "image-to-video",
+        "inputs": {"image": input_id},
+        "parameters": {"width": width, "height": height, "seed": 5, "steps": 2, **params},
+    }
+
+
+class ImageToVideo(Section):
+    section = "image_to_video"
+
+    def test_image_to_video(self):
+        if "image-to-video" not in self.caps["tasks"]:
+            return  # not applicable
+        video = (self.registration or {}).get("video")
+        if not video:
+            self.skipTest("image-to-video is advertised but no video registration was supplied")
+        self.operation("load", {"protocol": self.version, "bundle": video, "options": self.options()})
+        loaded = self.client.json("GET", "/v1/info")["loaded_bundle"]
+        self.assertEqual(loaded["tasks"], ["image-to-video"])
+        width, height = loaded["video_sizes"][0]
+        status, record, _ = self.client.call("POST", "/v1/inputs", data=make_png(width, height), headers={"Content-Type": "image/png"})
+        self.assertEqual(status, 201, record)
+
+        def body(name, **params):
+            return video_request(self.version, self.attempt(name), video["bundle_digest"], record["input_id"], width, height, **params)
+
+        bad = body("prompt")
+        bad["inputs"]["prompt"] = SECRET
+        status, value, _ = self.client.call("POST", "/v1/executions", bad)
+        self.error(status, value, "invalid_request", "prompt")
+        status, value, _ = self.client.call("POST", "/v1/executions", body("frames", frames=65))
+        self.error(status, value, "invalid_request", "frames")
+        unadvertised = body("size")
+        unadvertised["parameters"].update(width=width + 8)
+        status, value, _ = self.client.call("POST", "/v1/executions", unadvertised)
+        self.error(status, value, "invalid_request", "video_size")
+        status, value, _ = self.client.call("POST", "/v1/executions", self.request(self.attempt("wrongtask")) | {"bundle_digest": video["bundle_digest"]})
+        self.error(status, value, "unsupported", "task")
+
+        snap = self.run_to_end(body("video", frames=2, fps=8, decode_chunk=1))
+        self.assertEqual(snap["state"], "succeeded", snap.get("error"))
+        self.assertEqual([o["output_id"] for o in snap["outputs"]], ["frames", "poster"])
+        stages = [e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"]
+        self.assertEqual(stages, ["encoding", "sampling", "decoding", "packaging", "saving"])
+        progress = [e["data"] for e in snap["events"] if e["type"] == "progress"]
+        decoding = [p for p in progress if p["stage"] == "decoding"]
+        self.assertTrue([p for p in progress if p["stage"] == "sampling"])
+        self.assertEqual([(p["unit"], p["completed_steps"], p["total_steps"]) for p in decoding], [("frames", 1, 2), ("frames", 2, 2)])
+        self.assertEqual(snap["effective_settings"]["frames"], 2)
+        frames, poster = snap["outputs"]
+        self.assertEqual(frames["mime_type"], "application/zip")
+        self.assertEqual(poster["mime_type"], "image/png")
+        self.assertEqual((frames["width"], frames["height"], frames["frames"], frames["fps"]), (width, height, 2, 8))
+        self.assertAlmostEqual(frames["duration_seconds"], 0.25)
+        status, data, headers = self.client.call("GET", f"/v1/executions/{snap['execution_id']}/outputs/frames")
+        self.assertEqual((status, headers["Content-Type"]), (200, "application/zip"))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), frames["sha256"])
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            self.assertEqual(sorted(archive.namelist()), ["000001.png", "000002.png", "frames.json"])
+            self.assertTrue(all(i.compress_type == zipfile.ZIP_STORED for i in archive.infolist()))
+            manifest = json.loads(archive.read("frames.json"))
+            self.assertEqual(manifest, {"fps": 8, "width": width, "height": height, "frames": 2})
+            first = archive.read("000001.png")
+            for name in ("000001.png", "000002.png"):
+                self.assertEqual(struct.unpack(">II", archive.read(name)[16:24]), (width, height))
+        status, data, _ = self.client.call("GET", f"/v1/executions/{snap['execution_id']}/outputs/poster")
+        self.assertEqual(hashlib.sha256(data).hexdigest(), poster["sha256"])
+        self.assertEqual(data, first)  # the poster is frame 1, byte for byte
+        self.discard(snap["execution_id"])
+
+        accepted = self.submit(body("cancel", steps=50))
+        sent = threading.Event()
+
+        def on_event(event):
+            if not sent.is_set() and event["type"] == "stage" and event["data"]["stage"] == "sampling":
+                sent.set()
+                self.client.call("POST", f"/v1/executions/{accepted['execution_id']}/cancel")
+
+        self.client.events(accepted["execution_id"], on_event=on_event)
+        cancelled = self.wait(accepted["execution_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertEqual(cancelled["outputs"], [])
+        self.discard(accepted["execution_id"])
+        self.client.call("DELETE", "/v1/inputs/" + record["input_id"])
+        self.ensure_loaded()
+
+
 class Privacy(Section):
     section = "privacy"
 
@@ -664,7 +779,7 @@ class Privacy(Section):
             self.assertEqual(set(json.loads(text)), {"error"})
 
 
-SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, Inputs, Retention, Privacy]
+SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, ImageToVideo, Inputs, Retention, Privacy]
 
 
 def load_suite():

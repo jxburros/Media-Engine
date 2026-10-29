@@ -85,7 +85,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="media-worker protocol conformance suite")
     parser.add_argument("--url")
     parser.add_argument("--token-env", default="MEDIA_ENGINE_TOKEN")
-    parser.add_argument("--registration", help="JSON {bundle, upscaler?, options?}")
+    parser.add_argument("--registration", help="JSON {bundle, upscaler?, video?, options?}")
     parser.add_argument("--startup-record", help="file holding the worker's startup record")
     parser.add_argument("--launch", nargs=argparse.REMAINDER, help="command that starts the worker")
     parser.add_argument("--tls-ca", help="PEM CA that issued the worker's certificate")
