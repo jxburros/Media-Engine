@@ -6,12 +6,17 @@ import re
 import struct
 from pathlib import Path
 
-PROTOCOL = "media-worker/1.2"
-SUPPORTED_PROTOCOLS = ("media-worker/1.0", "media-worker/1.1", "media-worker/1.2")
-WORKER_VERSION = "0.5.0"
-TASKS = ("text-to-image", "image-to-image", "upscale")
+PROTOCOL = "media-worker/1.3"
+SUPPORTED_PROTOCOLS = (
+    "media-worker/1.0",
+    "media-worker/1.1",
+    "media-worker/1.2",
+    "media-worker/1.3",
+)
+WORKER_VERSION = "0.6.0"
+TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
-TASK_SINCE = {"text-to-image": 0, "image-to-image": 1, "upscale": 2}
+TASK_SINCE = {"text-to-image": 0, "image-to-image": 1, "upscale": 2, "image-to-video": 3}
 SDXL_ROLES = (
     "unet",
     "vae",
@@ -38,6 +43,7 @@ FAMILIES = {
         },
         "tasks": ("text-to-image", "image-to-image"),
         "config_file": "model_index.json",
+        "pipeline_class": "StableDiffusionXLPipeline",
         "since": 0,
     },
     "esrgan": {
@@ -50,13 +56,37 @@ FAMILIES = {
         "config_file": "config.json",
         "since": 2,
     },
+    "svd": {
+        "format": "diffusers-safetensors",
+        "pipeline": "image-to-video",
+        "roles": ("unet", "vae", "image_encoder", "feature_extractor", "scheduler"),
+        "weight_roles": ("unet", "vae", "image_encoder"),
+        "approved_classes": {
+            "unet": ("diffusers", "UNetSpatioTemporalConditionModel"),
+            "vae": ("diffusers", "AutoencoderKLTemporalDecoder"),
+            "image_encoder": ("transformers", "CLIPVisionModelWithProjection"),
+            "feature_extractor": ("transformers", "CLIPImageProcessor"),
+            "scheduler": ("diffusers", "EulerDiscreteScheduler"),
+        },
+        "tasks": ("image-to-video",),
+        "config_file": "model_index.json",
+        "pipeline_class": "StableVideoDiffusionPipeline",
+        "since": 3,
+    },
 }
 # 1.0/1.1 names, kept for importers; they describe the sdxl-base family.
 ROLES = FAMILIES["sdxl-base"]["roles"]
 WEIGHT_ROLES = FAMILIES["sdxl-base"]["weight_roles"]
 APPROVED_CLASSES = FAMILIES["sdxl-base"]["approved_classes"]
 FORMATS = ("diffusers-safetensors", "single-file-safetensors")
-OUTPUTS = {"text-to-image": ["image"], "image-to-image": ["image"], "upscale": ["image"]}
+OUTPUTS = {
+    "text-to-image": ["image"],
+    "image-to-image": ["image"],
+    "upscale": ["image"],
+    "image-to-video": ["frames", "poster"],
+}
+# Output MIME types and the file suffix each is stored under in the execution directory.
+OUTPUT_SUFFIXES = {"image/png": ".png", "application/zip": ".zip"}
 DEFAULTS = {
     "width": 1024,
     "height": 1024,
@@ -65,7 +95,15 @@ DEFAULTS = {
     "sampler": "euler",
     "scheduler": "euler",
 }
-TASK_DEFAULTS = {"image-to-image": {"strength": 0.75}, "upscale": {"tile": 0, "tile_overlap": 16}}
+TASK_DEFAULTS = {
+    "image-to-image": {"strength": 0.75},
+    "upscale": {"tile": 0, "tile_overlap": 16},
+    # `frames` defaults to the bundle's unet `num_frames`; it is resolved once the bundle loads.
+    "image-to-video": {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8},
+}
+# The reference pipeline's per-frame guidance ramp; not a request parameter in 1.3, so it is
+# reported in effective_settings rather than left implicit.
+VIDEO_GUIDANCE = {"min_guidance": 1.0, "max_guidance": 3.0}
 MAX_ADAPTERS = 4
 ADAPTER_TARGETS = ("unet", "text_encoder", "text_encoder_2")
 ADAPTER_FORMAT = "peft-lora"
@@ -81,7 +119,18 @@ LIMITS = {
     "tile_sizes": [256, 512, 1024],
     "tile_overlap": [0, 64],
     "output_side": 8192,
+    "video_steps": [1, 50],
+    "frames": [1, 64],
+    "fps": [1, 30],
+    "motion": [1, 255],
+    "noise_augmentation": [0, 1],
+    "decode_chunk": [1, 16],
+    # The reference svd bundle's sizes; a bundle may declare its own in video.json.
+    "video_sizes": [[1024, 576], [576, 1024]],
 }
+# The 1.3 limit keys, so a worker pinned to 1.2 can advertise exactly the 0.5.0 limits.
+VIDEO_LIMITS = ("video_steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk", "video_sizes")
+MAX_VIDEO_SIZES = 8
 AUTO_OPTIONS = ["precision"]
 FALLBACKS = ["cpu", "lower_precision"]
 PRECISION_BYTES = {"float16": 2, "float32": 4}
@@ -284,7 +333,7 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
     except (OSError, ValueError):
         raise WorkerError(400, "missing_component", "configuration") from None
     if (
-        index.get("_class_name") != "StableDiffusionXLPipeline"
+        index.get("_class_name") != family["pipeline_class"]
         or scheduler.get("_class_name") != "EulerDiscreteScheduler"
     ):
         raise WorkerError(400, "unsupported", "pipeline")
@@ -301,6 +350,8 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
     for role, value in approved.items():
         if index.get(role) != list(value):
             raise WorkerError(400, "unsupported", role)
+    if name == "svd":
+        video_facts(root)  # sizes and the default frame count must be usable before loading
     return root
 
 
@@ -372,12 +423,55 @@ def check_esrgan(root, files):
     return root
 
 
+def video_facts(root):
+    """The svd bundle's advertised sizes and default frame count, read without loading weights.
+
+    Sizes come from an optional top-level `video.json` (`{"sizes": [[width, height], …]}`) and
+    default to the reference bundle's 1024×576 and 576×1024; the default frame count is the
+    unet's `num_frames` (the library's default, 25, when the config omits it). A bundle whose
+    sizes or default frame count fall outside the advertised limits is `unsupported`, field
+    `configuration`, so nothing is decided later from an unusable bundle.
+    """
+    root = Path(root)
+    unsupported = WorkerError(400, "unsupported", "configuration")
+    sizes = LIMITS["video_sizes"]
+    try:
+        if (root / "video.json").is_file():
+            declared = json.loads((root / "video.json").read_text())
+            if not isinstance(declared, dict) or set(declared) != {"sizes"}:
+                raise unsupported
+            sizes = declared["sizes"]
+        unet = json.loads((root / "unet/config.json").read_text())
+    except (OSError, ValueError):
+        raise unsupported from None
+    if (
+        not isinstance(sizes, list)
+        or not 1 <= len(sizes) <= MAX_VIDEO_SIZES
+        or not isinstance(unet, dict)
+    ):
+        raise unsupported
+    for size in sizes:
+        if not isinstance(size, list) or len(size) != 2:
+            raise unsupported
+        for value, field in zip(size, ("width", "height")):
+            low, high = LIMITS[field]
+            if type(value) is not int or not low <= value <= high or value % LIMITS["size_multiple"]:
+                raise unsupported
+    frames = unet.get("num_frames", 25)
+    low, high = LIMITS["frames"]
+    if type(frames) is not int or not low <= frames <= high:
+        raise unsupported
+    return {"video_sizes": [list(s) for s in sizes], "default_frames": frames}
+
+
 def family_facts(root, family):
-    """Configuration facts a supervisor needs from the loaded family (the upscale factor)."""
+    """Configuration facts a supervisor needs from the loaded family (scale, video sizes)."""
     if family == "esrgan":
         from .upscale import read_config
 
         return {"scale": read_config(root)["scale"]}
+    if family == "svd":
+        return video_facts(root)
     return {}
 
 
@@ -432,6 +526,8 @@ def memory_estimate(root, precision, device, family="sdxl-base"):
             "activations_mb": activations,
             "uncertainty": "tile 0 (whole image) needs activations proportional to the full input and is not covered; excludes allocator reserve and framework overhead",
         }
+    if family == "svd":
+        return video_estimate(root, total, bytes_per_element, precision, device, roles)
     return {
         "value_mb": total,
         "source": "safetensors_headers",
@@ -440,6 +536,43 @@ def memory_estimate(root, precision, device, family="sdxl-base"):
         "device": device,
         "roles": roles,
         "uncertainty": "excludes activations, VAE float32 upcast, allocator reserve and framework overhead",
+    }
+
+
+def video_estimate(root, total, bytes_per_element, precision, device, roles):
+    """svd: parameters plus the sampling latents of the most frames at the largest size.
+
+    Per frame and per latent pixel (the VAE's spatial factor comes from its config) the sampling
+    loop holds the guided UNet input (2 × `in_channels`), the conditioning image latents repeated
+    for that frame (also guided, `in_channels`) and the denoised latent (`in_channels` / 2). That is
+    what grows with `frames` in every step; UNet and VAE activations also grow with frames and
+    `decode_chunk` and are not modeled here.
+    """
+    root = Path(root)
+    try:
+        unet = json.loads((root / "unet/config.json").read_text())
+        vae = json.loads((root / "vae/config.json").read_text())
+    except (OSError, ValueError):
+        unet, vae = {}, {}
+    channels = unet.get("in_channels", 8)
+    factor = 2 ** (len(vae.get("block_out_channels", (128, 256, 512, 512))) - 1)
+    facts = video_facts(root)
+    width, height = max(facts["video_sizes"], key=lambda s: s[0] * s[1])
+    pixels = (width // factor) * (height // factor)
+    per_frame = (2 * channels + channels + channels // 2) * pixels * bytes_per_element
+    frames = LIMITS["frames"][1]
+    latents = per_frame * frames // 1024**2
+    return {
+        "value_mb": total + latents,
+        "source": "safetensors_headers",
+        "basis": f"component parameters at the requested load precision plus the sampling latents of {frames} frames at {width}×{height} ({per_frame} bytes per frame: the guided UNet input, the repeated image latents and the denoised latent)",
+        "precision": precision,
+        "device": device,
+        "roles": roles,
+        "latents_mb": latents,
+        "per_frame_bytes": per_frame,
+        "frames": {"limit": LIMITS["frames"], "scaling": "latent memory grows linearly with frames; per_frame_bytes × frames"},
+        "uncertainty": "excludes UNet attention and VAE decoder activations (which grow with frames and decode_chunk), the image encoder's activations, allocator reserve and framework overhead",
     }
 
 
@@ -459,6 +592,8 @@ def png_dimensions(data):
 def effective_steps(parameters, task):
     if task == "upscale":
         return None
+    if task == "image-to-video":
+        return parameters["steps"]
     if task != "image-to-image":
         return parameters["steps"]
     return min(int(parameters["steps"] * parameters["strength"]), parameters["steps"])
@@ -475,6 +610,14 @@ def output_ids(task, parameters):
 def effective_settings(parameters, task, version):
     if task == "upscale":
         return {**TASK_DEFAULTS["upscale"], **parameters}
+    if task == "image-to-video":
+        # `frames` joins from the loaded bundle's facts when the request leaves it out.
+        return {
+            **TASK_DEFAULTS["image-to-video"],
+            **parameters,
+            **VIDEO_GUIDANCE,
+            "effective_steps": parameters["steps"],
+        }
     settings = {**parameters, "effective_steps": effective_steps(parameters, task)}
     if task == "text-to-image" and minor(version) >= 2:
         settings = {"count": 1, **settings}
@@ -507,6 +650,46 @@ def validate_upscale(body):
     return "upscale"
 
 
+def validate_video(body):
+    inputs, params = body["inputs"], body["parameters"]
+    if isinstance(inputs, dict) and ("prompt" in inputs or "negative_prompt" in inputs):
+        # The svd family is conditioned on the image alone; a prompt would be silently ignored.
+        raise WorkerError(400, "invalid_request", "prompt")
+    strict(inputs, ("image",))
+    if not isinstance(inputs["image"], str) or not re.fullmatch(
+        r"input_[a-f0-9]{32}", inputs["image"]
+    ):
+        raise WorkerError(400, "invalid_request", "image")
+    strict(
+        params,
+        ("width", "height", "seed", "steps"),
+        ("frames", "fps", "motion", "noise_augmentation", "decode_chunk"),
+    )
+    for field in ("width", "height"):
+        value = params[field]
+        low, high = LIMITS[field]
+        if type(value) is not int or not low <= value <= high or value % LIMITS["size_multiple"]:
+            raise WorkerError(400, "invalid_request", field)
+    for field, limit in (
+        ("seed", [0, 4294967295]),
+        ("steps", LIMITS["video_steps"]),
+        ("frames", LIMITS["frames"]),
+        ("fps", LIMITS["fps"]),
+        ("motion", LIMITS["motion"]),
+        ("decode_chunk", LIMITS["decode_chunk"]),
+    ):
+        if field in params:
+            value = params[field]
+            if type(value) is not int or not limit[0] <= value <= limit[1]:
+                raise WorkerError(400, "invalid_request", field)
+    if "noise_augmentation" in params:
+        value = params["noise_augmentation"]
+        low, high = LIMITS["noise_augmentation"]
+        if type(value) not in (int, float) or not low <= value <= high:
+            raise WorkerError(400, "invalid_request", "noise_augmentation")
+    return "image-to-video"
+
+
 def validate_parameters(body):
     strict(
         body,
@@ -527,6 +710,8 @@ def validate_parameters(body):
         raise WorkerError(400, "invalid_request", "attempt_id")
     if task == "upscale":
         return validate_upscale(body)
+    if task == "image-to-video":
+        return validate_video(body)
     image_required = ("image",) if task == "image-to-image" else ()
     strict(body["inputs"], ("prompt",) + image_required, ("negative_prompt",))
     for key, value in body["inputs"].items():

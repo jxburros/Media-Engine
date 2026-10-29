@@ -219,7 +219,7 @@ class NetworkModeTests(unittest.TestCase):
                        "MEDIA_ENGINE_FIXTURE_MAX_RETAINED": "10"}
         result = subprocess.run(command, cwd=HERE.parent, env=environment, capture_output=True, text=True, timeout=600)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("conformant: media-worker-conformance/1.0", result.stdout)
+        self.assertIn("conformant: media-worker-conformance/1.1", result.stdout)
 
     def test_non_loopback_bind_requires_all_tls_material(self):
         err = self.refused("--bind", "0.0.0.0")

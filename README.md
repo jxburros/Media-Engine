@@ -1,11 +1,12 @@
 # Media Engine
 
 An independently installed, offline media inference worker for [Media Runtime](https://github.com/jxburros/Media-Runtime)
-or another local supervisor. It implements `media-worker/1.2` (and still serves 1.0 and 1.1 callers
-unchanged) over authenticated loopback HTTP (or, in network mode, mutual TLS for a supervisor on
-another host), with asynchronous load/unload, a warm pipeline, one
+or another local supervisor. It implements `media-worker/1.3` (and still serves 1.0, 1.1 and 1.2
+callers unchanged) over authenticated loopback HTTP (or, in network mode, mutual TLS for a
+supervisor on another host), with asynchronous load/unload, a warm pipeline, one
 execution slot, SDXL text-to-image (up to four images per execution) and image-to-image, ESRGAN
-upscaling, real sampling/tile callbacks, cooperative cancellation, resumable SSE, opaque
+upscaling, Stable Video Diffusion image-to-video as a lossless frame archive, real
+sampling/tile/frame callbacks, cooperative cancellation, resumable SSE, opaque
 input/output handles, header-based memory estimates, automatic precision with caller-authorized
 fallbacks, device identity and an offline single-file checkpoint converter.
 
@@ -14,8 +15,9 @@ specifies are sequenced in [docs/implementation-plan.md](docs/implementation-pla
 its backend stages behind one protocol: the **reference worker** (`diffusers-sdxl`, the complete
 Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this project assembles the
 components and runs the denoising loop itself). The `esrgan` upscaler network is engine code on
-both. Native engines, video/audio families and custom GPU kernels are future stages;
-they are not advertised as capabilities.
+both. The `svd` image-to-video family runs on the reference backend only. Native engines, the
+audio family, an owned video loop and custom GPU kernels are future stages; they are not
+advertised as capabilities.
 
 ## Install
 
@@ -47,7 +49,7 @@ not fetch weights, convert checkpoints during a request (conversion is the separ
 identified by SHA-256 of every registered file; optional upstream revision/license metadata belongs
 to the registration. Keep approved files immutable/read-only while the worker serves them.
 
-Copy `examples/catalog.json`, replace the absolute model paths and keep the same handles (`sdxl-base`, `upscaler`)
+Copy `examples/catalog.json`, replace the absolute model paths and keep the same handles (`sdxl-base`, `upscaler`, `video`)
 in Runtime's artifact catalog. The **operator** supplies these paths at launch. Load requests carry
 only approved opaque artifact handles, component digests and relative file identities.
 
@@ -116,6 +118,41 @@ state = torch.load("RealESRGAN_x4plus.pth", map_location="cpu", weights_only=Tru
 state = state.get("params_ema", state.get("params", state))
 save_file({k: v.contiguous() for k, v in state.items()}, "network.safetensors")
 ```
+
+## Image-to-video
+
+A 1.3 `image-to-video` execution animates one uploaded PNG with an `svd` bundle (Stable Video
+Diffusion: spatio-temporal UNet, temporal-decoder VAE, CLIP image encoder, Euler scheduler) on
+the reference backend (`diffusers-sdxl`; the owned backend refuses the family). Nothing beyond
+the `inference` extra is needed: frames are written by the standard-library PNG writer and packed
+with `zipfile`.
+
+Supply a complete local Diffusers-format `stabilityai/stable-video-diffusion-img2vid-xt` (25
+frames) or `stable-video-diffusion-img2vid` (14 frames) bundle with safetensors weights:
+`model_index.json`, `unet/`, `vae/`, `image_encoder/`, `feature_extractor/` and `scheduler/`.
+Keep only the weights you serve in each folder (the worker hashes every file and the library
+loads the non-variant `*.safetensors`). Register it with `family: "svd"`, `pipeline:
+"image-to-video"`, `format: "diffusers-safetensors"` and those five roles. The bundle serves the
+reference sizes 1024×576 and 576×1024; an operator may add a top-level `video.json`,
+`{"sizes": [[1024, 576], [576, 1024]]}`, to declare other sizes the weights were trained for.
+While it is loaded, `capabilities.limits.video_sizes` and `loaded_bundle.video_sizes` list them.
+
+The request names the uploaded image and its real size (one of the bundle's sizes; nothing is
+resized), `seed`, `steps` (1–50) and optionally `frames` (1–64, default the bundle's
+`num_frames`), `fps` (1–30, default 7), `motion` (motion bucket 1–255, default 127),
+`noise_augmentation` (0–1, default 0.02) and `decode_chunk` (frames per VAE decode, 1–16, default
+8; lower it to save memory). Two outputs are finalized: `frames`, an `application/zip` with
+`frames.json` (`fps`, `width`, `height`, `frames`) and `000001.png` … stored losslessly, and
+`poster`, frame 1 as a PNG. The `frames` record carries `frames`, `fps` and `duration_seconds`.
+Progress counts sampling steps, then decoded frames; cancellation is honored at every step and
+decode chunk. Encode a container yourself from the archive, for example
+`ffmpeg -framerate 7 -i %06d.png -c:v libx264 -pix_fmt yuv420p out.mp4` after unzipping; the
+worker ships no encoder and never runs one.
+
+The Stable Video Diffusion weights are licensed by Stability AI under their own terms (the
+Stability AI Community License for the current releases; check the model card of the revision
+you install), separately from this MIT-licensed worker. The operator obtains and approves them;
+the worker never downloads them.
 
 ## Converting single-file checkpoints
 
@@ -234,7 +271,7 @@ PYTHONPATH=src python -m tests.conformance.run --registration ROOT/conformance.j
   --launch python tests/serve_fixture.py ROOT
 ```
 
-The conformance suite (`tests/conformance`, `media-worker-conformance/1.0`) runs against any
+The conformance suite (`tests/conformance`, `media-worker-conformance/1.1`) runs against any
 worker: `--url URL` with the credential in `MEDIA_ENGINE_TOKEN`, or `--launch CMD…` to start it
 and check its startup record too. It reports each section and says "conformant" only when none
 failed or was skipped; a backend is advertised only after it passes. Results are kept in
@@ -246,7 +283,8 @@ runs the suite over TLS with the committed test certificates in `tests/certs`.
 
 `tests/test_worker.py` exercises protocol/lifecycle behavior without GPU downloads.
 `tests/test_inference.py` runs real CPU inference through both backends on a tiny random-weight
-SDXL-shaped bundle and a tiny RRDBNet; `tests/test_convert.py` converts a tiny single-file
+SDXL-shaped bundle and a tiny RRDBNet, and image-to-video through the reference backend on a tiny
+random-weight svd bundle (64×64, two frames, two steps); `tests/test_convert.py` converts a tiny single-file
 checkpoint built from it. They are skipped unless the inference extra is installed (`uv sync --frozen --extra
 inference` then `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`). It proves the
 owned loop and the reference pipeline execute the same contract and, for the same seed and settings,
@@ -255,8 +293,10 @@ CPU stack, and that LoRA adapters change the output identically on both backends
 about image quality. Run the Runtime
 repository's `go test ./...` with both repositories beside each other for cross-process durable-job tests.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.5.0 speaks `media-worker/1.2` and serves `media-worker/1.0`/`1.1` callers such as Runtime 0.1.0–0.3.0;
-its startup record keeps `protocol: "media-worker/1.1"` for those launchers and adds `highest_protocol`.
+Engine 0.6.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.6.0;
+its startup record keeps `protocol: "media-worker/1.1"` for those launchers and reports `highest_protocol`.
+`tests/serve_fixture.py --protocol media-worker/1.2` (or `1.1`) pins the fixture to an older surface.
 
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
-SDXL base weights carry CreativeML Open RAIL++-M terms and are supplied by the operator.
+SDXL base weights carry CreativeML Open RAIL++-M terms and Stable Video Diffusion weights carry
+Stability AI's terms; both are supplied by the operator.

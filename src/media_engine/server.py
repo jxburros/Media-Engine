@@ -1,4 +1,4 @@
-"""media-worker/1.2: authenticated loopback (or mutual-TLS network mode), one warm pipeline, no queue."""
+"""media-worker/1.3: authenticated loopback (or mutual-TLS network mode), one warm pipeline, no queue."""
 
 import argparse
 import copy
@@ -21,11 +21,12 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
-from . import png
+from . import png, video
 from .backend import Cancelled, backend_class
 from .contracts import (
     FAMILIES,
     LIMITS,
+    OUTPUT_SUFFIXES,
     PROTOCOL,
     SUPPORTED_PROTOCOLS,
     WORKER_VERSION,
@@ -108,6 +109,9 @@ class Worker:
 
     def capabilities(self):
         backend = self.backend.capabilities()
+        if self.loaded_family == "svd" and "video_sizes" in backend.get("limits", {}):
+            # Sizes are a bundle fact: with an svd bundle loaded, advertise the sizes it serves.
+            backend["limits"] = {**backend["limits"], "video_sizes": self.loaded_facts["video_sizes"]}
         return {
             **backend,
             "session_id": self.session_id,
@@ -162,6 +166,17 @@ class Worker:
         strict(body, ("protocol", "bundle", "options"), ("adapters", "authorized_fallbacks"))
         version = protocol(body)
         level = minor(version)
+        bundle = body["bundle"]
+        name = bundle.get("family") if isinstance(bundle, dict) else None
+        if (
+            isinstance(name, str)
+            and name in FAMILIES
+            and FAMILIES[name]["since"] <= level
+            and name not in getattr(self.backend, "families", FAMILIES)
+        ):
+            # A family this backend's code does not implement (svd on owned-sdxl), refused before
+            # any file is read, as an unknown family is.
+            raise WorkerError(400, "unsupported", "family")
         if "authorized_fallbacks" in body and level < 2:
             raise WorkerError(400, "unsupported", "authorized_fallbacks")
         strict(body["options"], ("precision", "attention", "offload"))
@@ -358,7 +373,7 @@ class Worker:
     def storage_used(self):
         return sum(
             p.stat().st_size
-            for pattern in ("exec_*/*.png", "inputs/*.png")
+            for pattern in ("exec_*/*.png", "exec_*/*.zip", "inputs/*.png")
             for p in self.directory.glob(pattern)
         )
 
@@ -417,10 +432,15 @@ class Worker:
             return {}
         if task not in FAMILIES[self.loaded_family]["tasks"]:
             raise WorkerError(400, "unsupported", "task")
+        params = body["parameters"]
+        if task == "image-to-video":
+            if [params["width"], params["height"]] not in self.loaded_facts["video_sizes"]:
+                # Only sizes the bundle advertises; the input is never resized to fit one.
+                raise WorkerError(400, "invalid_request", "video_size")
+            return {"frames": params.get("frames", self.loaded_facts["default_frames"])}
         if task != "upscale":
             return {}
         scale = self.loaded_facts["scale"]
-        params = body["parameters"]
         if max(params["width"], params["height"]) * scale > self.capabilities()["limits"]["output_side"]:
             # Decided before any computation; the worker never shrinks a result to fit.
             raise WorkerError(400, "invalid_request", "output_side")
@@ -465,7 +485,7 @@ class Worker:
             if not self.loaded or self.loaded["bundle_digest"] != body["bundle_digest"]:
                 raise WorkerError(409, "model_not_ready")
             image_path = None
-            if task in ("image-to-image", "upscale"):
+            if task in ("image-to-image", "upscale", "image-to-video"):
                 record = self.inputs.get(body["inputs"]["image"])
                 if not record:
                     raise WorkerError(404, "input_not_found")
@@ -479,7 +499,10 @@ class Worker:
             expected = output_ids(task, body["parameters"])
             width = facts.get("output_width", body["parameters"]["width"])
             height = facts.get("output_height", body["parameters"]["height"])
-            reserve = (width * height * 4 + 65536) * len(expected)
+            # One image-sized reservation per output file, and per frame inside a frame archive;
+            # an oversized video is refused here, before sampling, never shortened.
+            files = len(expected) + (facts["frames"] - 1 if task == "image-to-video" else 0)
+            reserve = (width * height * 4 + 65536) * files
             if (
                 len(self.executions) + len(self.inputs) >= self.max_retained
                 or self.storage_used() + reserve > self.max_storage_mb * 1024**2
@@ -522,22 +545,41 @@ class Worker:
             return self.snapshot(execution_id)
 
     def finalize(self, execution_id, records):
-        """Verify every advertised output exists, then fsync, hash and publish each one."""
+        """Verify every advertised output exists, then fsync, hash and publish each one.
+
+        Type-specific facts are read back from the file (PNG header; the frame archive's
+        validated frames.json), never taken from the backend's word.
+        """
         entry = self.executions[execution_id]
         by_id = {r["output_id"]: r for r in records}
         folder = self.directory / execution_id
         outputs = []
         for output_id in entry["expected_outputs"]:
             record = by_id.get(output_id)
-            if record is None or not Path(record["path"]).is_file():
+            if (
+                record is None
+                or record["mime_type"] not in OUTPUT_SUFFIXES
+                or not Path(record["path"]).is_file()
+            ):
                 raise MissingOutput(output_id)
             with Path(record["path"]).open("rb") as stream:
                 head = stream.read(33)
                 stream.seek(0)
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
                 os.fsync(stream.fileno())
-            width, height = png.header(head)[:2]
-            final = folder / (output_id + ".png")
+            if record["mime_type"] == video.MIME_TYPE:
+                manifest = video.read_manifest(record["path"])
+                facts = {
+                    "width": manifest["width"],
+                    "height": manifest["height"],
+                    "frames": manifest["frames"],
+                    "fps": manifest["fps"],
+                    "duration_seconds": video.duration_seconds(manifest["frames"], manifest["fps"]),
+                }
+            else:
+                width, height = png.header(head)[:2]
+                facts = {"width": width, "height": height}
+            final = folder / (output_id + OUTPUT_SUFFIXES[record["mime_type"]])
             Path(record["path"]).replace(final)
             outputs.append(
                 {
@@ -545,8 +587,7 @@ class Worker:
                     "mime_type": record["mime_type"],
                     "size": final.stat().st_size,
                     "sha256": digest,
-                    "width": width,
-                    "height": height,
+                    **facts,
                 }
             )
         return outputs
@@ -615,7 +656,8 @@ class Worker:
             record = next((o for o in snap["outputs"] if o["output_id"] == output_id), None)
             if record is None:
                 raise WorkerError(404, "output_not_found")
-            return self.directory / execution_id / (output_id + ".png"), record
+            suffix = OUTPUT_SUFFIXES[record["mime_type"]]
+            return self.directory / execution_id / (output_id + suffix), record
 
     def release(self, execution_id):
         with self.lock:

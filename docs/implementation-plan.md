@@ -37,14 +37,16 @@ without GPU hardware.
 | Engine | Protocol | Phase                                                   | Runtime consumer |
 | ------ | -------- | ------------------------------------------------------- | ---------------- |
 | 0.4.0  | 1.2      | E1 Conformance suite, multi-output, loaders, upscale, conversion, auto/fallbacks, device identity | 0.4.0, 0.5.0, 0.6.0 |
-| 0.5.0  | 1.2      | E2 Network mode (mutual TLS)                            | 0.7.0            |
-| 0.6.0  | 1.3      | E3 Image-to-video (`svd`)                               | 0.8.0            |
-| 0.7.0  | 1.3      | E4 Text-to-audio (`stable-audio-open`)                  | 0.9.0            |
-| 0.8.0  | 1.3      | E5 Targeted optimization options                        | 0.9.x            |
+| 0.5.0  | 1.2      | E2 Network mode (mutual TLS)                            | 0.8.0            |
+| 0.6.0  | 1.3      | E3 Image-to-video (`svd`)                               | 0.9.0            |
+| 0.7.0  | 1.3      | E4 Text-to-audio (`stable-audio-open`)                  | 0.10.0           |
+| 0.8.0  | 1.3      | E5 Targeted optimization options                        | 0.10.x (no dedicated Runtime phase) |
 | 1.0.0  | 1.3      | E6 Owned native engine                                  | 1.0.0            |
 
-Minor 1.2 ships complete in 0.4.0; 0.5.0 adds fields only (`scheme`, `bind`, certificate
-fingerprint, `ownership_available`) which 1.2 permits as response additions. Minor 1.3 ships in
+The Runtime column follows the Runtime plan's phases (R4 network mode 0.8.0, R5 video 0.9.0, R6
+audio 0.10.0); Runtime 0.7.0 is the local worker pool. Minor 1.2 ships complete in 0.4.0; 0.5.0
+adds fields only (`scheme`, `bind`, certificate fingerprint, `ownership_available`) which 1.2
+permits as response additions. Minor 1.3 ships in
 0.6.0 and 0.7.0 together: 0.6.0 advertises 1.3 with video only and 0.7.0 adds audio; the
 `tasks` list, not the minor, tells a caller what exists.
 

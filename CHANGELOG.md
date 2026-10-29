@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.6.0 — 2026-10-29
+
+Protocol `media-worker/1.3` with image-to-video (phase E3). 1.0, 1.1 and 1.2 are still served
+unchanged; every new behavior is gated on the request's minor, and a 1.2 caller that names
+`image-to-video` or an `svd` bundle gets `unsupported` (field `task` or `family`).
+
+- **`svd` family and `image-to-video` task**: a Diffusers `StableVideoDiffusionPipeline` bundle
+  (unet, vae, image_encoder → safetensors; feature_extractor, scheduler → json) with the
+  approved classes checked from `model_index.json`; sizes from an optional `video.json`
+  (default 1024×576 and 576×1024) and the default frame count from the unet's `num_frames`,
+  both reported as `video_sizes`/`default_frames` on validation, load and `loaded_bundle`, and
+  `capabilities.limits.video_sizes` follows the loaded bundle.
+- **Request**: `inputs.image` only; `seed`, `steps` (1–50) required; `frames` (1–64), `fps`
+  (1–30, default 7), `motion` (1–255, default 127), `noise_augmentation` (0–1, default 0.02) and
+  `decode_chunk` (1–16, default 8) optional; width/height must be an advertised size and equal the
+  input (never resized). The fixed guidance ramp is reported as `min_guidance`/`max_guidance`.
+- **Outputs**: `frames`, an `application/zip` of stored lossless PNGs `000001.png` … plus
+  `frames.json` (`fps`, `width`, `height`, `frames`), reproducible byte for byte; and `poster`,
+  frame 1's PNG. The worker validates the archive and reads `frames`, `fps`, `duration_seconds`,
+  `width` and `height` back from it into the output record. Storage is reserved per frame before
+  sampling. New standard-library module `video.py` (writer and reader).
+- **Reference backend only**: `diffusers-sdxl` runs the library pipeline from the verified
+  components with stages `encoding`, `sampling` (step progress), `decoding` (per chunk, `unit:
+  "frames"`), `packaging`, `saving`, and checks cancellation at every UNet call and step, before
+  every decode chunk and before packaging. `owned-sdxl` does not serve `svd` (`unsupported`, field
+  `family`); `capabilities.loaders` lists `svd` only for `diffusers-sdxl`.
+- **Memory estimate**: `svd` adds `latents_mb` and `per_frame_bytes` (sampling latents of 64
+  frames at the largest size) with its basis; decoder and attention activations are excluded and
+  stated.
+- **Conformance suite `media-worker-conformance/1.1`**: an `image_to_video` section plus video
+  checks in discovery, negotiation and validation; the registration document gains `video`.
+- `tests/serve_fixture.py` serves a `video` handle (svd, two frames, sizes 64×64, 1024×576,
+  576×1024; tiny random stand-in weights) through `TestBackend`, which writes a real frame archive
+  through `video.py`; `--protocol media-worker/1.2` now reproduces the 0.5.0 fixture surface and
+  `--protocol media-worker/1.1` still reproduces 0.3.0.
+- Schema `$id` 1.3 (`svd` bundles, the video execution body, `frame_manifest`,
+  `video_configuration`; 1.0–1.2 shapes still valid); `docs/protocol.md` "What changed in 1.3";
+  README "Image-to-video" with the reference bundle and its license; compatibility row and video
+  checklist; `docs/decisions.md` 0.6.0 entry. The plan's Runtime-consumer column now matches the
+  Runtime plan (network mode 0.8.0, video 0.9.0, audio 0.10.0). No new dependency; the optional
+  MP4 encoder extra is not part of this release.
+
+Validation, stated plainly: there is no GPU and there are no real Stable Video Diffusion weights
+in this workspace, so the svd path ran only on CPU float32 with a tiny random-weight bundle
+(64×64, two frames, two steps) in a Python 3.12.3 virtual environment holding the pinned
+`inference` set with CPU torch 2.6.0 (`+cpu` wheel, not the locked CUDA build). There the frames
+match the library pipeline's own decode within one 8-bit level and the whole suite passes
+(64 tests, one IPv6 skip); the conformance suite reports `diffusers-sdxl` and `owned-sdxl`
+conformant on CPU with tiny bundles. float16, CUDA memory, the reference 1024×576 × 25-frame
+workload and the estimate's accuracy are implemented but not hardware-validated; see the
+image-to-video checklist in `docs/compatibility.md`. The `inference-owned`-only environment was
+not rebuilt for this release (no owned-path code changed). Runtime 0.5.0 (8/8 integration tests)
+and 0.6.0 (11/11) pass unchanged against the 0.6.0 fixture; no Runtime consumes 1.3 yet
+(Runtime 0.9.0, phase R5).
+
 ## 0.5.0 — 2026-10-27
 
 Network mode over mutual TLS (phase E2). Protocol minor stays `media-worker/1.2`: no request,

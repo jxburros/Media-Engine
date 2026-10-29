@@ -3,8 +3,8 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
-version = "0.5.0"
-description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling) for Media Runtime"
+version = "0.6.0"
+description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video) for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
 readme = "README.md"

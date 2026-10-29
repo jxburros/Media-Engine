@@ -8,10 +8,14 @@ The first stdout line is the startup record. ROOT receives these catalog handles
   upscaler     esrgan single-file-safetensors bundle, scale 2        ROOT/upscaler
   converted    sdxl-base bundle with conversion.json provenance      ROOT/converted
   checkpoint   bare single-file checkpoint (needs conversion)        ROOT/checkpoint
+  video        svd bundle (1.3): num_frames 2, sizes 64×64,          ROOT/video
+               1024×576 and 576×1024; tiny random stand-in weights
 plus ROOT/catalog.json (handle → directory), ROOT/registrations.json (handle → bundle or
 adapter registration) and ROOT/conformance.json (the conformance suite's registration document).
 Every option also reads an environment variable so a supervisor's test can set it without
-changing the launch command.
+changing the launch command. --protocol media-worker/1.2 (or MEDIA_ENGINE_FIXTURE_PROTOCOL)
+serves exactly the Engine 0.5.0 fixture surface (no image-to-video, no svd), and
+--protocol media-worker/1.1 the 0.3.0 surface, so supervisors can test negotiation and refusal.
 
 Network mode takes the worker's own flags and rules (media_engine.server.network_configuration):
 --bind, --tls-cert, --tls-key, --tls-client-ca and --no-parent-watch, also read from
@@ -33,6 +37,7 @@ from fixture import (
     make_checkpoint,
     make_converted,
     make_esrgan_bundle,
+    make_svd_bundle,
 )
 from media_engine.contracts import SUPPORTED_PROTOCOLS
 from media_engine.server import (
@@ -60,7 +65,8 @@ parser.add_argument(
     "--protocol",
     default=env("PROTOCOL", SUPPORTED_PROTOCOLS[-1]),
     choices=SUPPORTED_PROTOCOLS[1:],
-    help="highest minor to serve (media-worker/1.1 reproduces the 0.3.0 fixture surface)",
+    help="highest minor to serve (media-worker/1.2 reproduces the 0.5.0 fixture surface, "
+    "media-worker/1.1 the 0.3.0 surface)",
 )
 parser.add_argument(
     "--device-unavailable",
@@ -110,11 +116,13 @@ handles = {
     "upscaler": root / "upscaler",
     "converted": root / "converted",
     "checkpoint": root / "checkpoint",
+    "video": root / "video",
 }
 registrations = {
     "fixture": make_bundle(handles["fixture"]),
     "fixture-lora": make_adapter(handles["fixture-lora"]),
     "upscaler": make_esrgan_bundle(handles["upscaler"]),
+    "video": make_svd_bundle(handles["video"]),
 }
 registrations["converted"] = make_converted(handles["converted"], reference=handles["fixture"])
 make_checkpoint(handles["checkpoint"])
@@ -126,6 +134,7 @@ catalog = {handle: str(path) for handle, path in handles.items()}
         {
             "bundle": registrations["fixture"],
             "upscaler": registrations["upscaler"],
+            "video": registrations["video"],
             "adapter": registrations["fixture-lora"],
         },
         indent=2,

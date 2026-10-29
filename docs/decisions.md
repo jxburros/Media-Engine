@@ -5,6 +5,68 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
 0.4.0.
 
+## 0.6.0 — image-to-video (protocol 1.3)
+
+- **No new dependency.** The `svd` family uses model and pipeline classes already in the pinned
+  `diffusers` and `transformers`, Pillow for the reference pipeline's input handling, the
+  standard-library `png.py` for frames and `zipfile` for the archive. `pyproject.toml` pins,
+  the extras and `uv.lock` are unchanged except the package's own version line. The optional MP4
+  encoder extra is not built: the lossless archive is the baseline, and nothing yet shows a
+  caller needs a container from the worker.
+- **Reference weights:** `stabilityai/stable-video-diffusion-img2vid-xt` (25 frames, 1024×576),
+  with `stable-video-diffusion-img2vid` (14 frames) as the smaller alternative, in Diffusers
+  format with safetensors weights. They are licensed by Stability AI separately from this project
+  (the Stability AI Community License for current revisions; the operator checks the model card
+  of the revision installed). Operators supply and approve them; nothing here downloads them.
+  No real weights were available in this workspace.
+- **Reference backend only.** `DiffusersBackend.families` adds `svd`; the owned backend keeps
+  `sdxl-base` and `esrgan`, so a load naming `svd` there is `unsupported`, field `family`, before
+  any file is read, and its `loaders` never list the family. An owned video loop is an
+  optimization-stage item after the reference path is validated on hardware.
+- **Sizes come from the bundle.** The plan's "`video_sizes` advertised from the bundle" is an
+  optional top-level `video.json` (`{"sizes": [...]}`, part of the registration's file digests)
+  defaulting to the reference 1024×576 and 576×1024. The library's unet config does not encode
+  the training size (`sample_size` is 96 on the reference bundle), so a declared file is the only
+  way a smaller bundle, such as the test bundles at 64×64, can be served without resizing. The
+  worker never resizes or crops the input; a size the bundle does not list is `invalid_request`,
+  field `video_size`.
+- **`frames` defaults to the bundle's unet `num_frames`.** That default is a bundle fact, so it
+  is reported as `loaded_bundle.default_frames` and listed in `task_parameters.<task>.bundle_defaults`
+  rather than in `defaults`; `effective_settings.frames` is resolved once the bundle is loaded.
+  `capabilities.defaults` is unchanged, so 1.1/1.2 supervisors that merge it never send a video
+  field.
+- **No guidance parameter.** The reference pipeline ramps guidance from 1.0 (first frame) to 3.0
+  (last frame); 1.3 does not expose it, and `effective_settings` reports `min_guidance` and
+  `max_guidance` so the value is explicit, not hidden.
+- **Stages come from the library pipeline.** `encoding` is the pipeline's image conditioning;
+  `sampling` is emitted from a forward pre-hook on the UNet at its first call (the pipeline has no
+  hook between conditioning and the loop), and the hook is also a cancellation checkpoint.
+  Decoding is the pipeline's own `decode_latents` loop reimplemented so each chunk reports
+  progress and checks cancellation; the CPU inference test checks the frames against the
+  library's own output within one 8-bit level.
+- **Archive format.** Members are stored (PNG is already deflated), `frames.json` comes first,
+  names are `000001.png` …, and every member has the DOS-epoch timestamp and mode 0644 so the
+  same frames always give the same archive bytes and digest. The server validates the archive
+  and reads `frames`, `fps` and the size back from `frames.json` before publishing, as it reads
+  image sizes back from PNG headers. `duration_seconds` is `frames / fps`, unrounded.
+- **Storage is reserved per frame** (one image-sized slot per frame plus the poster) at
+  submission, so a result that cannot fit is `storage_full` before sampling.
+- **The memory estimate adds only the sampling latents** that grow with frames
+  (`per_frame_bytes`, `latents_mb` at the largest size and `limits.frames`); UNet attention and
+  VAE decoder activations are excluded and stated so. The hardware checklist measures the peak.
+- **`capabilities.output_formats` keeps its 1.0 value (`["png"]`).** Changing a field's value is
+  not an addition; the per-task `output_formats` name the archive's MIME type.
+- **The fixture pinned to 1.2 reproduces 0.5.0 exactly**, including limits and task defaults, so
+  supervisors can test that a 1.2 worker never offers video. `make_svd_bundle()` writes a few
+  seeded random floats per weight role (not a network; the fixture never reads them).
+- **Conformance suite `media-worker-conformance/1.1`.** Assertions were added (the
+  `image_to_video` section and video checks in discovery, negotiation and validation), so the
+  version changed; no 1.0 assertion changed, and a worker without image-to-video sees the 1.0
+  results.
+- **Release map.** The plan's Runtime-consumer column now follows the Runtime plan: network mode
+  (E2) is consumed by Runtime 0.8.0 (R4), image-to-video (E3) by 0.9.0 (R5) and text-to-audio (E4)
+  by 0.10.0.
+
 ## 0.5.0 — network mode (protocol 1.2)
 
 - **No new dependency.** TLS is the standard-library `ssl` module over the OpenSSL that CPython
@@ -88,17 +150,17 @@ or impractical to own, is pinned by checksum, and is isolated in one module so i
 Every dependency is listed below with the backend that needs it and the reason it is not owned
 code. A dependency without an entry is a defect. No external service is used at any stage.
 
-## Ledger — Python worker (0.5.0, unchanged since 0.4.0)
+## Ledger — Python worker (0.6.0; pins unchanged since 0.4.0)
 
 | Package       | Extra(s)                    | Imported by                                   | Why it is not owned code                                        | Next change                                      |
 | ------------- | --------------------------- | --------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
-| torch         | inference, inference-owned  | reference, owned, upscaler, convert           | Tensor execution and CUDA kernels                               | Remains until the native engine                  |
-| diffusers     | inference, inference-owned  | reference (pipelines); owned and convert (model classes, scheduler, single-file key mapping) | Reference pipelines; SDXL model classes; checkpoint key mapping | Owned path keeps model classes only              |
-| transformers  | inference, inference-owned  | reference, owned, convert                     | CLIP model classes and tokenizers                               | Owned path may replace CLIP tokenization later   |
+| torch         | inference, inference-owned  | reference (incl. svd), owned, upscaler, convert | Tensor execution and CUDA kernels                               | Remains until the native engine                  |
+| diffusers     | inference, inference-owned  | reference (pipelines, incl. `StableVideoDiffusionPipeline`); owned and convert (model classes, scheduler, single-file key mapping) | Reference pipelines; SDXL model classes; checkpoint key mapping | Owned path keeps model classes only              |
+| transformers  | inference, inference-owned  | reference, owned, convert                     | CLIP model classes and tokenizers; the svd CLIP image encoder and processor | Owned path may replace CLIP tokenization later   |
 | safetensors   | inference, inference-owned  | reference, owned (direct weight loading), upscaler, convert | Tensor loading/saving (headers are parsed by owned code)        | Keep                                             |
 | numpy         | inference, inference-owned  | diffusers internals (e.g. the Euler scheduler) on every path; no engine module imports it | Required by diffusers itself; pinned so the owned extra resolves identically | Drops out of the pin set with diffusers         |
 | accelerate    | inference                   | reference (Diffusers loading helpers)         | Diffusers' low-memory loading                                   | Not installed with inference-owned               |
-| Pillow        | inference (transitively also inference-owned via diffusers) | reference (PNG decode/encode); not imported by owned code or the upscaler | Image I/O inside the Diffusers pipelines   | Owned path writes/reads PNG with `png.py`        |
+| Pillow        | inference (transitively also inference-owned via diffusers) | reference (PNG decode/encode, svd input image); not imported by owned code, the upscaler or the frame writer | Image I/O inside the Diffusers pipelines   | Owned path writes/reads PNG with `png.py`        |
 | peft          | inference                   | reference (LoRA through library layers)       | PEFT layer injection                                            | Not installed with inference-owned               |
 | setuptools    | build                       | packaging                                     | Packaging                                                       | Keep                                             |
 
@@ -109,12 +171,14 @@ converter in an environment built from `inference-owned` alone (no accelerate, n
 
 Standard-library-only by design: the HTTP/SSE server (`http.server`), JSON, hashing, PNG reading
 and writing (`png.py`: `zlib`, `struct`), the conformance suite (`unittest`, `urllib`, `socket`),
-TLS in network mode (`ssl`, from 0.5.0), and later WAV (`wave`) and ZIP (`zipfile`). Test-only tooling not in
+TLS in network mode (`ssl`, from 0.5.0), frame archives (`video.py`: `zipfile`, `json`, from
+0.6.0), and later WAV (`wave`). Test-only tooling not in
 any extra: `jsonschema` was used ad hoc to check the schema against real bodies and is not a
 dependency.
 
 Optional and not yet accepted: one pinned MP4 encoder wheel for the `video` output format; the
-lossless frame archive is the baseline and this entry is added only on evidence of need.
+lossless frame archive is the baseline (shipped in 0.6.0) and this entry is added only on
+evidence of need.
 
 ## Ledger — native engine (planned, phase E6)
 
