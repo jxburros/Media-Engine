@@ -1,10 +1,11 @@
-# media-worker/1.2 implementation contract
+# media-worker/1.3 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.5.0 speaks
-`media-worker/1.2` and still accepts `media-worker/1.0` and `media-worker/1.1` requests;
-`/v1/info`, `/v1/capabilities` and the startup record list `supported_protocols`. Every 1.2
-behavior is gated on the request's `protocol` minor: a 1.0/1.1 request sees exactly the 0.3.0
-responses (response objects may gain fields, never lose or change them). A supervisor picks the highest minor both sides
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.6.0 speaks
+`media-worker/1.3` and still accepts `media-worker/1.0`, `media-worker/1.1` and
+`media-worker/1.2` requests; `/v1/info`, `/v1/capabilities` and the startup record list
+`supported_protocols`. Every 1.2 and 1.3 behavior is gated on the request's `protocol` minor: a
+1.0/1.1 request sees exactly the 0.3.0 responses and a 1.2 request exactly the 0.5.0 responses
+(response objects may gain fields, never lose or change them). A supervisor picks the highest minor both sides
 support and sends that value in every request's `protocol` field. A different major is rejected
 with `protocol_mismatch`. Request schemas are in `schemas/worker.schema.json`; unknown fields and
 options are errors. Authentication is a bearer credential supplied through the launch environment.
@@ -57,8 +58,9 @@ unadvertised precision was in 0.3.0), `authorized_fallbacks` is `unsupported` (f
 bundle is refused (`invalid_request` for the unknown field, `unsupported`/`family` for the
 family). 1.1 snapshots carry no `count` in `effective_settings` and no `applied_fallbacks` unless
 a 1.2 load applied one. A backend is advertised only after the conformance suite
-(`tests/conformance`, version `media-worker-conformance/1.0`) passes against it with no skipped
-section; [compatibility.md](compatibility.md) records the result.
+(`tests/conformance`; `media-worker-conformance/1.0` in 0.4.0–0.5.0, `1.1` with the
+image-to-video section from 0.6.0) passes against it with no skipped section;
+[compatibility.md](compatibility.md) records the result.
 
 ### Discovery in 1.2
 
@@ -67,7 +69,8 @@ backend_id, session_id, port, pid, device_identity}`, plus the transport fields 
 minor and stays `media-worker/1.1`: the record's shape only gained fields in 1.2, and Runtime 0.3.0
 refuses a startup record whose `protocol` it does not know. Supervisors negotiate from
 `supported_protocols` (identical in the record, `/v1/info` and `/v1/capabilities`); `/v1/info`
-and `/v1/capabilities` report `protocol: "media-worker/1.2"`. `--probe` reports 1.2.
+and `/v1/capabilities` report the highest minor served (`media-worker/1.3` from Engine 0.6.0),
+as does `--probe`.
 
 `/v1/info` adds `device_identity`. `/v1/capabilities` adds (example from the fixture):
 
@@ -286,6 +289,147 @@ keeps the requested `options` (so a supervisor's load-identity comparison is unc
 `applied_fallbacks`. After a CPU fallback `capabilities.ready` is true while `device_available`
 stays false.
 
+## What changed in 1.3
+
+| Addition                                          | Meaning                                                                                         |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| task `image-to-video`, family `svd`               | Animates one uploaded PNG; reference backend only (`diffusers-sdxl`) in Engine 0.6.0            |
+| `parameters.frames`, `fps`, `motion`, `noise_augmentation`, `decode_chunk` | Video parameters; `seed` and `steps` (1–50) are required, the rest have defaults |
+| outputs `frames`, `poster`                        | `frames` is `application/zip` (lossless PNG per frame plus `frames.json`); `poster` is frame 1  |
+| output record `frames`, `fps`, `duration_seconds` | On the `frames` output, read back from `frames.json`; `duration_seconds = frames / fps`         |
+| stage `packaging`; progress `unit: "frames"`      | Frames are zipped after decoding; decoding progress counts frames                               |
+| `limits.video_steps`, `.frames`, `.fps`, `.motion`, `.noise_augmentation`, `.decode_chunk`, `.video_sizes` | Ranges for the video parameters; `video_sizes` follows the loaded svd bundle (reference sizes otherwise) |
+| `loaded_bundle.video_sizes`, `.default_frames`    | The loaded svd bundle's sizes (`video.json`, optional) and its unet's `num_frames`             |
+| `task_parameters.image-to-video`                  | Inputs, parameters, defaults, `bundle_defaults`, outputs, `output_formats`, stages, archive shape |
+| `memory_estimate.latents_mb`, `.per_frame_bytes`  | svd: the sampling latents of the most frames at the largest size                                |
+
+Nothing else changed: no 1.0–1.2 request, event, error or output shape. A 1.2 (or older) caller
+that names `image-to-video` gets `unsupported`, field `task`; an `svd` bundle on a 1.2 load or
+validation is `unsupported`, field `family` (a 1.0/1.1 body still fails on its fields first, as
+for `esrgan`). `tasks`, `model_families` and `loaders` list what the worker serves, whatever the
+caller's minor, so a 1.2 supervisor may see `image-to-video` listed and must not request it;
+`defaults` is unchanged, so a supervisor that merges it into every request never sends a video
+field. Minor 1.3 also covers text-to-audio, which Engine 0.6.0 does not serve: the `tasks` list,
+not the minor, tells a caller what exists.
+
+### Discovery in 1.3
+
+The startup record still reports `protocol: "media-worker/1.1"` (see Discovery in 1.2) and
+`highest_protocol: "media-worker/1.3"`. `/v1/capabilities` adds, on a reference backend with the
+inference extra installed:
+
+```json
+{
+  "tasks": ["text-to-image", "image-to-image", "upscale", "image-to-video"],
+  "model_families": ["sdxl-base", "esrgan", "svd"],
+  "loaders": [
+    {"format": "diffusers-safetensors", "families": ["svd"],
+     "roles": ["unet", "vae", "image_encoder", "feature_extractor", "scheduler"],
+     "tasks": ["image-to-video"], "ownership": "reference"}
+  ],
+  "task_parameters": {
+    "image-to-video": {"inputs": ["image"],
+      "parameters": ["frames", "fps", "motion", "noise_augmentation", "decode_chunk"],
+      "defaults": {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8},
+      "bundle_defaults": ["frames"], "input_formats": ["image/png"],
+      "outputs": ["frames", "poster"],
+      "output_formats": {"frames": "application/zip", "poster": "image/png"},
+      "families": ["svd"], "stages": ["encoding", "sampling", "decoding", "packaging", "saving"],
+      "progress_units": {"decoding": "frames"},
+      "archive": {"frame_format": "image/png", "frame_names": "000001.png",
+                  "manifest": "frames.json", "compression": "stored"}}
+  },
+  "task_defaults": {"image-to-video": {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8}},
+  "limits": {"video_steps": [1, 50], "frames": [1, 64], "fps": [1, 30], "motion": [1, 255],
+             "noise_augmentation": [0, 1], "decode_chunk": [1, 16],
+             "video_sizes": [[1024, 576], [576, 1024]]}
+}
+```
+
+(Only the additions are shown.) The owned backend (`owned-sdxl`) does not serve `svd`: it never
+lists the family, its loader or the task, and a load or validation naming an `svd` bundle is
+`unsupported`, field `family`, before any file is read. `capabilities.output_formats` keeps its
+1.0 value; the per-task `output_formats` are authoritative. A worker pinned to 1.2 (the test
+fixture's `--protocol media-worker/1.2`) reports exactly the 0.5.0 surface.
+
+### The `svd` family
+
+| Family | `format`                | `pipeline`       | Components (`role` → `tensor_format`)                                         | Tasks          |
+| ------ | ----------------------- | ---------------- | ----------------------------------------------------------------------------- | -------------- |
+| `svd`  | `diffusers-safetensors` | `image-to-video` | unet, vae, image_encoder → `safetensors`; feature_extractor, scheduler → `json` | image-to-video |
+
+The directory is a Diffusers `StableVideoDiffusionPipeline` bundle: `model_index.json` names
+exactly `unet` → `UNetSpatioTemporalConditionModel`, `vae` → `AutoencoderKLTemporalDecoder` (both
+`diffusers`), `image_encoder` → `CLIPVisionModelWithProjection`, `feature_extractor` →
+`CLIPImageProcessor` (both `transformers`) and `scheduler` → `EulerDiscreteScheduler`; anything
+else is `unsupported` with the role or `pipeline` as field. Component digests cover each role's
+folder, as for `sdxl-base`. An optional top-level `video.json`, `{"sizes": [[width, height], …]}`
+(1–8 sizes, each side 64–2048 and a multiple of eight), declares the sizes the bundle serves;
+without it the bundle serves the reference sizes, 1024×576 and 576×1024. The default frame count
+is the unet configuration's `num_frames` (25 when absent, the library default) and must lie within
+`limits.frames`. A `video.json` or default outside those rules is `unsupported`, field
+`configuration`, at validation. `source.conversion` and adapters are refused as for `esrgan`.
+
+A 1.3 validation and load report `family: "svd"`, `tasks: ["image-to-video"]`, `video_sizes` and
+`default_frames`; `loaded_bundle` carries the same facts. While an `svd` bundle is loaded,
+`capabilities.limits.video_sizes` is that bundle's list; otherwise it is the reference sizes (the
+test fixture advertises its video bundle's sizes, 64×64, 1024×576 and 576×1024).
+
+### Image-to-video
+
+```json
+{"protocol": "media-worker/1.3", "attempt_id": "attempt_v1", "bundle_digest": "sha256:<svd>",
+ "task": "image-to-video", "inputs": {"image": "input_<32 hex>"},
+ "parameters": {"width": 1024, "height": 576, "seed": 42, "steps": 25,
+                "frames": 25, "fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8}}
+```
+
+`inputs` is exactly `{image}`; a `prompt` or `negative_prompt` is `invalid_request`, field
+`prompt`. `parameters` requires `width`, `height`, `seed` (uint32) and `steps`
+(`limits.video_steps`); `frames`, `fps`, `motion` (the motion bucket), `noise_augmentation` and
+`decode_chunk` (frames per VAE decode) are optional with the defaults above and `frames` from the
+bundle. Each is checked against its limit (`invalid_request` with the parameter as field; `fps`,
+`motion`, `frames`, `decode_chunk` and `steps` are integers). There is no guidance parameter: the
+reference pipeline's per-frame guidance ramp from 1.0 to 3.0 is fixed and reported as
+`min_guidance`/`max_guidance` in `effective_settings`. Any other field is `invalid_request`.
+
+With the bundle loaded, `[width, height]` must be one of `loaded_bundle.video_sizes`
+(`invalid_request`, field `video_size`), and at submission it must equal the uploaded image
+(`invalid_request`, field `width`); the input is never resized or cropped. The storage
+reservation is one image-sized slot per frame plus one for the poster, so a result that cannot fit
+is `503 storage_full` before sampling; frames are never dropped or re-timed to fit.
+`effective_settings` is `{width, height, seed, steps, frames, fps, motion, noise_augmentation,
+decode_chunk, min_guidance, max_guidance, effective_steps}` (`frames` resolved from the bundle
+when omitted; on `/v1/validate` before the bundle is loaded it is absent).
+
+Stages are `encoding` (the image conditioning: CLIP image embedding and VAE encoding of the
+noised input), `sampling` (from the first UNet call) with `{stage: "sampling", scope: "stage",
+completed_steps, total_steps}` per step, `decoding` with `{stage: "decoding", scope: "stage",
+unit: "frames", completed_steps, total_steps: frames}` after each chunk of `decode_chunk` frames,
+`packaging` while the archive is written, then `saving`. Cancellation is checked at every UNet
+call and every step, before every decode chunk and before packaging; a cancelled execution
+publishes nothing. `measurements` adds `frames` and `decode_chunks`.
+
+The execution finalizes two outputs:
+
+| Output   | MIME type         | Content                                                                                       |
+| -------- | ----------------- | --------------------------------------------------------------------------------------------- |
+| `frames` | `application/zip` | `frames.json` then `000001.png` … one 8-bit RGB PNG per frame, every member stored (not deflated), fixed timestamps |
+| `poster` | `image/png`       | Frame 1, byte for byte equal to `000001.png`                                                  |
+
+`frames.json` is `{"fps": 7, "width": 1024, "height": 576, "frames": 25}`. The worker reads it
+back (and checks every member's name, storage and PNG header against it) before publishing, and
+the `frames` output record carries `{output_id, mime_type, size, sha256, width, height, frames,
+fps, duration_seconds}` from it; `poster` has the image fields. The same seed, settings, bundle
+and software stack give the same archive bytes. Encoding a container (MP4 or otherwise) is the
+caller's business: the worker ships no encoder and never looks for one on `PATH`.
+
+The memory estimate of an `svd` bundle adds `latents_mb`: the sampling latents of
+`limits.frames` frames at the bundle's largest size (`per_frame_bytes` each: the guided UNet
+input, the guided image latents repeated per frame and the denoised latent), with a `frames`
+scaling note. It excludes UNet attention and VAE decoder activations, which also grow with frames
+and `decode_chunk`, and says so in `uncertainty`.
+
 
 ## Transport
 
@@ -408,7 +552,7 @@ executions that used them are collected. A handle from another session is `input
 ## Execution
 
 `POST /v1/executions` takes exactly `{protocol,attempt_id,bundle_digest,task,inputs,parameters}`.
-Tasks are `text-to-image`, `image-to-image` and (1.2) `upscale`, described above. Inputs are prompt (required), negative_prompt
+Tasks are `text-to-image`, `image-to-image`, (1.2) `upscale` and (1.3) `image-to-video`, described above. Inputs are prompt (required), negative_prompt
 (optional), max 10,000 characters each, and for image-to-image `image` (an `input_id`). Parameters
 are resolved seed (uint32), width/height (64–2048, multiples of eight), steps (1–150), guidance
 (0–30), sampler `euler`, scheduler `euler`, and for image-to-image `strength` (0 < s ≤ 1, with
@@ -430,15 +574,17 @@ is a supported recovery mechanism alongside SSE.
 cursors return 409 resume_required. IDs increase from one, scoped to execution/session. Events are
 state, stage, progress, output and error; each carries timestamp, session_id, execution_id, sequence,
 type and data. Progress is `{stage:"sampling",scope:"stage",completed_steps,total_steps}` where
-`total_steps` is the effective count; never total progress. Upscale progress adds `unit:"tiles"`.
+`total_steps` is the effective count; never total progress. Upscale progress adds `unit:"tiles"`;
+image-to-video decoding progress has `stage:"decoding"` and `unit:"frames"`.
 
 `POST /v1/executions/{execution_id}/cancel` acknowledges intent (202), or returns the immutable
 terminal snapshot (200). Cooperative checkpoints stop encoding/sampling/decoding transitions and
 every sampling step. A supervisor may kill only a process it owns; that is interruption, not
 confirmed cancellation. Terminal states are succeeded/failed/cancelled.
 
-Outputs include output_id (`image`, plus `image_2` … for a 1.2 `count`), image/png MIME, byte
-size, SHA-256 and actual width/height. `GET /v1/executions/{execution_id}/outputs/{output_id}`
+Outputs include output_id (`image`, plus `image_2` … for a 1.2 `count`; `frames` and `poster`
+for 1.3 image-to-video), MIME type (image/png, or application/zip for `frames`), byte size,
+SHA-256 and actual width/height (plus `frames`, `fps` and `duration_seconds` on `frames`). `GET /v1/executions/{execution_id}/outputs/{output_id}`
 streams finalized bytes only. DELETE on a terminal
 execution discards records/events/output after collection. Missing output bytes return 410.
 Outputs survive client disconnects within the worker session, not process death.
