@@ -3,8 +3,8 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
-version = "0.6.0"
-description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video) for Media Runtime"
+version = "0.7.0"
+description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video, Stable Audio Open text-to-audio) for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
 readme = "README.md"
@@ -14,6 +14,9 @@ dependencies = []
 inference-owned = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "safetensors==0.5.3", "numpy==2.2.3"]
 # The full reference set (diffusers-sdxl), a superset of inference-owned.
 inference = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "accelerate==1.4.0", "safetensors==0.5.3", "Pillow==11.1.0", "numpy==2.2.3", "peft==0.14.0"]
+# text-to-audio (stable-audio-open, reference backend): the family's scheduler imports torchsde.
+# Installed alongside `inference`; it adds nothing the other families need.
+inference-audio = ["torchsde==0.2.6"]
 [project.scripts]
 media-engine = "media_engine.server:main"
 [tool.setuptools.packages.find]

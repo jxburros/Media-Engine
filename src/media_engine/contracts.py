@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import math
 import re
 import struct
+from fractions import Fraction
 from pathlib import Path
 
 PROTOCOL = "media-worker/1.3"
@@ -13,10 +15,16 @@ SUPPORTED_PROTOCOLS = (
     "media-worker/1.2",
     "media-worker/1.3",
 )
-WORKER_VERSION = "0.6.0"
-TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video")
+WORKER_VERSION = "0.7.0"
+TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
-TASK_SINCE = {"text-to-image": 0, "image-to-image": 1, "upscale": 2, "image-to-video": 3}
+TASK_SINCE = {
+    "text-to-image": 0,
+    "image-to-image": 1,
+    "upscale": 2,
+    "image-to-video": 3,
+    "text-to-audio": 3,
+}
 SDXL_ROLES = (
     "unet",
     "vae",
@@ -73,6 +81,26 @@ FAMILIES = {
         "pipeline_class": "StableVideoDiffusionPipeline",
         "since": 3,
     },
+    "stable-audio-open": {
+        "format": "diffusers-safetensors",
+        "pipeline": "text-to-audio",
+        "roles": ("transformer", "vae", "text_encoder", "tokenizer", "projection_model", "scheduler"),
+        "weight_roles": ("transformer", "vae", "text_encoder", "projection_model"),
+        "approved_classes": {
+            "transformer": ("diffusers", "StableAudioDiTModel"),
+            "vae": ("diffusers", "AutoencoderOobleck"),
+            "text_encoder": ("transformers", "T5EncoderModel"),
+            "tokenizer": ("transformers", "T5TokenizerFast"),
+            # The library registers the projection under its pipeline module, not `diffusers`.
+            "projection_model": ("stable_audio", "StableAudioProjectionModel"),
+            "scheduler": ("diffusers", "CosineDPMSolverMultistepScheduler"),
+        },
+        "tasks": ("text-to-audio",),
+        "config_file": "model_index.json",
+        "pipeline_class": "StableAudioPipeline",
+        "scheduler_class": "CosineDPMSolverMultistepScheduler",
+        "since": 3,
+    },
 }
 # 1.0/1.1 names, kept for importers; they describe the sdxl-base family.
 ROLES = FAMILIES["sdxl-base"]["roles"]
@@ -84,9 +112,10 @@ OUTPUTS = {
     "image-to-image": ["image"],
     "upscale": ["image"],
     "image-to-video": ["frames", "poster"],
+    "text-to-audio": ["audio"],
 }
 # Output MIME types and the file suffix each is stored under in the execution directory.
-OUTPUT_SUFFIXES = {"image/png": ".png", "application/zip": ".zip"}
+OUTPUT_SUFFIXES = {"image/png": ".png", "application/zip": ".zip", "audio/wav": ".wav"}
 DEFAULTS = {
     "width": 1024,
     "height": 1024,
@@ -100,6 +129,8 @@ TASK_DEFAULTS = {
     "upscale": {"tile": 0, "tile_overlap": 16},
     # `frames` defaults to the bundle's unet `num_frames`; it is resolved once the bundle loads.
     "image-to-video": {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8},
+    # The library pipeline's default guidance; seed, steps and duration_seconds are required.
+    "text-to-audio": {"guidance": 7},
 }
 # The reference pipeline's per-frame guidance ramp; not a request parameter in 1.3, so it is
 # reported in effective_settings rather than left implicit.
@@ -127,10 +158,19 @@ LIMITS = {
     "decode_chunk": [1, 16],
     # The reference svd bundle's sizes; a bundle may declare its own in video.json.
     "video_sizes": [[1024, 576], [576, 1024]],
+    "audio_steps": [1, 200],
+    # The reference stable-audio-open bundle's range; a loaded bundle advertises its own.
+    "duration_seconds": [1, 47],
+    "sample_rate": [1000, 192000],
+    "audio_channels": [1, 2],
 }
 # The 1.3 limit keys, so a worker pinned to 1.2 can advertise exactly the 0.5.0 limits.
 VIDEO_LIMITS = ("video_steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk", "video_sizes")
+AUDIO_LIMITS = ("audio_steps", "duration_seconds", "sample_rate", "audio_channels")
 MAX_VIDEO_SIZES = 8
+# No bundle may declare a clip longer than this, whatever its latent length allows; it bounds
+# request validation before a bundle is loaded and the storage reserved for one clip.
+MAX_AUDIO_SECONDS = 600
 AUTO_OPTIONS = ["precision"]
 FALLBACKS = ["cpu", "lower_precision"]
 PRECISION_BYTES = {"float16": 2, "float32": 4}
@@ -334,7 +374,7 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
         raise WorkerError(400, "missing_component", "configuration") from None
     if (
         index.get("_class_name") != family["pipeline_class"]
-        or scheduler.get("_class_name") != "EulerDiscreteScheduler"
+        or scheduler.get("_class_name") != family.get("scheduler_class", "EulerDiscreteScheduler")
     ):
         raise WorkerError(400, "unsupported", "pipeline")
     # Only standard installed library classes; reject custom component imports.
@@ -352,6 +392,8 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
             raise WorkerError(400, "unsupported", role)
     if name == "svd":
         video_facts(root)  # sizes and the default frame count must be usable before loading
+    if name == "stable-audio-open":
+        audio_facts(root)  # sample rate, channels and duration range must be usable before loading
     return root
 
 
@@ -464,6 +506,93 @@ def video_facts(root):
     return {"video_sizes": [list(s) for s in sizes], "default_frames": frames}
 
 
+def audio_facts(root):
+    """The stable-audio-open bundle's sample rate, channels, granularity and duration range.
+
+    Read from the configs without loading weights: `sampling_rate` and `audio_channels` from the
+    VAE config, the latent granularity (`hop_length`, samples per latent frame) as the product of
+    its `downsampling_ratios`, and the latent length from the transformer's `sample_size` (the
+    library's defaults where a config omits them, which are the reference bundle's values). The
+    longest clip the bundle can produce is `sample_size × hop_length / sampling_rate` seconds; the
+    advertised range is an optional top-level `audio.json` (`{"duration_seconds": [low, high]}`)
+    within that, else 1 s to the whole seconds it allows (1–47 for the reference bundle). The
+    tokenizer must ship `tokenizer.json`, so the fast tokenizer loads without sentencepiece. An
+    unusable bundle is `unsupported`, field `configuration` (`tokenizer` for the tokenizer).
+    """
+    root = Path(root)
+    unsupported = WorkerError(400, "unsupported", "configuration")
+    if not (root / "tokenizer/tokenizer.json").is_file():
+        raise WorkerError(400, "unsupported", "tokenizer")
+    try:
+        vae = json.loads((root / "vae/config.json").read_text())
+        transformer = json.loads((root / "transformer/config.json").read_text())
+        declared = None
+        if (root / "audio.json").is_file():
+            declared = json.loads((root / "audio.json").read_text())
+    except (OSError, ValueError):
+        raise unsupported from None
+    if not isinstance(vae, dict) or not isinstance(transformer, dict):
+        raise unsupported
+    rate = vae.get("sampling_rate", 44100)
+    channels = vae.get("audio_channels", 2)
+    ratios = vae.get("downsampling_ratios", [2, 4, 4, 8, 8])
+    length = transformer.get("sample_size", 1024)
+    if (
+        type(rate) is not int
+        or not LIMITS["sample_rate"][0] <= rate <= LIMITS["sample_rate"][1]
+        or type(channels) is not int
+        or not LIMITS["audio_channels"][0] <= channels <= LIMITS["audio_channels"][1]
+        or not isinstance(ratios, list)
+        or not ratios
+        or any(type(r) is not int or r < 1 for r in ratios)
+        or type(length) is not int
+        or length < 1
+    ):
+        raise unsupported
+    hop = math.prod(ratios)
+    capacity = Fraction(length * hop, rate)
+    if declared is None:
+        low, high = 1, min(math.floor(capacity), MAX_AUDIO_SECONDS)
+    else:
+        if not isinstance(declared, dict) or set(declared) != {"duration_seconds"}:
+            raise unsupported
+        span = declared["duration_seconds"]
+        if not isinstance(span, list) or len(span) != 2 or any(not is_number(v) for v in span):
+            raise unsupported
+        low, high = span
+    if not 0 < low <= high or high > capacity or high > MAX_AUDIO_SECONDS:
+        raise unsupported
+    return {
+        "sample_rate": rate,
+        "channels": channels,
+        "hop_length": hop,
+        "duration_range": [low, high],
+    }
+
+
+def is_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def audio_length(duration, facts):
+    """The clip a requested duration produces: whole latent frames covering it, never fewer.
+
+    The request is honored up to the latent granularity (`hop_length` samples): the clip is the
+    smallest whole number of latent frames that covers `duration`, so the effective duration is
+    the request rounded up to that granularity and reported as such. Decimal arithmetic on the
+    number as written keeps 1.0 s from becoming one frame more through binary rounding.
+    """
+    rate, hop = facts["sample_rate"], facts["hop_length"]
+    exact = Fraction(repr(duration)) if type(duration) is float else Fraction(duration)
+    latent_frames = math.ceil(exact * rate / hop)
+    samples = latent_frames * hop
+    return {
+        "latent_frames": latent_frames,
+        "samples": samples,
+        "effective_duration_seconds": samples / rate,
+    }
+
+
 def family_facts(root, family):
     """Configuration facts a supervisor needs from the loaded family (scale, video sizes)."""
     if family == "esrgan":
@@ -472,6 +601,8 @@ def family_facts(root, family):
         return {"scale": read_config(root)["scale"]}
     if family == "svd":
         return video_facts(root)
+    if family == "stable-audio-open":
+        return audio_facts(root)
     return {}
 
 
@@ -528,6 +659,8 @@ def memory_estimate(root, precision, device, family="sdxl-base"):
         }
     if family == "svd":
         return video_estimate(root, total, bytes_per_element, precision, device, roles)
+    if family == "stable-audio-open":
+        return audio_estimate(root, total, bytes_per_element, precision, device, roles)
     return {
         "value_mb": total,
         "source": "safetensors_headers",
@@ -576,6 +709,41 @@ def video_estimate(root, total, bytes_per_element, precision, device, roles):
     }
 
 
+def audio_estimate(root, total, bytes_per_element, precision, device, roles):
+    """stable-audio-open: parameters plus the sampling latents and the decoded waveform.
+
+    The library samples the transformer's whole latent length whatever the requested duration
+    and decodes all of it before the clip is cut, so the terms are fixed per bundle: per latent
+    frame the loop holds the guided transformer input and its guided output (2 × `in_channels`
+    each) and the latent (`in_channels`); the VAE then returns `sample_size × hop_length` samples
+    per channel. Transformer attention, the T5 encoder's and the VAE decoder's activations are
+    not modeled here.
+    """
+    root = Path(root)
+    try:
+        transformer = json.loads((root / "transformer/config.json").read_text())
+    except (OSError, ValueError):
+        transformer = {}
+    facts = audio_facts(root)
+    channels = transformer.get("in_channels", 64)
+    length = transformer.get("sample_size", 1024)
+    latents = 5 * channels * length * bytes_per_element
+    waveform = length * facts["hop_length"] * facts["channels"] * bytes_per_element
+    working = (latents + waveform) // 1024**2
+    return {
+        "value_mb": total + working,
+        "source": "safetensors_headers",
+        "basis": f"component parameters at the requested load precision plus the sampling latents of the whole latent length ({length} frames × {channels} channels: the guided transformer input and output and the latent, {latents} bytes) and the decoded waveform before it is cut ({length * facts['hop_length']} samples × {facts['channels']} channels, {waveform} bytes)",
+        "precision": precision,
+        "device": device,
+        "roles": roles,
+        "latents_mb": latents // 1024**2,
+        "waveform_mb": waveform // 1024**2,
+        "duration": {"limit": facts["duration_range"], "scaling": "constant: the whole latent length is sampled and decoded for every duration"},
+        "uncertainty": "excludes transformer attention, T5 encoder and VAE decoder activations, the 16-bit PCM copy written to disk, allocator reserve and framework overhead",
+    }
+
+
 def png_dimensions(data):
     """Validate a PNG signature/IHDR and return (width, height) without decoding pixels."""
     if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
@@ -592,7 +760,7 @@ def png_dimensions(data):
 def effective_steps(parameters, task):
     if task == "upscale":
         return None
-    if task == "image-to-video":
+    if task in ("image-to-video", "text-to-audio"):
         return parameters["steps"]
     if task != "image-to-image":
         return parameters["steps"]
@@ -616,6 +784,13 @@ def effective_settings(parameters, task, version):
             **TASK_DEFAULTS["image-to-video"],
             **parameters,
             **VIDEO_GUIDANCE,
+            "effective_steps": parameters["steps"],
+        }
+    if task == "text-to-audio":
+        # sample_rate, channels and the effective duration join from the loaded bundle's facts.
+        return {
+            **TASK_DEFAULTS["text-to-audio"],
+            **parameters,
             "effective_steps": parameters["steps"],
         }
     settings = {**parameters, "effective_steps": effective_steps(parameters, task)}
@@ -690,6 +865,39 @@ def validate_video(body):
     return "image-to-video"
 
 
+def validate_audio(body):
+    inputs, params = body["inputs"], body["parameters"]
+    if isinstance(inputs, dict) and "image" in inputs:
+        # The family is conditioned on text and timing alone; an image would be silently ignored.
+        raise WorkerError(400, "invalid_request", "image")
+    strict(inputs, ("prompt",), ("negative_prompt",))
+    for key, value in inputs.items():
+        if (
+            not isinstance(value, str)
+            or len(value) > 10000
+            or (key == "prompt" and not value.strip())
+        ):
+            raise WorkerError(400, "invalid_request", key)
+    if isinstance(params, dict):
+        for field in ("width", "height", "sampler", "scheduler", "count"):
+            if field in params:
+                # Image parameters and scheduler choice do not exist for this task.
+                raise WorkerError(400, "invalid_request", field)
+    strict(params, ("seed", "steps", "duration_seconds"), ("guidance",))
+    for field, limit in (("seed", [0, 4294967295]), ("steps", LIMITS["audio_steps"])):
+        value = params[field]
+        if type(value) is not int or not limit[0] <= value <= limit[1]:
+            raise WorkerError(400, "invalid_request", field)
+    guidance = params.get("guidance", TASK_DEFAULTS["text-to-audio"]["guidance"])
+    if not is_number(guidance) or not LIMITS["guidance"][0] <= guidance <= LIMITS["guidance"][1]:
+        raise WorkerError(400, "invalid_request", "guidance")
+    duration = params["duration_seconds"]
+    # The loaded bundle's range is checked once it is known (Worker.loaded_checks).
+    if not is_number(duration) or not 0 < duration <= MAX_AUDIO_SECONDS:
+        raise WorkerError(400, "invalid_request", "duration_seconds")
+    return "text-to-audio"
+
+
 def validate_parameters(body):
     strict(
         body,
@@ -712,6 +920,8 @@ def validate_parameters(body):
         return validate_upscale(body)
     if task == "image-to-video":
         return validate_video(body)
+    if task == "text-to-audio":
+        return validate_audio(body)
     image_required = ("image",) if task == "image-to-image" else ()
     strict(body["inputs"], ("prompt",) + image_required, ("negative_prompt",))
     for key, value in body["inputs"].items():
