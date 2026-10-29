@@ -24,7 +24,9 @@ from .contracts import (
     SUPPORTED_PROTOCOLS,
     TASK_DEFAULTS,
     TASKS,
+    VIDEO_GUIDANCE,
     WORKER_VERSION,
+    WorkerError,
     effective_steps,
     memory_estimate,
     output_ids,
@@ -41,6 +43,15 @@ DEPENDENCIES = (
 )
 # The esrgan family runs the engine-owned network on every backend.
 UPSCALE_DEPENDENCIES = (("torch", "torch"), ("safetensors", "safetensors"))
+# The svd family's model classes and the reference pipeline's image handling; no accelerate or
+# peft, and nothing beyond the base inference extra (frames are written by png.py and zipfile).
+VIDEO_DEPENDENCIES = (
+    ("torch", "torch"),
+    ("diffusers", "diffusers"),
+    ("transformers", "transformers"),
+    ("safetensors", "safetensors"),
+    ("Pillow", "PIL"),
+)
 
 
 class Cancelled(Exception):
@@ -97,6 +108,25 @@ def task_parameters(tasks):
             "families": ["esrgan"],
             "stages": ["upscaling", "saving"],
             "progress_unit": "tiles",
+        },
+        "image-to-video": {
+            "inputs": ["image"],
+            "parameters": ["frames", "fps", "motion", "noise_augmentation", "decode_chunk"],
+            "defaults": dict(TASK_DEFAULTS["image-to-video"]),
+            # Resolved from the loaded bundle (its unet's num_frames), reported in loaded_bundle.
+            "bundle_defaults": ["frames"],
+            "input_formats": ["image/png"],
+            "outputs": OUTPUTS["image-to-video"],
+            "output_formats": {"frames": "application/zip", "poster": "image/png"},
+            "families": ["svd"],
+            "stages": ["encoding", "sampling", "decoding", "packaging", "saving"],
+            "progress_units": {"decoding": "frames"},
+            "archive": {
+                "frame_format": "image/png",
+                "frame_names": "000001.png",
+                "manifest": "frames.json",
+                "compression": "stored",
+            },
         },
     }
     return {task: table[task] for task in tasks}
@@ -176,6 +206,8 @@ class TorchBackend:
     backend_id = "torch"
     ownership = "reference"
     dependencies = DEPENDENCIES
+    # Families this backend's code implements, whatever is installed; others are `unsupported`.
+    families = ("sdxl-base", "esrgan")
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
         self.device = device
@@ -186,6 +218,7 @@ class TorchBackend:
         self.family = None
         self.upscaler = None
         self.upscale_config = None
+        self.video = None
 
     def missing_dependencies(self, dependencies=None):
         return [
@@ -210,6 +243,8 @@ class TorchBackend:
             families.append("sdxl-base")
         if not self.missing_dependencies(UPSCALE_DEPENDENCIES):
             families.append("esrgan")
+        if "svd" in self.families and not self.missing_dependencies(VIDEO_DEPENDENCIES):
+            families.append("svd")
         return families
 
     def loaders(self, families):
@@ -421,14 +456,18 @@ class TorchBackend:
 
     # ----- lifecycle shared by every family ---------------------------------------------------
     def load(self, root, options, adapters=(), family="sdxl-base", device=None):
+        if family not in self.families:
+            raise WorkerError(400, "unsupported", "family")
         self.run_device = device or self.device
         self.family = family
         if family == "esrgan":
             return self.load_upscaler(root, options)
+        if family == "svd":
+            return self.load_video(root, options)
         return self.load_pipeline(root, options, adapters)
 
     def unload(self):
-        self.upscaler = self.upscale_config = None
+        self.upscaler = self.upscale_config = self.video = None
         self.unload_pipeline()
         measurements = self.release_device()
         self.run_device, self.family, self.applied_fallbacks = self.device, None, []
@@ -452,6 +491,8 @@ class TorchBackend:
         """Write every output for the request into `directory`; return (records, measurements)."""
         if request["task"] == "upscale":
             return self.upscale(request, directory, emit, cancelled, image_path)
+        if request["task"] == "image-to-video":
+            return self.generate_video(request, directory, emit, cancelled, image_path)
         return self.generate_images(request, directory, emit, cancelled, image_path)
 
     def upscale(self, request, directory, emit, cancelled, image_path):
@@ -511,6 +552,7 @@ class DiffusersBackend(TorchBackend):
 
     backend_id = "diffusers-sdxl"
     ownership = "reference"
+    families = ("sdxl-base", "esrgan", "svd")
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
         super().__init__(device, memory_budget_mb)
@@ -554,6 +596,156 @@ class DiffusersBackend(TorchBackend):
     def unload_pipeline(self):
         self.pipe = None
         self.img2img = None
+
+    # ----- image-to-video (svd) ---------------------------------------------------------------
+    def load_video(self, root, options):
+        offline_environment()
+        import torch
+        from diffusers import StableVideoDiffusionPipeline
+        from diffusers.models.attention_processor import AttnProcessor2_0
+
+        self.apply_budget()
+        pipe = StableVideoDiffusionPipeline.from_pretrained(
+            str(root),
+            local_files_only=True,
+            use_safetensors=True,
+            torch_dtype=getattr(torch, options["precision"]),
+        )
+        pipe.unet.set_attn_processor(AttnProcessor2_0())
+        pipe.vae.set_attn_processor(AttnProcessor2_0())
+        pipe.to(self.run_device)
+        pipe.set_progress_bar_config(disable=True)
+        self.video = pipe
+
+    def decode_frames(self, pipe, latents, frames, chunk, emit, cancelled):
+        """Decode `chunk` frames per VAE call, as the pipeline's decode_latents does, to PNG bytes.
+
+        The loop is ours so each chunk reports progress (unit `frames`) and cancellation is checked
+        before every chunk; the temporal decoder sees each chunk as one clip, exactly as there.
+        """
+        from . import png
+
+        latents = latents.flatten(0, 1) / pipe.vae.config.scaling_factor
+        latents = latents.to(pipe.vae.dtype)
+        images = []
+        for start in range(0, frames, chunk):
+            if cancelled.is_set():
+                raise Cancelled()
+            part = latents[start : start + chunk]
+            decoded = pipe.vae.decode(part, num_frames=part.shape[0]).sample
+            images.extend(png.tensor_to_png((f.float() / 2 + 0.5).clamp(0, 1)) for f in decoded)
+            emit(
+                "progress",
+                {
+                    "stage": "decoding",
+                    "scope": "stage",
+                    "unit": "frames",
+                    "completed_steps": len(images),
+                    "total_steps": frames,
+                },
+            )
+        return images
+
+    def generate_video(self, request, directory, emit, cancelled, image_path):
+        import torch
+
+        from . import video
+
+        pipe = self.video
+        if pipe is None:
+            raise RuntimeError("Model not loaded")
+        params = {**TASK_DEFAULTS["image-to-video"], **request["parameters"]}
+        frames = params.get("frames", pipe.unet.config.num_frames)
+        width, height, steps = params["width"], params["height"], params["steps"]
+        sampling = []
+
+        def started(_module, _inputs):
+            # Image conditioning ends at the first UNet call; every call is also a checkpoint.
+            if cancelled.is_set():
+                raise Cancelled()
+            if not sampling:
+                sampling.append(True)
+                emit("stage", {"stage": "sampling"})
+
+        self.begin(cancelled)
+        hook = pipe.unet.register_forward_pre_hook(started)
+        try:
+            with torch.inference_mode():
+                emit("stage", {"stage": "encoding"})
+                image = self.load_image(image_path, width, height)
+                if cancelled.is_set():
+                    raise Cancelled()
+
+                def step(pipeline, index, timestep, values):
+                    if cancelled.is_set():
+                        raise Cancelled()
+                    emit(
+                        "progress",
+                        {
+                            "stage": "sampling",
+                            "completed_steps": index + 1,
+                            "total_steps": steps,
+                            "scope": "stage",
+                        },
+                    )
+                    return values
+
+                latents = pipe(
+                    image,
+                    height=height,
+                    width=width,
+                    num_frames=frames,
+                    num_inference_steps=steps,
+                    min_guidance_scale=VIDEO_GUIDANCE["min_guidance"],
+                    max_guidance_scale=VIDEO_GUIDANCE["max_guidance"],
+                    fps=params["fps"],
+                    motion_bucket_id=params["motion"],
+                    noise_aug_strength=params["noise_augmentation"],
+                    # One generator draws the conditioning noise, then the initial latents.
+                    generator=torch.Generator(device=self.run_device).manual_seed(params["seed"]),
+                    callback_on_step_end=step,
+                    output_type="latent",
+                ).frames
+                if cancelled.is_set():
+                    raise Cancelled()
+                emit("stage", {"stage": "decoding"})
+                pngs = self.decode_frames(pipe, latents, frames, params["decode_chunk"], emit, cancelled)
+                if cancelled.is_set():
+                    raise Cancelled()
+                emit("stage", {"stage": "packaging"})
+                archive = Path(directory) / "frames.zip"
+                video.write_archive(archive, pngs, params["fps"], width, height)
+                emit("stage", {"stage": "saving"})
+                poster = Path(directory) / "poster.png"
+                poster.write_bytes(pngs[0])  # frame 1, byte for byte
+                records = [
+                    {
+                        "output_id": "frames",
+                        "path": archive,
+                        "mime_type": video.MIME_TYPE,
+                        "width": width,
+                        "height": height,
+                        "frames": frames,
+                        "fps": params["fps"],
+                    },
+                    {
+                        "output_id": "poster",
+                        "path": poster,
+                        "mime_type": "image/png",
+                        "width": width,
+                        "height": height,
+                    },
+                ]
+                chunks = -(-frames // params["decode_chunk"])
+                return records, {
+                    "effective_steps": steps,
+                    "frames": frames,
+                    "decode_chunks": chunks,
+                    **self.measurements(),
+                }
+        finally:
+            hook.remove()
+            self.finish()
 
     def generate_images(self, request, directory, emit, cancelled, image_path=None):
         import torch
