@@ -1,6 +1,6 @@
 # media-worker/1.3 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.6.0 speaks
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.7.0 speaks
 `media-worker/1.3` and still accepts `media-worker/1.0`, `media-worker/1.1` and
 `media-worker/1.2` requests; `/v1/info`, `/v1/capabilities` and the startup record list
 `supported_protocols`. Every 1.2 and 1.3 behavior is gated on the request's `protocol` minor: a
@@ -59,7 +59,8 @@ bundle is refused (`invalid_request` for the unknown field, `unsupported`/`famil
 family). 1.1 snapshots carry no `count` in `effective_settings` and no `applied_fallbacks` unless
 a 1.2 load applied one. A backend is advertised only after the conformance suite
 (`tests/conformance`; `media-worker-conformance/1.0` in 0.4.0–0.5.0, `1.1` with the
-image-to-video section from 0.6.0) passes against it with no skipped section;
+image-to-video section from 0.6.0, `1.2` with the text-to-audio section from 0.7.0) passes
+against it with no skipped section;
 [compatibility.md](compatibility.md) records the result.
 
 ### Discovery in 1.2
@@ -302,15 +303,24 @@ stays false.
 | `loaded_bundle.video_sizes`, `.default_frames`    | The loaded svd bundle's sizes (`video.json`, optional) and its unet's `num_frames`             |
 | `task_parameters.image-to-video`                  | Inputs, parameters, defaults, `bundle_defaults`, outputs, `output_formats`, stages, archive shape |
 | `memory_estimate.latents_mb`, `.per_frame_bytes`  | svd: the sampling latents of the most frames at the largest size                                |
+| task `text-to-audio`, family `stable-audio-open` (0.7.0) | One clip from a prompt; reference backend only (`diffusers-sdxl`) in Engine 0.7.0          |
+| `parameters.duration_seconds`, `guidance` (0.7.0) | Audio parameters; `seed`, `steps` (1–200) and `duration_seconds` are required, `guidance` defaults to 7 |
+| output `audio` (0.7.0)                            | `audio/wav`, canonical 16-bit PCM; the record adds `sample_rate`, `channels`, `samples`, `duration_seconds` read back from the file |
+| `limits.audio_steps`, `.duration_seconds`, `.sample_rate`, `.audio_channels` (0.7.0) | Ranges for the audio parameters and bundle facts; `duration_seconds` follows the loaded bundle |
+| `loaded_bundle.sample_rate`, `.channels`, `.hop_length`, `.duration_range` (0.7.0) | The loaded stable-audio-open bundle's facts, read from its configs                   |
+| `task_parameters.text-to-audio` (0.7.0)           | Inputs, parameters, `required_parameters`, defaults, outputs, `output_formats`, stages, `bundle_facts`, audio shape |
+| `capabilities.missing_task_dependencies` (0.7.0)  | Per task, the missing distributions that keep it unadvertised (`{"text-to-audio": ["torchsde"]}` without the `inference-audio` extra); readiness still follows `missing_dependencies` |
+| `memory_estimate.latents_mb`, `.waveform_mb` (0.7.0) | stable-audio-open: the sampling latents and the decoded waveform of the whole latent length |
 
 Nothing else changed: no 1.0–1.2 request, event, error or output shape. A 1.2 (or older) caller
-that names `image-to-video` gets `unsupported`, field `task`; an `svd` bundle on a 1.2 load or
-validation is `unsupported`, field `family` (a 1.0/1.1 body still fails on its fields first, as
-for `esrgan`). `tasks`, `model_families` and `loaders` list what the worker serves, whatever the
-caller's minor, so a 1.2 supervisor may see `image-to-video` listed and must not request it;
-`defaults` is unchanged, so a supervisor that merges it into every request never sends a video
-field. Minor 1.3 also covers text-to-audio, which Engine 0.6.0 does not serve: the `tasks` list,
-not the minor, tells a caller what exists.
+that names `image-to-video` or `text-to-audio` gets `unsupported`, field `task`; an `svd` or
+`stable-audio-open` bundle on a 1.2 load or validation is `unsupported`, field `family` (a
+1.0/1.1 body still fails on its fields first, as for `esrgan`). `tasks`, `model_families` and
+`loaders` list what the worker serves, whatever the caller's minor, so a 1.2 supervisor may see
+`image-to-video` or `text-to-audio` listed and must not request them; `defaults` is unchanged, so
+a supervisor that merges it into every request never sends a video or audio field. Minor 1.3 was
+first advertised by Engine 0.6.0, which did not serve text-to-audio; Engine 0.7.0 adds it without
+a new minor. The `tasks` list, not the minor, tells a caller what exists.
 
 ### Discovery in 1.3
 
@@ -346,7 +356,8 @@ inference extra installed:
 }
 ```
 
-(Only the additions are shown.) The owned backend (`owned-sdxl`) does not serve `svd`: it never
+(Only the additions are shown; the text-to-audio additions from 0.7.0 are under
+[Text-to-audio](#text-to-audio).) The owned backend (`owned-sdxl`) does not serve `svd`: it never
 lists the family, its loader or the task, and a load or validation naming an `svd` bundle is
 `unsupported`, field `family`, before any file is read. `capabilities.output_formats` keeps its
 1.0 value; the per-task `output_formats` are authoritative. A worker pinned to 1.2 (the test
@@ -429,6 +440,134 @@ The memory estimate of an `svd` bundle adds `latents_mb`: the sampling latents o
 input, the guided image latents repeated per frame and the denoised latent), with a `frames`
 scaling note. It excludes UNet attention and VAE decoder activations, which also grow with frames
 and `decode_chunk`, and says so in `uncertainty`.
+
+### Text-to-audio
+
+Engine 0.7.0 adds text-to-audio within minor 1.3. `/v1/capabilities` on a reference backend with
+the `inference` and `inference-audio` extras installed adds:
+
+```json
+{
+  "tasks": ["text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio"],
+  "model_families": ["sdxl-base", "esrgan", "svd", "stable-audio-open"],
+  "loaders": [
+    {"format": "diffusers-safetensors", "families": ["stable-audio-open"],
+     "roles": ["transformer", "vae", "text_encoder", "tokenizer", "projection_model", "scheduler"],
+     "tasks": ["text-to-audio"], "ownership": "reference"}
+  ],
+  "task_parameters": {
+    "text-to-audio": {"inputs": ["prompt", "negative_prompt"],
+      "parameters": ["guidance", "duration_seconds"],
+      "required_parameters": ["seed", "steps", "duration_seconds"],
+      "defaults": {"guidance": 7}, "outputs": ["audio"],
+      "output_formats": {"audio": "audio/wav"}, "families": ["stable-audio-open"],
+      "stages": ["encoding", "sampling", "decoding", "saving"],
+      "bundle_facts": ["sample_rate", "channels", "hop_length", "duration_range"],
+      "audio": {"encoding": "pcm_s16le", "container": "wav",
+                "duration": "rounded up to whole latent frames (hop_length samples) and reported"}}
+  },
+  "task_defaults": {"text-to-audio": {"guidance": 7}},
+  "limits": {"audio_steps": [1, 200], "duration_seconds": [1, 47],
+             "sample_rate": [1000, 192000], "audio_channels": [1, 2]},
+  "missing_task_dependencies": {},
+  "dependencies": {"torchsde": "0.2.6"}
+}
+```
+
+(Only the additions are shown.) Without `torchsde` the backend stays ready for its other families
+but lists neither the family, its loader nor the task, and `missing_task_dependencies` is
+`{"text-to-audio": ["torchsde"]}`; `missing_dependencies` (which decides `ready` and whether a
+load is accepted) is unchanged. The owned backend does not serve `stable-audio-open`, exactly as
+for `svd`: no family, loader or task, and a load or validation naming such a bundle is
+`unsupported`, field `family`, before any file is read.
+
+#### The `stable-audio-open` family
+
+| Family              | `format`                | `pipeline`      | Components (`role` → `tensor_format`)                                                       | Tasks         |
+| ------------------- | ----------------------- | --------------- | ------------------------------------------------------------------------------------------- | ------------- |
+| `stable-audio-open` | `diffusers-safetensors` | `text-to-audio` | transformer, vae, text_encoder, projection_model → `safetensors`; tokenizer, scheduler → `json` | text-to-audio |
+
+The directory is a Diffusers `StableAudioPipeline` bundle: `model_index.json` names exactly
+`transformer` → `StableAudioDiTModel`, `vae` → `AutoencoderOobleck`, `scheduler` →
+`CosineDPMSolverMultistepScheduler` (all `diffusers`), `text_encoder` → `T5EncoderModel`,
+`tokenizer` → `T5TokenizerFast` (both `transformers`) and `projection_model` →
+`StableAudioProjectionModel` under the library entry `stable_audio` (as the library itself
+writes it); the scheduler configuration must name the same scheduler. Anything else is
+`unsupported` with the role or `pipeline` as field. The tokenizer folder must contain
+`tokenizer.json` (`unsupported`, field `tokenizer`, otherwise), so the fast tokenizer loads without
+sentencepiece. Component digests cover each role's folder, as for `sdxl-base`.
+
+The bundle's facts come from its configurations, without loading weights: `sample_rate` is the
+VAE's `sampling_rate` (1000–192000 Hz), `channels` its `audio_channels` (1–2), `hop_length` (the
+latent granularity, samples per latent frame) the product of its `downsampling_ratios`, and the
+longest clip it can produce is the transformer's `sample_size` × `hop_length` / `sample_rate`
+seconds (the library defaults, which are the reference bundle's values, where a configuration is
+silent: 44100 Hz stereo, 2048 samples per frame, 1024 frames, 47.55 s). An optional top-level
+`audio.json`, `{"duration_seconds": [low, high]}`, declares the range the bundle serves, with `0 <
+low ≤ high` and `high` within that longest clip; without it the range is 1 s to the whole seconds
+the bundle allows (`[1, 47]` for the reference bundle). Anything outside these rules is
+`unsupported`, field `configuration`, at validation. `source.conversion` and adapters are
+refused as for `esrgan`.
+
+A 1.3 validation and load report `family: "stable-audio-open"`, `tasks: ["text-to-audio"]`,
+`sample_rate`, `channels`, `hop_length` and `duration_range`; `loaded_bundle` carries the same
+facts. While such a bundle is loaded, `capabilities.limits.duration_seconds` is its range;
+otherwise it is the reference range, 1–47 s.
+
+#### The request
+
+```json
+{"protocol": "media-worker/1.3", "attempt_id": "attempt_a1", "bundle_digest": "sha256:<audio>",
+ "task": "text-to-audio", "inputs": {"prompt": "rain on a tin roof", "negative_prompt": "low quality"},
+ "parameters": {"seed": 42, "steps": 100, "guidance": 7, "duration_seconds": 10}}
+```
+
+`inputs` is `{prompt}` with an optional `negative_prompt` (10,000 characters each; an `image` is
+`invalid_request`, field `image`). `parameters` requires `seed` (uint32), `steps`
+(`limits.audio_steps`, integer) and `duration_seconds` (a number, `0 < d ≤ 600` before a bundle
+is loaded); `guidance` (0–30) defaults to 7. `width`, `height`, `sampler`, `scheduler` and `count`
+are `invalid_request` with that field (the family has one scheduler and no image size); any other
+field is `invalid_request`. With the bundle loaded, `duration_seconds` must lie within
+`loaded_bundle.duration_range` (`invalid_request`, field `duration_seconds`): a longer request is
+refused, never trimmed to the limit.
+
+The requested duration is honored up to the model's latent granularity: the clip is the smallest
+whole number of latent frames that covers it, `latent_frames = ceil(duration_seconds ×
+sample_rate / hop_length)` (computed on the number as written, so 1.0 is not a frame longer
+through binary rounding), and the effective duration is `latent_frames × hop_length /
+sample_rate`, never shorter than the request. The model is conditioned on that effective
+duration. With the reference bundle a 10 s request is 216 frames, 442,368 samples, 10.031 s.
+`effective_settings` is `{seed, steps, guidance, duration_seconds, effective_steps}` plus, once
+the bundle is loaded, `{sample_rate, channels, latent_frames, effective_duration_seconds}`. The
+storage reservation is the WAV's exact size (44 header bytes plus 2 bytes per sample per channel),
+so a clip that cannot fit is `503 storage_full` before sampling.
+
+Stages are `encoding` (T5 prompt and timing conditioning), `sampling` (from the first
+transformer call) with `{stage: "sampling", scope: "stage", completed_steps, total_steps}` per
+step, `decoding` (the VAE decodes the transformer's whole latent length, as the library does, and
+the waveform is cut at the latent boundary that covers the request) and `saving`. Cancellation is
+checked at every transformer call and every step, after sampling and before saving; a cancelled
+execution publishes nothing. `measurements` adds `latent_frames`, `samples` and `clipped_samples`
+(samples beyond full scale before quantization, which are clamped).
+
+The execution finalizes one output:
+
+| Output  | MIME type   | Content                                                                                                     |
+| ------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
+| `audio` | `audio/wav` | A 44-byte RIFF/WAVE header (`fmt ` PCM, 16 bits) then one `data` chunk of interleaved little-endian samples |
+
+Samples are the decoder's output clamped to [-1, 1], scaled by 32767 and rounded to nearest. The
+worker reads the header back (and checks that the file holds exactly the frames it declares)
+before publishing, and the output record carries `{output_id, mime_type, size, sha256,
+sample_rate, channels, samples, duration_seconds}` from it. The same seed, settings, bundle and
+software stack give the same bytes. The WAV is written by the standard library; there is no
+encoder, resampler or external tool.
+
+The memory estimate of a `stable-audio-open` bundle adds `latents_mb` (per latent frame the guided
+transformer input and output and the latent, over the whole latent length) and `waveform_mb` (the
+decoded waveform before it is cut). Both are constant per bundle because the library samples and
+decodes the whole latent length whatever the duration; transformer attention, T5 encoder and VAE
+decoder activations are excluded and stated in `uncertainty`.
 
 
 ## Transport
@@ -552,7 +691,7 @@ executions that used them are collected. A handle from another session is `input
 ## Execution
 
 `POST /v1/executions` takes exactly `{protocol,attempt_id,bundle_digest,task,inputs,parameters}`.
-Tasks are `text-to-image`, `image-to-image`, (1.2) `upscale` and (1.3) `image-to-video`, described above. Inputs are prompt (required), negative_prompt
+Tasks are `text-to-image`, `image-to-image`, (1.2) `upscale` and (1.3) `image-to-video` and `text-to-audio`, described above. Inputs are prompt (required), negative_prompt
 (optional), max 10,000 characters each, and for image-to-image `image` (an `input_id`). Parameters
 are resolved seed (uint32), width/height (64–2048, multiples of eight), steps (1–150), guidance
 (0–30), sampler `euler`, scheduler `euler`, and for image-to-image `strength` (0 < s ≤ 1, with
@@ -583,8 +722,10 @@ every sampling step. A supervisor may kill only a process it owns; that is inter
 confirmed cancellation. Terminal states are succeeded/failed/cancelled.
 
 Outputs include output_id (`image`, plus `image_2` … for a 1.2 `count`; `frames` and `poster`
-for 1.3 image-to-video), MIME type (image/png, or application/zip for `frames`), byte size,
-SHA-256 and actual width/height (plus `frames`, `fps` and `duration_seconds` on `frames`). `GET /v1/executions/{execution_id}/outputs/{output_id}`
+for 1.3 image-to-video; `audio` for 1.3 text-to-audio), MIME type (image/png, application/zip for
+`frames`, audio/wav for `audio`), byte size, SHA-256 and actual width/height (plus `frames`, `fps`
+and `duration_seconds` on `frames`; `sample_rate`, `channels`, `samples` and `duration_seconds`
+instead on `audio`). `GET /v1/executions/{execution_id}/outputs/{output_id}`
 streams finalized bytes only. DELETE on a terminal
 execution discards records/events/output after collection. Missing output bytes return 410.
 Outputs survive client disconnects within the worker session, not process death.

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jxburros/Media-Engine/schemas/worker-1.3.schema.json",
-  "title": "Media Worker 1.3 request and record schemas (1.0, 1.1 and 1.2 shapes remain valid)",
+  "title": "Media Worker 1.3 request and record schemas (1.0, 1.1 and 1.2 shapes remain valid; text-to-audio from Engine 0.7.0)",
   "$defs": {
     "bundle": {
       "type": "object",
@@ -21,14 +21,16 @@
           "enum": [
             "sdxl-base",
             "esrgan",
-            "svd"
+            "svd",
+            "stable-audio-open"
           ]
         },
         "pipeline": {
           "enum": [
             "text-to-image",
             "upscale",
-            "image-to-video"
+            "image-to-video",
+            "text-to-audio"
           ]
         },
         "components": {
@@ -51,7 +53,9 @@
                   "network",
                   "configuration",
                   "image_encoder",
-                  "feature_extractor"
+                  "feature_extractor",
+                  "transformer",
+                  "projection_model"
                 ]
               },
               "artifact_handle": {
@@ -273,6 +277,51 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "stable-audio-open"
+              }
+            }
+          },
+          "then": {
+            "description": "media-worker/1.3 only (served from Engine 0.7.0)",
+            "properties": {
+              "pipeline": {
+                "const": "text-to-audio"
+              },
+              "format": {
+                "const": "diffusers-safetensors"
+              },
+              "source": {
+                "not": {
+                  "required": [
+                    "conversion"
+                  ]
+                }
+              },
+              "components": {
+                "minItems": 6,
+                "maxItems": 6,
+                "items": {
+                  "properties": {
+                    "role": {
+                      "enum": [
+                        "transformer",
+                        "vae",
+                        "text_encoder",
+                        "tokenizer",
+                        "projection_model",
+                        "scheduler"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     },
@@ -301,7 +350,8 @@
             "text-to-image",
             "image-to-image",
             "upscale",
-            "image-to-video"
+            "image-to-video",
+            "text-to-audio"
           ]
         },
         "inputs": {
@@ -311,7 +361,8 @@
             "prompt": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 10000
+              "maxLength": 10000,
+              "description": "required for text-to-image, image-to-image and text-to-audio and forbidden otherwise"
             },
             "negative_prompt": {
               "type": "string",
@@ -344,8 +395,8 @@
             "steps": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 150,
-              "description": "1–150; image-to-video 1–50"
+              "maximum": 200,
+              "description": "text-to-image and image-to-image 1–150; image-to-video 1–50; text-to-audio 1–200"
             },
             "seed": {
               "type": "integer",
@@ -355,7 +406,8 @@
             "guidance": {
               "type": "number",
               "minimum": 0,
-              "maximum": 30
+              "maximum": 30,
+              "description": "text-to-image and image-to-image: required; text-to-audio: optional, default 7"
             },
             "sampler": {
               "const": "euler"
@@ -419,12 +471,15 @@
               "minimum": 1,
               "maximum": 16,
               "description": "image-to-video only; frames per VAE decode call, default 8"
+            },
+            "duration_seconds": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 600,
+              "description": "media-worker/1.3 text-to-audio only (Engine 0.7.0); must lie within the loaded bundle's loaded_bundle.duration_range; rounded up to whole latent frames and reported as effective_duration_seconds, never trimmed"
             }
           },
-          "required": [
-            "width",
-            "height"
-          ]
+          "required": []
         }
       },
       "required": [
@@ -511,8 +566,18 @@
                       "required": [
                         "decode_chunk"
                       ]
+                    },
+                    {
+                      "required": [
+                        "duration_seconds"
+                      ]
                     }
                   ]
+                },
+                "properties": {
+                  "steps": {
+                    "maximum": 150
+                  }
                 }
               }
             }
@@ -589,8 +654,18 @@
                       "required": [
                         "decode_chunk"
                       ]
+                    },
+                    {
+                      "required": [
+                        "duration_seconds"
+                      ]
                     }
                   ]
+                },
+                "properties": {
+                  "steps": {
+                    "maximum": 150
+                  }
                 }
               }
             }
@@ -639,7 +714,11 @@
                     "tile",
                     "tile_overlap"
                   ]
-                }
+                },
+                "required": [
+                  "width",
+                  "height"
+                ]
               }
             }
           }
@@ -724,6 +803,47 @@
                   "steps": {
                     "maximum": 50
                   }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "task": {
+                "const": "text-to-audio"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.3"
+              },
+              "inputs": {
+                "required": [
+                  "prompt"
+                ],
+                "not": {
+                  "required": [
+                    "image"
+                  ]
+                }
+              },
+              "parameters": {
+                "required": [
+                  "seed",
+                  "steps",
+                  "duration_seconds"
+                ],
+                "propertyNames": {
+                  "enum": [
+                    "seed",
+                    "steps",
+                    "guidance",
+                    "duration_seconds"
+                  ]
                 }
               }
             }
@@ -1008,7 +1128,7 @@
         },
         "latents_mb": {
           "type": "integer",
-          "description": "svd: sampling latents of the most frames at the largest advertised size"
+          "description": "svd: sampling latents of the most frames at the largest advertised size; stable-audio-open: sampling latents of the whole latent length"
         },
         "per_frame_bytes": {
           "type": "integer",
@@ -1017,6 +1137,14 @@
         "frames": {
           "type": "object",
           "description": "svd: how frames scale latent memory"
+        },
+        "waveform_mb": {
+          "type": "integer",
+          "description": "stable-audio-open: the decoded waveform of the whole latent length before it is cut"
+        },
+        "duration": {
+          "type": "object",
+          "description": "stable-audio-open: the duration range and how duration scales memory (it does not)"
         }
       },
       "required": [
@@ -1231,7 +1359,7 @@
         },
         "mime_type": {
           "type": "string",
-          "description": "image/png, or application/zip for the image-to-video frames archive"
+          "description": "image/png, application/zip for the image-to-video frames archive, or audio/wav for the text-to-audio clip"
         },
         "size": {
           "type": "integer",
@@ -1258,13 +1386,20 @@
         },
         "duration_seconds": {
           "type": "number",
-          "description": "image-to-video frames output: frames / fps"
+          "description": "image-to-video frames output: frames / fps; text-to-audio audio output: samples / sample_rate, the effective duration after latent granularity, read back from the WAV header"
         },
         "sample_rate": {
-          "type": "integer"
+          "type": "integer",
+          "description": "text-to-audio audio output: from the WAV header"
         },
         "channels": {
-          "type": "integer"
+          "type": "integer",
+          "description": "text-to-audio audio output: from the WAV header"
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "text-to-audio audio output: samples per channel, from the WAV header"
         }
       },
       "required": [
@@ -1549,6 +1684,34 @@
       },
       "required": [
         "sizes"
+      ]
+    },
+    "audio_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional top-level audio.json of a stable-audio-open bundle; absent means 1 s to the whole seconds the bundle's latent length allows (1–47 for the reference bundle)",
+      "properties": {
+        "duration_seconds": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 600
+            },
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 600
+            }
+          ],
+          "description": "[low, high] with low ≤ high and high within sample_size × hop_length / sampling_rate"
+        }
+      },
+      "required": [
+        "duration_seconds"
       ]
     }
   },

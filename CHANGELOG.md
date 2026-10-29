@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.7.0 — 2026-10-29
+
+Text-to-audio (phase E4) within protocol `media-worker/1.3`, which 0.6.0 already advertises; 1.0,
+1.1 and 1.2 are still served unchanged. Every new behavior is gated on the request's minor, and a
+1.2 caller that names `text-to-audio` or a `stable-audio-open` bundle gets `unsupported` (field
+`task` or `family`).
+
+- **`stable-audio-open` family and `text-to-audio` task**: a Diffusers `StableAudioPipeline`
+  bundle (transformer, vae, text_encoder, projection_model → safetensors; tokenizer, scheduler →
+  json) with the approved classes checked from `model_index.json`, including the library's
+  `["stable_audio", "StableAudioProjectionModel"]` entry and the family's own scheduler
+  (`CosineDPMSolverMultistepScheduler`); `tokenizer/tokenizer.json` is required. Sample rate and
+  channels from the VAE config, the latent granularity (`hop_length`) from its downsampling
+  ratios, the longest clip from the transformer's latent length, and the duration range from an
+  optional `audio.json` (default 1 s to the whole seconds allowed: 1–47 for the reference
+  bundle), reported as `sample_rate`/`channels`/`hop_length`/`duration_range` on validation, load
+  and `loaded_bundle`; `capabilities.limits.duration_seconds` follows the loaded bundle.
+- **Request**: `prompt` and optional `negative_prompt`; `seed`, `steps` (1–200) and
+  `duration_seconds` required, `guidance` (0–30) optional with default 7. Image fields,
+  sampler/scheduler and `count` are refused by name; a duration outside the loaded bundle's range
+  is `invalid_request`, never trimmed to fit.
+- **Duration**: rounded up to whole latent frames, never below the request; the model is
+  conditioned on that effective duration, and `effective_settings` reports `sample_rate`,
+  `channels`, `latent_frames` and `effective_duration_seconds`.
+- **Output**: `audio`, a canonical 16-bit PCM `audio/wav` written by the new standard-library
+  module `audio.py` (`wave`); the worker validates the header and length and reads
+  `sample_rate`, `channels`, `samples` and `duration_seconds` back from the file into the output
+  record. The exact WAV size is reserved before sampling.
+- **Reference backend only**: `diffusers-sdxl` runs the library pipeline from the verified
+  components with stages `encoding`, `sampling` (step progress), `decoding` (the whole latent
+  length, cut at the latent boundary covering the request, as the library cuts its own output)
+  and `saving`, checking cancellation at every transformer call and step and before saving.
+  `owned-sdxl` does not serve the family (`unsupported`, field `family`).
+- **New extra `inference-audio`** pinning `torchsde==0.2.6`, which the family's scheduler
+  imports (`uv.lock` adds torchsde, trampoline and scipy; no existing pin moved). Without it the
+  worker stays ready for everything else, does not advertise text-to-audio and reports
+  `capabilities.missing_task_dependencies: {"text-to-audio": ["torchsde"]}`.
+- **Memory estimate**: `stable-audio-open` adds `latents_mb` and `waveform_mb` (the sampling
+  latents and decoded waveform of the whole latent length, constant per bundle) with their
+  basis; attention, T5 and VAE decoder activations are excluded and stated.
+- **Conformance suite `media-worker-conformance/1.2`**: a `text_to_audio` section plus audio
+  checks in discovery, negotiation and validation; the registration document gains `audio`.
+- `tests/serve_fixture.py` serves an `audio` handle (stable-audio-open, 8 kHz stereo,
+  256-sample latent frames, 1–47 s; tiny random stand-in weights) through `TestBackend`, which
+  writes a real WAV of a seeded tone through `audio.py`; `--protocol media-worker/1.2` still
+  reproduces the 0.5.0 fixture surface.
+- Schema (`$id` still 1.3): `stable-audio-open` bundles, the audio execution body,
+  `duration_seconds`, the audio output record fields and `audio_configuration`; 1.0–1.2 shapes
+  and the 0.6.0 1.3 shapes still valid. `docs/protocol.md` "Text-to-audio" in "What changed in
+  1.3"; README "Text-to-audio" with the reference bundle and its license; compatibility row and
+  text-to-audio checklist; `docs/decisions.md` 0.7.0 entry and the `torchsde` ledger row.
+
+Validation, stated plainly: there is no GPU and there are no real Stable Audio Open weights in
+this workspace, so the stable-audio-open path ran only on CPU float32 with a tiny random-weight
+bundle (1 kHz stereo, 8-sample latent frames, one second, two steps) in a Python 3.12.13 virtual
+environment holding the pinned `inference` and `inference-audio` sets with CPU torch 2.6.0
+(`+cpu` wheel, not the locked CUDA build). There the WAV samples match the library pipeline's own
+output within one 16-bit step, the duration rounding is as reported, and the whole suite passes
+(77 tests, one IPv6 skip); the conformance suite reports `diffusers-sdxl` and `owned-sdxl`
+conformant on CPU with tiny bundles. float16, CUDA memory, the reference 44.1 kHz × 47 s
+workload, the estimate's accuracy and audio quality are implemented but not hardware-validated;
+see the text-to-audio checklist in `docs/compatibility.md`. The `inference-owned`-only
+environment was not rebuilt for this release (no owned-path code changed). Runtime 0.6.0 (11/11
+integration tests) and 0.7.0 (15/15) pass unchanged against the 0.7.0 fixture; no Runtime
+consumes 1.3 yet (Runtime 0.10.0, phase R6, for audio).
+
 ## 0.6.0 — 2026-10-29
 
 Protocol `media-worker/1.3` with image-to-video (phase E3). 1.0, 1.1 and 1.2 are still served
