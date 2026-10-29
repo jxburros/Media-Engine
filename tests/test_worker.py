@@ -15,6 +15,7 @@ from fixture import (
     make_converted,
     make_esrgan_bundle,
     make_png,
+    make_svd_bundle,
 )
 from media_engine.server import Worker, create_server
 from media_engine.contracts import PROTOCOL, WorkerError, DEFAULTS, bundle_path
@@ -407,7 +408,7 @@ class ProtocolTwelveTests(unittest.TestCase):
         self.assertIn("upscale", caps["tasks"])
         self.assertEqual(
             {l["families"][0]: l["format"] for l in caps["loaders"]},
-            {"sdxl-base": "diffusers-safetensors", "esrgan": "single-file-safetensors"},
+            {"sdxl-base": "diffusers-safetensors", "esrgan": "single-file-safetensors", "svd": "diffusers-safetensors"},
         )
         self.assertEqual(caps["task_parameters"]["text-to-image"]["outputs"], ["image"])
         self.assertEqual(caps["limits"]["count"], [1, 4])
@@ -616,11 +617,341 @@ class ProtocolTwelveTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 404)
             self.assertEqual(json.load(caught.exception)["error"]["code"], "output_not_found")
             info = json.load(get("/v1/info"))
-            self.assertEqual(info["protocol"], "media-worker/1.2")
+            self.assertEqual(info["protocol"], "media-worker/1.3")
             self.assertIn("device_identity", info)
         finally:
             server.shutdown()
             server.server_close()
+
+
+class ProtocolThirteenTests(unittest.TestCase):
+    """media-worker/1.3: image-to-video with the svd family, frame archives and posters."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.bundle = make_bundle(self.root / "model")
+        self.video = make_svd_bundle(self.root / "video")
+        self.catalog = {"fixture": str(self.root / "model"), "video": str(self.root / "video")}
+        self.backend = TestBackend()
+        self.worker = Worker(self.root / "work", self.backend, self.catalog)
+
+    def tearDown(self):
+        while self.worker.active or self.worker.state in {"loading", "unloading"}:
+            time.sleep(0.01)
+        self.temp.cleanup()
+
+    def load(self, bundle=None, protocol=PROTOCOL, worker=None):
+        worker = worker or self.worker
+        op = worker.control(
+            "load",
+            {"protocol": protocol, "bundle": bundle or self.video, "options": self.backend.capabilities()["load_defaults"]},
+        )
+        while worker.operations[op["operation_id"]]["state"] == "running":
+            time.sleep(0.01)
+        record = worker.operations[op["operation_id"]]
+        self.assertEqual(record["state"], "succeeded", record["error"])
+        return record
+
+    def request(self, input_id, attempt="attempt_v", protocol=PROTOCOL, **params):
+        return {
+            "protocol": protocol,
+            "attempt_id": attempt,
+            "bundle_digest": self.video["bundle_digest"],
+            "task": "image-to-video",
+            "inputs": {"image": input_id},
+            "parameters": {"width": 64, "height": 64, "seed": 9, "steps": 3, **params},
+        }
+
+    def wait(self, execution):
+        while self.worker.snapshot(execution)["state"] == "running":
+            time.sleep(0.01)
+        return self.worker.snapshot(execution)
+
+    def code(self, call, *args):
+        with self.assertRaises(WorkerError) as caught:
+            call(*args)
+        return caught.exception.code, caught.exception.field
+
+    def test_capabilities_and_bundle_facts(self):
+        caps = self.worker.capabilities()
+        self.assertIn("image-to-video", caps["tasks"])
+        video = caps["task_parameters"]["image-to-video"]
+        self.assertEqual(video["outputs"], ["frames", "poster"])
+        self.assertEqual(video["output_formats"], {"frames": "application/zip", "poster": "image/png"})
+        self.assertEqual(video["defaults"], {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8})
+        self.assertEqual(video["stages"], ["encoding", "sampling", "decoding", "packaging", "saving"])
+        # The fixture advertises the sizes its video bundle serves (a real backend, unloaded,
+        # advertises the reference sizes; see below).
+        self.assertEqual(caps["limits"]["video_sizes"], [[64, 64], [1024, 576], [576, 1024]])
+        self.assertEqual((caps["limits"]["video_steps"], caps["limits"]["frames"]), ([1, 50], [1, 64]))
+        from media_engine.backend import DiffusersBackend
+
+        self.assertEqual(DiffusersBackend("cpu").capabilities()["limits"]["video_sizes"], [[1024, 576], [576, 1024]])
+        loader = next(l for l in caps["loaders"] if l["families"] == ["svd"])
+        self.assertEqual(loader["roles"], ["unet", "vae", "image_encoder", "feature_extractor", "scheduler"])
+        # Defaults merged into every request stay the 1.0 set; 1.1 supervisors never send video fields.
+        self.assertNotIn("fps", caps["defaults"])
+        validated = self.worker.validation({"protocol": PROTOCOL, "bundle": self.video, "options": caps["load_defaults"]})
+        self.assertEqual((validated["family"], validated["tasks"]), ("svd", ["image-to-video"]))
+        self.assertEqual(validated["video_sizes"], [[64, 64], [1024, 576], [576, 1024]])
+        self.assertEqual(validated["default_frames"], 2)
+        estimate = validated["memory_estimate"]
+        # 28 values per latent pixel (guided 8-channel input, guided image latents, the latent) at
+        # the largest declared size and the fixture VAE's factor of 2, float32.
+        self.assertEqual(estimate["per_frame_bytes"], 28 * 512 * 288 * 4)
+        self.assertEqual(estimate["latents_mb"], 28 * 512 * 288 * 4 * 64 // 1024**2)
+        self.assertEqual(estimate["value_mb"], estimate["latents_mb"])  # stand-in weights are bytes
+        self.assertIn("64 frames", estimate["basis"])
+        self.load()
+        loaded = self.worker.info()["loaded_bundle"]
+        self.assertEqual((loaded["family"], loaded["tasks"], loaded["default_frames"]), ("svd", ["image-to-video"], 2))
+        # With an svd bundle loaded, limits.video_sizes is that bundle's list.
+        root = self.root / "small"
+        small = make_svd_bundle(root, handle="small", bundle_id="small", sizes=[[128, 64]])
+        self.catalog["small"] = str(root)
+        self.load(small)
+        self.assertEqual(self.worker.capabilities()["limits"]["video_sizes"], [[128, 64]])
+        self.load(self.bundle)
+        self.assertEqual(self.worker.capabilities()["limits"]["video_sizes"], [[64, 64], [1024, 576], [576, 1024]])
+
+    def test_svd_bundle_layout_is_checked(self):
+        import json as _json
+
+        root = self.root / "video"
+        self.assertEqual(bundle_path(self.video, self.catalog), root.resolve())
+        (root / "video.json").write_text(_json.dumps({"sizes": [[65, 64]]}))
+        bad = describe_bundle(root, "video", "bad", "svd")
+        self.assertEqual(self.code(bundle_path, bad, self.catalog), ("unsupported", "configuration"))
+        (root / "video.json").write_text(_json.dumps({"sizes": [[64, 64]], "fps": 7}))
+        bad = describe_bundle(root, "video", "bad", "svd")
+        self.assertEqual(self.code(bundle_path, bad, self.catalog), ("unsupported", "configuration"))
+        (root / "video.json").unlink()
+        reference = describe_bundle(root, "video", "reference-sizes", "svd")
+        from media_engine.contracts import family_facts
+
+        bundle_path(reference, self.catalog)
+        self.assertEqual(family_facts(root, "svd")["video_sizes"], [[1024, 576], [576, 1024]])
+        unet = _json.loads((root / "unet/config.json").read_text())
+        (root / "unet/config.json").write_text(_json.dumps({**unet, "num_frames": 65}))
+        bad = describe_bundle(root, "video", "bad", "svd")
+        self.assertEqual(self.code(bundle_path, bad, self.catalog), ("unsupported", "configuration"))
+        index = _json.loads((root / "model_index.json").read_text())
+        (root / "unet/config.json").write_text(_json.dumps(unet))
+        (root / "model_index.json").write_text(_json.dumps({**index, "_class_name": "StableDiffusionXLPipeline"}))
+        bad = describe_bundle(root, "video", "bad", "svd")
+        self.assertEqual(self.code(bundle_path, bad, self.catalog), ("unsupported", "pipeline"))
+        # An sdxl-base registration of an svd directory fails on its roles, not later.
+        self.assertEqual(self.code(bundle_path, dict(self.bundle, family="svd"), self.catalog)[0], "unsupported")
+
+    def test_validation_and_older_callers(self):
+        record = self.worker.store_input(make_png(64, 64))
+        body = self.request(record["input_id"])
+        validated = self.worker.validate_execution(body)
+        self.assertEqual(validated["outputs"], ["frames", "poster"])
+        self.assertEqual(validated["effective_steps"], 3)
+        self.assertNotIn("frames", validated["effective_settings"])  # bundle default: not loaded yet
+        self.load()
+        validated = self.worker.validate_execution(body)
+        self.assertEqual(
+            validated["effective_settings"],
+            {"width": 64, "height": 64, "seed": 9, "steps": 3, "frames": 2, "fps": 7, "motion": 127,
+             "noise_augmentation": 0.02, "decode_chunk": 8, "min_guidance": 1.0, "max_guidance": 3.0,
+             "effective_steps": 3},
+        )
+        cases = {
+            ("invalid_request", "prompt"): {"inputs": {"image": record["input_id"], "prompt": "x"}},
+            ("invalid_request", "image"): {"inputs": {"image": "elsewhere.png"}},
+            ("invalid_request", "steps"): {"steps": 51},
+            ("invalid_request", "frames"): {"frames": 65},
+            ("invalid_request", "fps"): {"fps": 0},
+            ("invalid_request", "motion"): {"motion": 256},
+            ("invalid_request", "noise_augmentation"): {"noise_augmentation": True},
+            ("invalid_request", "decode_chunk"): {"decode_chunk": 17},
+            ("invalid_request", "seed"): {"seed": -1},
+            ("invalid_request", None): {"guidance": 3},
+            ("invalid_request", "video_size"): {"width": 128},
+        }
+        for expected, change in cases.items():
+            broken = self.request(record["input_id"], "attempt_" + str(len(expected[1] or "")))
+            if "inputs" in change:
+                broken["inputs"] = change["inputs"]
+            else:
+                broken["parameters"].update(change)
+            self.assertEqual(self.code(self.worker.submit, broken), expected, change)
+        # An advertised size the input does not have: the input is never resized.
+        self.assertEqual(self.code(self.worker.submit, self.request(record["input_id"], width=1024, height=576)), ("invalid_request", "width"))
+        # A 1.2 caller sees no video: the task, the family and the svd bundle are all refused.
+        self.assertEqual(self.code(self.worker.submit, self.request(record["input_id"], protocol="media-worker/1.2")), ("unsupported", "task"))
+        self.assertEqual(self.code(self.worker.validate_execution, self.request(record["input_id"], protocol="media-worker/1.2")), ("unsupported", "task"))
+        old_load = {"protocol": "media-worker/1.2", "bundle": self.video, "options": self.backend.capabilities()["load_defaults"]}
+        self.assertEqual(self.code(self.worker.validate_load, old_load), ("unsupported", "family"))
+        self.assertEqual(self.code(bundle_path, self.video, self.catalog, True, "media-worker/1.2"), ("unsupported", "family"))
+        # Task routing by the loaded family, both ways.
+        t2i = {**self.request(record["input_id"]), "task": "text-to-image", "inputs": {"prompt": "x"},
+               "parameters": {**DEFAULTS, "seed": 1, "width": 64, "height": 64}}
+        self.assertEqual(self.code(self.worker.submit, t2i), ("unsupported", "task"))
+        self.load(self.bundle)
+        self.assertEqual(self.code(self.worker.submit, dict(self.request(record["input_id"]), bundle_digest=self.bundle["bundle_digest"])), ("unsupported", "task"))
+
+    def test_owned_backend_does_not_serve_svd(self):
+        from media_engine.backend import DiffusersBackend, TorchBackend
+        from media_engine.pipeline import OwnedPipelineBackend
+
+        self.assertIn("svd", DiffusersBackend.families)
+        self.assertNotIn("svd", OwnedPipelineBackend.families)
+        owned = Worker(self.root / "owned", OwnedPipelineBackend("cpu"), self.catalog)
+        body = {"protocol": PROTOCOL, "bundle": self.video, "options": {"precision": "float32", "attention": "sdpa", "offload": "none"}}
+        self.assertEqual(self.code(owned.validate_load, body), ("unsupported", "family"))
+        self.assertNotIn("svd", OwnedPipelineBackend("cpu").served_families())
+        self.assertEqual(self.code(OwnedPipelineBackend("cpu").load, self.root / "video", body["options"], (), "svd"), ("unsupported", "family"))
+        self.assertTrue(issubclass(DiffusersBackend, TorchBackend))
+
+    def test_execution_outputs_progress_and_storage(self):
+        from media_engine import video
+
+        self.load()
+        record = self.worker.store_input(make_png(64, 64))
+        snap = self.wait(self.worker.submit(self.request(record["input_id"], decode_chunk=1))["execution_id"])
+        self.assertEqual(snap["state"], "succeeded", snap["error"])
+        self.assertEqual([e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"],
+                         ["encoding", "sampling", "decoding", "packaging", "saving"])
+        decoding = [e["data"] for e in snap["events"] if e["type"] == "progress" and e["data"]["stage"] == "decoding"]
+        self.assertEqual([(d["unit"], d["completed_steps"], d["total_steps"]) for d in decoding], [("frames", 1, 2), ("frames", 2, 2)])
+        frames, poster = snap["outputs"]
+        self.assertEqual(
+            {k: frames[k] for k in ("output_id", "mime_type", "width", "height", "frames", "fps", "duration_seconds")},
+            {"output_id": "frames", "mime_type": "application/zip", "width": 64, "height": 64, "frames": 2, "fps": 7, "duration_seconds": 2 / 7},
+        )
+        self.assertEqual(set(poster), {"output_id", "mime_type", "size", "sha256", "width", "height"})
+        self.assertEqual(snap["effective_settings"]["frames"], 2)
+        self.assertEqual(snap["measurements"]["frames"], 2)
+        folder = self.worker.directory / snap["execution_id"]
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["frames.zip", "poster.png"])
+        manifest, pngs = video.read_archive(folder / "frames.zip")
+        self.assertEqual(manifest, {"fps": 7, "width": 64, "height": 64, "frames": 2})
+        self.assertEqual((folder / "poster.png").read_bytes(), pngs[0])
+        self.assertNotEqual(pngs[0], pngs[1])
+        self.assertGreaterEqual(self.worker.storage_used(), frames["size"] + poster["size"])
+        # Same seed and settings, same archive bytes (fixed member timestamps).
+        again = self.wait(self.worker.submit(self.request(record["input_id"], "attempt_again", decode_chunk=1))["execution_id"])
+        self.assertEqual(again["outputs"][0]["sha256"], frames["sha256"])
+        longer = self.wait(self.worker.submit(self.request(record["input_id"], "attempt_longer", frames=5, fps=10, decode_chunk=2))["execution_id"])
+        self.assertEqual((longer["outputs"][0]["frames"], longer["outputs"][0]["duration_seconds"]), (5, 0.5))
+        decoding = [e["data"]["completed_steps"] for e in longer["events"] if e["type"] == "progress" and e["data"]["stage"] == "decoding"]
+        self.assertEqual(decoding, [2, 4, 5])
+        self.worker.release(snap["execution_id"])
+        self.assertFalse(folder.exists())
+        token = "z" * 40
+        server = create_server(self.worker, token, 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import hashlib
+
+            for output in longer["outputs"]:
+                response = urllib.request.urlopen(urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/v1/executions/{longer['execution_id']}/outputs/{output['output_id']}",
+                    headers={"Authorization": "Bearer " + token},
+                ))
+                self.assertEqual(response.headers["Content-Type"], output["mime_type"])
+                self.assertEqual(hashlib.sha256(response.read()).hexdigest(), output["sha256"])
+        finally:
+            server.shutdown()
+            server.server_close()
+        # An archive that cannot fit is refused before sampling, never shortened.
+        large = self.worker.store_input(make_png(1024, 576))
+        self.worker.max_storage_mb = 100
+        body = self.request(large["input_id"], "attempt_large", width=1024, height=576, frames=64)
+        self.assertEqual(self.code(self.worker.submit, body), ("storage_full", None))
+
+    def test_cancellation_per_step_and_per_decode_chunk(self):
+        self.load()
+        record = self.worker.store_input(make_png(64, 64))
+        run = self.worker.submit(self.request(record["input_id"], steps=50))
+        while not self.worker.snapshot(run["execution_id"])["progress"]:
+            time.sleep(0.01)
+        self.worker.cancel(run["execution_id"])
+        cancelled = self.wait(run["execution_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertLess(cancelled["progress"]["completed_steps"], 50)
+        self.assertFalse((self.worker.directory / run["execution_id"]).exists())
+        run = self.worker.submit(self.request(record["input_id"], "attempt_decode", steps=1, frames=64, decode_chunk=1))
+        while (self.worker.snapshot(run["execution_id"])["progress"] or {}).get("stage") != "decoding":
+            time.sleep(0.005)
+        self.worker.cancel(run["execution_id"])
+        cancelled = self.wait(run["execution_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertEqual(cancelled["progress"]["unit"], "frames")
+        self.assertLess(cancelled["progress"]["completed_steps"], 64)
+        self.assertEqual(cancelled["outputs"], [])
+        self.assertNotIn("packaging", [e["data"]["stage"] for e in cancelled["events"] if e["type"] == "stage"])
+
+    def test_pinned_to_1_2_reproduces_the_0_5_0_surface(self):
+        protocols = ("media-worker/1.0", "media-worker/1.1", "media-worker/1.2")
+        backend = TestBackend(protocols=protocols)
+        pinned = Worker(self.root / "pinned", backend, self.catalog, protocols=protocols)
+        caps = pinned.capabilities()
+        self.assertEqual(caps["tasks"], ["text-to-image", "image-to-image", "upscale"])
+        self.assertEqual(caps["model_families"], ["sdxl-base", "esrgan"])
+        self.assertNotIn("image-to-video", caps["task_parameters"])
+        self.assertNotIn("image-to-video", caps["task_defaults"])
+        self.assertFalse(set(caps["limits"]) & {"video_sizes", "frames", "video_steps"})
+        info = pinned.info()
+        self.assertEqual((info["protocol"], info["supported_protocols"]), ("media-worker/1.2", list(protocols)))
+        record = pinned.store_input(make_png(64, 64))
+        self.assertEqual(self.code(pinned.submit, self.request(record["input_id"])), ("protocol_mismatch", "protocol"))
+        self.assertEqual(self.code(pinned.submit, self.request(record["input_id"], protocol="media-worker/1.2")), ("unsupported", "task"))
+
+
+class FrameArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_round_trip_is_stored_and_reproducible(self):
+        import zipfile
+        from media_engine import png, video
+
+        frames = [png.write(16, 8, bytes((k, 2 * k, 3 * k)) * 128) for k in range(3)]
+        first, second = self.root / "a.zip", self.root / "b.zip"
+        self.assertEqual(video.write_archive(first, frames, 12, 16, 8), {"fps": 12, "width": 16, "height": 8, "frames": 3})
+        time.sleep(1.1)  # a different wall-clock second must not change the bytes
+        video.write_archive(second, frames, 12, 16, 8)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        manifest, decoded = video.read_archive(first)
+        self.assertEqual((manifest["frames"], decoded), (3, frames))
+        with zipfile.ZipFile(first) as archive:
+            self.assertEqual(archive.namelist(), ["frames.json", "000001.png", "000002.png", "000003.png"])
+            self.assertEqual({i.compress_type for i in archive.infolist()}, {zipfile.ZIP_STORED})
+        self.assertEqual(video.frame_name(12), "000012.png")
+        with self.assertRaises(ValueError):
+            video.write_archive(self.root / "c.zip", frames, 12, 8, 8)  # frames are 16×8
+
+    def test_reader_refuses_what_is_not_a_frame_archive(self):
+        import zipfile
+        from media_engine import png, video
+
+        frame = png.write(8, 8, bytes(192))
+        cases = {
+            "deflated": [("frames.json", '{"fps": 1, "width": 8, "height": 8, "frames": 1}', zipfile.ZIP_DEFLATED), ("000001.png", frame, zipfile.ZIP_DEFLATED)],
+            "no manifest": [("000001.png", frame, zipfile.ZIP_STORED)],
+            "count": [("frames.json", '{"fps": 1, "width": 8, "height": 8, "frames": 2}', zipfile.ZIP_STORED), ("000001.png", frame, zipfile.ZIP_STORED)],
+            "size": [("frames.json", '{"fps": 1, "width": 16, "height": 8, "frames": 1}', zipfile.ZIP_STORED), ("000001.png", frame, zipfile.ZIP_STORED)],
+            "extra": [("frames.json", '{"fps": 1, "width": 8, "height": 8, "frames": 1, "codec": "x"}', zipfile.ZIP_STORED), ("000001.png", frame, zipfile.ZIP_STORED)],
+        }
+        for name, members in cases.items():
+            path = self.root / (name + ".zip")
+            with zipfile.ZipFile(path, "w") as archive:
+                for member, data, compression in members:
+                    archive.writestr(member, data, compress_type=compression)
+            with self.assertRaises(ValueError, msg=name):
+                video.read_manifest(path)
+        (self.root / "plain.zip").write_bytes(b"not a zip at all")
+        with self.assertRaises(ValueError):
+            video.read_manifest(self.root / "plain.zip")
 
 
 if __name__ == "__main__":

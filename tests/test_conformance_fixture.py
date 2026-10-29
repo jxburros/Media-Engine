@@ -64,9 +64,18 @@ class ConformanceFixtureTests(unittest.TestCase):
                 os.environ[key] = value
         return run_suite(stream=io.StringIO())
 
-    def test_fixture_is_conformant_at_1_2(self):
+    def test_fixture_is_conformant_at_1_3(self):
         root, token, record = self.launch()
+        self.assertEqual(record["highest_protocol"], "media-worker/1.3")
+        self.assertEqual(record["protocol"], "media-worker/1.1")
+        conformant, sections = self.suite(root, token, record)
+        self.assertTrue(conformant, sections)
+
+    def test_fixture_is_conformant_pinned_to_1_2(self):
+        root, token, record = self.launch("--protocol", "media-worker/1.2")
+        self.assertEqual(record["supported_protocols"][-1], "media-worker/1.2")
         self.assertEqual(record["highest_protocol"], "media-worker/1.2")
+        self.assertIn("device_identity", record)
         conformant, sections = self.suite(root, token, record)
         self.assertTrue(conformant, sections)
 
@@ -96,13 +105,15 @@ class ConformanceFixtureTests(unittest.TestCase):
         identity = record["device_identity"]
         self.assertEqual(identity["index"], 3)
         catalog = json.loads((root / "catalog.json").read_text())
-        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint"})
+        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video"})
         self.assertEqual(
             [p.name for p in (root / "checkpoint").iterdir()], ["checkpoint.safetensors"]
         )
         registrations = json.loads((root / "registrations.json").read_text())
         self.assertEqual(registrations["upscaler"]["format"], "single-file-safetensors")
         self.assertIn("conversion", registrations["converted"]["source"])
+        self.assertEqual(registrations["video"]["family"], "svd")
+        self.assertEqual(registrations["video"]["pipeline"], "image-to-video")
         _root, _token, other = self.launch()
         self.assertNotEqual(other["device_identity"]["host_id"], identity["host_id"])
 

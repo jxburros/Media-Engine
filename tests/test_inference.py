@@ -3,7 +3,9 @@
 Skipped unless the inference extra is installed. The bundle is architecturally SDXL base
 (dual CLIP conditioning, time-id embedding, Euler scheduler, KL VAE) with tiny dimensions and
 random weights, so it proves the owned pipeline and the reference pipeline execute the same
-protocol end to end; it says nothing about image quality or hardware compatibility.
+protocol end to end; it says nothing about image quality or hardware compatibility. The svd
+bundle (spatio-temporal UNet, temporal-decoder VAE, CLIP image encoder, Euler scheduler) is tiny
+and random in the same way and runs image-to-video through the reference backend only.
 """
 
 import hashlib
@@ -26,6 +28,8 @@ HAVE_OWNED = all(
 HAVE_INFERENCE = HAVE_OWNED and all(
     importlib.util.find_spec(m) is not None for m in ("PIL", "accelerate", "peft", "numpy")
 )
+# image-to-video needs the svd model classes and Pillow, nothing beyond the base inference set.
+HAVE_VIDEO = HAVE_OWNED and importlib.util.find_spec("PIL") is not None
 
 
 def pixels(data):
@@ -193,6 +197,80 @@ def tiny_esrgan_bundle(root, scale=2):
     return describe_bundle(root, "tiny-upscaler", "tiny-upscaler", "esrgan")
 
 
+def tiny_svd_bundle(root, frames=2):
+    """A random-weight Stable Video Diffusion bundle at 64×64 (VAE factor 2, two frames)."""
+    import torch
+    from diffusers import (
+        AutoencoderKLTemporalDecoder,
+        EulerDiscreteScheduler,
+        StableVideoDiffusionPipeline,
+        UNetSpatioTemporalConditionModel,
+    )
+    from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModelWithProjection
+
+    torch.manual_seed(4)
+    unet = UNetSpatioTemporalConditionModel(
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        sample_size=32,
+        in_channels=8,
+        out_channels=4,
+        down_block_types=("CrossAttnDownBlockSpatioTemporal", "DownBlockSpatioTemporal"),
+        up_block_types=("UpBlockSpatioTemporal", "CrossAttnUpBlockSpatioTemporal"),
+        cross_attention_dim=32,
+        num_attention_heads=(2, 4),
+        # fps, motion bucket and noise augmentation, each embedded in 8 dimensions.
+        projection_class_embeddings_input_dim=24,
+        addition_time_embed_dim=8,
+        num_frames=frames,
+    )
+    vae = AutoencoderKLTemporalDecoder(
+        block_out_channels=[32, 64],
+        in_channels=3,
+        out_channels=3,
+        down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
+        latent_channels=4,
+        layers_per_block=1,
+    )
+    # The pipeline resizes the conditioning image to 224 for CLIP; 32-pixel patches keep it tiny.
+    encoder = CLIPVisionModelWithProjection(
+        CLIPVisionConfig(
+            hidden_size=32,
+            projection_dim=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=224,
+            intermediate_size=37,
+            patch_size=32,
+        )
+    )
+    scheduler = EulerDiscreteScheduler(
+        beta_schedule="scaled_linear",
+        beta_start=0.00085,
+        beta_end=0.012,
+        interpolation_type="linear",
+        num_train_timesteps=1000,
+        prediction_type="v_prediction",
+        sigma_max=700.0,
+        sigma_min=0.002,
+        steps_offset=1,
+        timestep_spacing="leading",
+        timestep_type="continuous",
+        use_karras_sigmas=True,
+    )
+    pipe = StableVideoDiffusionPipeline(
+        vae=vae,
+        image_encoder=encoder,
+        unet=unet,
+        scheduler=scheduler,
+        feature_extractor=CLIPImageProcessor(crop_size=224, size=224),
+    )
+    root = Path(root)
+    pipe.save_pretrained(str(root), safe_serialization=True)
+    (root / "video.json").write_text(json.dumps({"sizes": [[64, 64]]}))
+    return describe_bundle(root, "tiny-video", "tiny-svd", "svd", source={"license": "test-only random weights"})
+
+
 class Harness:
     @classmethod
     def setUpClass(cls):
@@ -201,6 +279,7 @@ class Harness:
         cls.model_dir, cls.bundle = tiny_sdxl_bundle(cls.root)
         cls.adapter = tiny_lora(cls.root / "lora", cls.model_dir)
         cls.upscaler = tiny_esrgan_bundle(cls.root / "upscaler")
+        cls.video = tiny_svd_bundle(cls.root / "video") if HAVE_VIDEO else None
 
     @classmethod
     def tearDownClass(cls):
@@ -218,6 +297,7 @@ class Harness:
                 "tiny": str(self.model_dir),
                 "tiny-lora": str(self.root / "lora"),
                 "tiny-upscaler": str(self.root / "upscaler"),
+                "tiny-video": str(self.root / "video"),
             },
         )
 
@@ -466,6 +546,109 @@ class InferenceTests(Harness, unittest.TestCase):
         owned = self.exercise("owned-sdxl", adapters)["text-to-image"]
         self.assertGreater(mean_difference(base, owned), 1)
         self.assertLessEqual(difference(reference, owned), 2)
+
+
+@unittest.skipUnless(HAVE_VIDEO, "inference extra (svd model classes and Pillow) is not installed")
+class VideoInferenceTests(Harness, unittest.TestCase):
+    def video_request(self, attempt, input_id, **params):
+        return {
+            "protocol": PROTOCOL,
+            "attempt_id": attempt,
+            "bundle_digest": self.video["bundle_digest"],
+            "task": "image-to-video",
+            "inputs": {"image": input_id},
+            "parameters": {"width": 64, "height": 64, "seed": 3, "steps": 2, **params},
+        }
+
+    def test_reference_image_to_video(self):
+        """64×64, two frames, two steps through StableVideoDiffusionPipeline on CPU float32."""
+        import zipfile
+
+        from media_engine import video
+
+        worker = self.worker("diffusers-sdxl")
+        caps = worker.capabilities()
+        self.assertIn("image-to-video", caps["tasks"])
+        self.assertIn(["svd"], [l["families"] for l in caps["loaders"]])
+        loaded = self.load(worker, self.video)
+        self.assertGreater(loaded["memory_estimate"]["latents_mb"] + loaded["memory_estimate"]["value_mb"], 0)
+        self.assertEqual(worker.info()["loaded_bundle"]["default_frames"], 2)
+        record = worker.store_input(make_png(64, 64, (0xC0, 0x40, 0x20)))
+        snap = self.run_request(worker, self.video_request("attempt_video", record["input_id"], decode_chunk=1, fps=6))
+        self.assertEqual(
+            [e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"],
+            ["encoding", "sampling", "decoding", "packaging", "saving"],
+        )
+        progress = [e["data"] for e in snap["events"] if e["type"] == "progress"]
+        self.assertEqual([p["completed_steps"] for p in progress if p["stage"] == "sampling"], [1, 2])
+        self.assertEqual([(p["unit"], p["completed_steps"]) for p in progress if p["stage"] == "decoding"], [("frames", 1), ("frames", 2)])
+        frames, poster = snap["outputs"]
+        self.assertEqual((frames["frames"], frames["fps"], frames["duration_seconds"]), (2, 6, 2 / 6))
+        folder = worker.directory / snap["execution_id"]
+        archive = folder / "frames.zip"
+        manifest, pngs = video.read_archive(archive)
+        self.assertEqual(manifest, {"fps": 6, "width": 64, "height": 64, "frames": 2})
+        with zipfile.ZipFile(archive) as opened:
+            self.assertEqual(sorted(opened.namelist()), ["000001.png", "000002.png", "frames.json"])
+        self.assertEqual([png.header(f)[:2] for f in pngs], [(64, 64), (64, 64)])
+        self.assertEqual((folder / "poster.png").read_bytes(), pngs[0])
+        self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), frames["sha256"])
+        self.assertEqual(snap["measurements"]["decode_chunks"], 2)
+        # Same seed and settings reproduce the archive bytes on this CPU stack; another seed does
+        # not. (decode_chunk changes what the temporal decoder sees together, so only like is
+        # compared with like.)
+        again = self.run_request(worker, self.video_request("attempt_again", record["input_id"], decode_chunk=1, fps=6))
+        self.assertEqual(again["outputs"][0]["sha256"], frames["sha256"])
+        other = self.run_request(worker, self.video_request("attempt_other", record["input_id"], decode_chunk=1, fps=6, seed=4))
+        self.assertNotEqual(other["outputs"][0]["sha256"], frames["sha256"])
+        whole = self.run_request(worker, self.video_request("attempt_whole", record["input_id"]))
+        self.assertEqual(whole["measurements"]["decode_chunks"], 1)
+        self.assertEqual(whole["outputs"][0]["frames"], 2)
+        cancelled = worker.submit(self.video_request("attempt_cancel", record["input_id"], steps=50))
+        worker.cancel(cancelled["execution_id"])
+        self.assertEqual(self.finish(worker, execution=cancelled["execution_id"])["state"], "cancelled")
+
+    def test_frames_match_the_library_pipeline(self):
+        """Our per-chunk decode and PNG writer give the pixels StableVideoDiffusionPipeline returns."""
+        import torch
+        from diffusers import StableVideoDiffusionPipeline
+        from PIL import Image
+
+        from media_engine import video
+
+        worker = self.worker("diffusers-sdxl")
+        self.load(worker, self.video)
+        image = make_png(64, 64, (0x30, 0x80, 0xA0))
+        record = worker.store_input(image)
+        snap = self.run_request(worker, self.video_request("attempt_match", record["input_id"], decode_chunk=2))
+        _, ours = video.read_archive(worker.directory / snap["execution_id"] / "frames.zip")
+        pipe = StableVideoDiffusionPipeline.from_pretrained(str(self.root / "video"), local_files_only=True, use_safetensors=True)
+        pipe.set_progress_bar_config(disable=True)
+        with torch.inference_mode():
+            frames = pipe(
+                Image.new("RGB", (64, 64), (0x30, 0x80, 0xA0)),
+                height=64,
+                width=64,
+                num_frames=2,
+                num_inference_steps=2,
+                fps=7,
+                motion_bucket_id=127,
+                noise_aug_strength=0.02,
+                decode_chunk_size=2,
+                generator=torch.Generator("cpu").manual_seed(3),
+                output_type="pt",
+            ).frames[0]
+        for ours_frame, theirs in zip(ours, frames):
+            self.assertLessEqual(difference(ours_frame, png.tensor_to_png(theirs)), 1)
+
+    def test_owned_backend_refuses_svd(self):
+        worker = self.worker("owned-sdxl")
+        self.assertNotIn("image-to-video", worker.capabilities()["tasks"])
+        from media_engine.contracts import WorkerError
+
+        with self.assertRaises(WorkerError) as caught:
+            worker.validate_load({"protocol": PROTOCOL, "bundle": self.video, "options": worker.capabilities()["load_defaults"]})
+        self.assertEqual((caught.exception.code, caught.exception.field), ("unsupported", "family"))
 
 
 if __name__ == "__main__":

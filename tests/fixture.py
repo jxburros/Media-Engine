@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import random
 import struct
 import time
 import zlib
@@ -19,15 +20,19 @@ from media_engine.contracts import (
     SUPPORTED_PROTOCOLS,
     TASK_DEFAULTS,
     TASKS,
+    VIDEO_LIMITS,
     digest,
     effective_steps,
     memory_estimate,
+    minor,
     output_ids,
+    video_facts,
 )
 from media_engine import png as png_module
+from media_engine import video
 from media_engine.upscale import architecture, tile_count, validate_config
 
-FIXTURE_VERSION = "0.5.0-test-fixture"
+FIXTURE_VERSION = "0.6.0-test-fixture"
 NOTICE = "TEST FIXTURE ONLY - NOT MODEL WEIGHTS"
 
 
@@ -42,6 +47,21 @@ def zero_safetensors(shapes):
         offset += size
     encoded = json.dumps(header).encode()
     return struct.pack("<Q", len(encoded)) + encoded + bytes(offset)
+
+
+def random_safetensors(shapes, seed):
+    """A valid safetensors container of small seeded pseudo-random F32 values; never model weights."""
+    generator = random.Random(seed)
+    header, offset, data = {"__metadata__": {"fixture": NOTICE}}, 0, []
+    for name, shape in shapes.items():
+        count = 1
+        for dim in shape:
+            count *= dim
+        data.append(struct.pack(f"<{count}f", *(generator.uniform(-0.1, 0.1) for _ in range(count))))
+        header[name] = {"dtype": "F32", "shape": shape, "data_offsets": [offset, offset + 4 * count]}
+        offset += 4 * count
+    encoded = json.dumps(header).encode()
+    return struct.pack("<Q", len(encoded)) + encoded + b"".join(data)
 
 
 def fixture_safetensors(role):
@@ -184,6 +204,43 @@ def make_esrgan_bundle(root, handle="upscaler", bundle_id="fixture-upscaler", **
     return describe_bundle(root, handle, bundle_id, "esrgan")
 
 
+# 64×64 lets supervisors' tests stay small; the reference sizes are listed too.
+SVD_SIZES = [[64, 64], [1024, 576], [576, 1024]]
+
+
+def make_svd_bundle(root, handle="video", bundle_id="fixture-video", frames=2, sizes=SVD_SIZES):
+    """An svd directory with tiny random stand-in weights, `num_frames` 2 and declared sizes.
+
+    The weights are a few seeded random floats per role, not a network: the fixture backend never
+    reads them, and the real svd bundle for inference tests is built in test_inference.py.
+    """
+    root = Path(root)
+    roles = {r: list(c) for r, c in FAMILIES["svd"]["approved_classes"].items()}
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model_index.json").write_text(
+        json.dumps({"_class_name": "StableVideoDiffusionPipeline", **roles}, indent=2, sort_keys=True)
+    )
+    configs = {
+        "unet": ("config.json", {"_class_name": "UNetSpatioTemporalConditionModel", "in_channels": 8, "num_frames": frames}),
+        "vae": ("config.json", {"_class_name": "AutoencoderKLTemporalDecoder", "block_out_channels": [32, 64]}),
+        "image_encoder": ("config.json", {"model_type": "clip_vision_model"}),
+        "feature_extractor": ("preprocessor_config.json", {"image_processor_type": "CLIPImageProcessor"}),
+        "scheduler": ("scheduler_config.json", {"_class_name": "EulerDiscreteScheduler"}),
+    }
+    weights = {"unet": "diffusion_pytorch_model", "vae": "diffusion_pytorch_model", "image_encoder": "model"}
+    for index, (role, (name, config)) in enumerate(configs.items()):
+        folder = root / role
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_text(json.dumps(config, indent=2, sort_keys=True))
+        if role in weights:
+            (folder / (weights[role] + ".safetensors")).write_bytes(
+                random_safetensors({role + ".weight": [4, 2]}, index)
+            )
+    if sizes is not None:
+        (root / "video.json").write_text(json.dumps({"sizes": sizes}))
+    return describe_bundle(root, handle, bundle_id, "svd")
+
+
 def make_checkpoint(root):
     """A bare single-file SDXL-style checkpoint: one safetensors file, no model_index/config."""
     root = Path(root)
@@ -260,11 +317,17 @@ class TestBackend:
         self.applied_fallbacks = []
         self.family = None
         self.scale = None
+        self.default_frames = None
         self.loaded_options = None
 
     @property
+    def level(self):
+        """The highest minor served: 1 reproduces the 0.3.0 surface, 2 the 0.5.0 surface."""
+        return minor(self.protocols[-1])
+
+    @property
     def current(self):
-        return "media-worker/1.2" in self.protocols
+        return self.level >= 2
 
     def capabilities(self):
         caps = {
@@ -310,15 +373,20 @@ class TestBackend:
         }
         if not self.current:
             return caps  # Pinned to 1.1: exactly the 0.3.0 fixture's surface.
-        limits = dict(LIMITS)
+        # Pinned to 1.2: exactly the 0.5.0 fixture's surface (no svd, video limits or task).
+        families = {n: f for n, f in FAMILIES.items() if f["since"] <= self.level}
+        tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values())]
+        limits = {k: v for k, v in LIMITS.items() if self.level >= 3 or k not in VIDEO_LIMITS}
+        if self.level >= 3:
+            limits["video_sizes"] = SVD_SIZES  # what the fixture's video bundle serves
         if self.output_side:
             limits["output_side"] = self.output_side
         caps.update(
-            task_defaults=TASK_DEFAULTS,
+            task_defaults={k: v for k, v in TASK_DEFAULTS.items() if k in tasks},
             limits=limits,
-            tasks=list(TASKS),
-            task_parameters=task_parameters(TASKS),
-            model_families=list(FAMILIES),
+            tasks=tasks,
+            task_parameters=task_parameters(tasks),
+            model_families=list(families),
             loaders=[
                 {
                     "format": spec["format"],
@@ -327,7 +395,7 @@ class TestBackend:
                     "tasks": list(spec["tasks"]),
                     "ownership": "owned" if name == "esrgan" else self.ownership,
                 }
-                for name, spec in FAMILIES.items()
+                for name, spec in families.items()
             ],
             formats=list(FORMATS),
             auto_options=AUTO_OPTIONS,
@@ -387,16 +455,20 @@ class TestBackend:
             if family == "esrgan"
             else None
         )
+        self.default_frames = video_facts(root)["default_frames"] if family == "svd" else None
         time.sleep(0.02)
 
     def unload(self):
         self.family, self.scale, self.run_device, self.applied_fallbacks = None, None, self.device, []
+        self.default_frames = None
         return {"allocated_mb": 0, "reserved_mb": 0}
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
         self.generations += 1
         if request["task"] == "upscale":
             return self.upscale(request, directory, emit, cancelled, image_path)
+        if request["task"] == "image-to-video":
+            return self.generate_video(request, directory, emit, cancelled, image_path)
         if request["task"] == "image-to-image":
             # The fixture proves the handle resolves to the uploaded bytes; it does not sample.
             assert Path(image_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
@@ -479,3 +551,51 @@ class TestBackend:
             "height": height * self.scale,
         }
         return [record], {"test_fixture": True, "tiles": total, "peak_allocated_mb": 0}
+
+    def generate_video(self, request, directory, emit, cancelled, image_path):
+        """Real stages, progress, checkpoints and archive; frames are flat colors, not inference."""
+        params = {**TASK_DEFAULTS["image-to-video"], **request["parameters"]}
+        width, height = png_module.header(Path(image_path).read_bytes())[:2]
+        assert (width, height) == (params["width"], params["height"])
+        frames = params.get("frames", self.default_frames)
+        emit("stage", {"stage": "encoding"})
+        time.sleep(0.02)
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "sampling"})
+        for step in range(params["steps"]):
+            time.sleep(0.03)
+            if cancelled.is_set():
+                raise Cancelled()
+            emit(
+                "progress",
+                {"stage": "sampling", "scope": "stage", "completed_steps": step + 1, "total_steps": params["steps"]},
+            )
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "decoding"})
+        pngs = []
+        for start in range(0, frames, params["decode_chunk"]):
+            if cancelled.is_set():
+                raise Cancelled()
+            time.sleep(0.02)
+            for k in range(start, min(start + params["decode_chunk"], frames)):
+                # Frame k is reproducible from seed + k, like output k of a text-to-image batch.
+                pngs.append(png_module.write(width, height, bytes(seed_color(params["seed"] + k)) * (width * height)))
+            emit(
+                "progress",
+                {"stage": "decoding", "scope": "stage", "unit": "frames", "completed_steps": len(pngs), "total_steps": frames},
+            )
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "packaging"})
+        archive = Path(directory) / "frames.zip"
+        video.write_archive(archive, pngs, params["fps"], width, height)
+        emit("stage", {"stage": "saving"})
+        poster = Path(directory) / "poster.png"
+        poster.write_bytes(pngs[0])
+        records = [
+            {"output_id": "frames", "path": archive, "mime_type": video.MIME_TYPE, "width": width, "height": height, "frames": frames, "fps": params["fps"]},
+            {"output_id": "poster", "path": poster, "mime_type": "image/png", "width": width, "height": height},
+        ]
+        return records, {"test_fixture": True, "effective_steps": params["steps"], "frames": frames, "peak_allocated_mb": 0}
