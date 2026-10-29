@@ -105,7 +105,7 @@ class ConformanceFixtureTests(unittest.TestCase):
         identity = record["device_identity"]
         self.assertEqual(identity["index"], 3)
         catalog = json.loads((root / "catalog.json").read_text())
-        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video"})
+        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video", "audio"})
         self.assertEqual(
             [p.name for p in (root / "checkpoint").iterdir()], ["checkpoint.safetensors"]
         )
@@ -114,6 +114,8 @@ class ConformanceFixtureTests(unittest.TestCase):
         self.assertIn("conversion", registrations["converted"]["source"])
         self.assertEqual(registrations["video"]["family"], "svd")
         self.assertEqual(registrations["video"]["pipeline"], "image-to-video")
+        self.assertEqual(registrations["audio"]["family"], "stable-audio-open")
+        self.assertEqual(registrations["audio"]["pipeline"], "text-to-audio")
         _root, _token, other = self.launch()
         self.assertNotEqual(other["device_identity"]["host_id"], identity["host_id"])
 

@@ -5,7 +5,10 @@ Skipped unless the inference extra is installed. The bundle is architecturally S
 random weights, so it proves the owned pipeline and the reference pipeline execute the same
 protocol end to end; it says nothing about image quality or hardware compatibility. The svd
 bundle (spatio-temporal UNet, temporal-decoder VAE, CLIP image encoder, Euler scheduler) is tiny
-and random in the same way and runs image-to-video through the reference backend only.
+and random in the same way and runs image-to-video through the reference backend only; so is the
+stable-audio-open bundle (diffusion transformer, Oobleck VAE at 1 kHz stereo, T5 encoder with a
+word-level fast tokenizer built offline, timing projection, cosine DPM-Solver scheduler), which
+runs text-to-audio through the reference backend only.
 """
 
 import hashlib
@@ -30,6 +33,8 @@ HAVE_INFERENCE = HAVE_OWNED and all(
 )
 # image-to-video needs the svd model classes and Pillow, nothing beyond the base inference set.
 HAVE_VIDEO = HAVE_OWNED and importlib.util.find_spec("PIL") is not None
+# text-to-audio needs the family's model classes plus torchsde (the inference-audio extra).
+HAVE_AUDIO = HAVE_OWNED and importlib.util.find_spec("torchsde") is not None
 
 
 def pixels(data):
@@ -271,6 +276,73 @@ def tiny_svd_bundle(root, frames=2):
     return describe_bundle(root, "tiny-video", "tiny-svd", "svd", source={"license": "test-only random weights"})
 
 
+def tiny_audio_bundle(root):
+    """A random-weight Stable Audio Open bundle: 1 kHz stereo, 8 samples per latent frame, 2.048 s.
+
+    The T5 tokenizer is a word-level `tokenizers` model wrapped as T5TokenizerFast and saved as
+    tokenizer.json, so neither the bundle nor the test needs sentencepiece or a download.
+    """
+    import torch
+    from diffusers import (
+        AutoencoderOobleck,
+        CosineDPMSolverMultistepScheduler,
+        StableAudioDiTModel,
+        StableAudioPipeline,
+    )
+    from diffusers.pipelines.stable_audio import StableAudioProjectionModel
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    from transformers import T5Config, T5EncoderModel, T5TokenizerFast
+
+    torch.manual_seed(5)
+    words = ["<pad>", "</s>", "<unk>"] + "a the soft loud rain drum bird wood hammer test tone".split()
+    model = Tokenizer(models.WordLevel({w: i for i, w in enumerate(words)}, unk_token="<unk>"))
+    model.pre_tokenizer = pre_tokenizers.Whitespace()
+    model.post_processor = processors.TemplateProcessing(single="$A </s>", special_tokens=[("</s>", 1)])
+    tokenizer = T5TokenizerFast(
+        tokenizer_object=model, pad_token="<pad>", eos_token="</s>", unk_token="<unk>", extra_ids=0, model_max_length=16
+    )
+    encoder = T5EncoderModel(
+        T5Config(vocab_size=len(words), d_model=32, d_ff=37, d_kv=8, num_layers=2, num_heads=4, relative_attention_num_buckets=8)
+    )
+    vae = AutoencoderOobleck(
+        encoder_hidden_size=6,
+        downsampling_ratios=[2, 4],
+        decoder_channels=3,
+        decoder_input_channels=3,
+        audio_channels=2,
+        channel_multiples=[2, 4],
+        sampling_rate=1000,
+    )
+    transformer = StableAudioDiTModel(
+        sample_size=256,
+        in_channels=3,
+        num_layers=2,
+        attention_head_dim=4,
+        num_attention_heads=2,
+        num_key_value_attention_heads=2,
+        out_channels=3,
+        cross_attention_dim=4,
+        time_proj_dim=8,
+        global_states_input_dim=8,
+        cross_attention_input_dim=4,
+    )
+    projection = StableAudioProjectionModel(text_encoder_dim=32, conditioning_dim=4, min_value=0, max_value=32)
+    scheduler = CosineDPMSolverMultistepScheduler(
+        solver_order=2, prediction_type="v_prediction", sigma_data=1.0, sigma_schedule="exponential"
+    )
+    pipe = StableAudioPipeline(
+        vae=vae,
+        text_encoder=encoder,
+        projection_model=projection,
+        tokenizer=tokenizer,
+        transformer=transformer,
+        scheduler=scheduler,
+    )
+    root = Path(root)
+    pipe.save_pretrained(str(root), safe_serialization=True)
+    return describe_bundle(root, "tiny-audio", "tiny-audio", "stable-audio-open", source={"license": "test-only random weights"})
+
+
 class Harness:
     @classmethod
     def setUpClass(cls):
@@ -280,6 +352,7 @@ class Harness:
         cls.adapter = tiny_lora(cls.root / "lora", cls.model_dir)
         cls.upscaler = tiny_esrgan_bundle(cls.root / "upscaler")
         cls.video = tiny_svd_bundle(cls.root / "video") if HAVE_VIDEO else None
+        cls.audio = tiny_audio_bundle(cls.root / "audio") if HAVE_AUDIO else None
 
     @classmethod
     def tearDownClass(cls):
@@ -298,6 +371,7 @@ class Harness:
                 "tiny-lora": str(self.root / "lora"),
                 "tiny-upscaler": str(self.root / "upscaler"),
                 "tiny-video": str(self.root / "video"),
+                "tiny-audio": str(self.root / "audio"),
             },
         )
 
@@ -648,6 +722,123 @@ class VideoInferenceTests(Harness, unittest.TestCase):
 
         with self.assertRaises(WorkerError) as caught:
             worker.validate_load({"protocol": PROTOCOL, "bundle": self.video, "options": worker.capabilities()["load_defaults"]})
+        self.assertEqual((caught.exception.code, caught.exception.field), ("unsupported", "family"))
+
+
+@unittest.skipUnless(HAVE_AUDIO, "inference-audio extra (torchsde) or the model classes are not installed")
+class AudioInferenceTests(Harness, unittest.TestCase):
+    def audio_request(self, attempt, **params):
+        return {
+            "protocol": PROTOCOL,
+            "attempt_id": attempt,
+            "bundle_digest": self.audio["bundle_digest"],
+            "task": "text-to-audio",
+            "inputs": {"prompt": "soft rain", "negative_prompt": "loud drum"},
+            "parameters": {"seed": 3, "steps": 2, "duration_seconds": 1, **params},
+        }
+
+    def test_reference_text_to_audio(self):
+        """One second at 1 kHz stereo, two steps, through StableAudioPipeline on CPU float32."""
+        from media_engine import audio
+
+        worker = self.worker("diffusers-sdxl")
+        caps = worker.capabilities()
+        self.assertIn("text-to-audio", caps["tasks"])
+        self.assertIn(["stable-audio-open"], [l["families"] for l in caps["loaders"]])
+        self.assertEqual(caps["missing_task_dependencies"], {})
+        loaded = self.load(worker, self.audio)
+        roles = loaded["memory_estimate"]["roles"]
+        self.assertEqual(set(roles), {"transformer", "vae", "text_encoder", "projection_model"})
+        self.assertTrue(all(r["parameters"] > 0 for r in roles.values()))
+        facts = worker.info()["loaded_bundle"]
+        self.assertEqual(
+            {k: facts[k] for k in ("sample_rate", "channels", "hop_length", "duration_range")},
+            {"sample_rate": 1000, "channels": 2, "hop_length": 8, "duration_range": [1, 2]},
+        )
+        snap = self.run_request(worker, self.audio_request("attempt_audio"))
+        self.assertEqual(
+            [e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"],
+            ["encoding", "sampling", "decoding", "saving"],
+        )
+        progress = [e["data"] for e in snap["events"] if e["type"] == "progress"]
+        self.assertEqual([p["completed_steps"] for p in progress if p["stage"] == "sampling"], [1, 2])
+        (output,) = snap["outputs"]
+        # One second is 125 whole latent frames of 8 samples: exact, nothing added or removed.
+        self.assertEqual(
+            {k: output[k] for k in ("mime_type", "sample_rate", "channels", "samples", "duration_seconds")},
+            {"mime_type": "audio/wav", "sample_rate": 1000, "channels": 2, "samples": 1000, "duration_seconds": 1.0},
+        )
+        path = worker.directory / snap["execution_id"] / "audio.wav"
+        data = path.read_bytes()
+        self.assertEqual(data[:4] + data[8:16] + data[36:40], b"RIFFWAVEfmt data")
+        self.assertEqual(len(data), 44 + 1000 * 2 * 2)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), output["sha256"])
+        header, pcm = audio.read_wav(path)
+        self.assertEqual((header["sample_rate"], header["channels"], header["samples"]), (1000, 2, 1000))
+        self.assertGreater(len(set(pcm)), 2)  # not silence
+        self.assertEqual(snap["measurements"]["latent_frames"], 125)
+        # 1.005 s is 125.6 frames: rounded up to 126 frames, 1008 samples, and reported as 1.008 s.
+        rounded = self.run_request(worker, self.audio_request("attempt_rounded", duration_seconds=1.005))
+        self.assertEqual((rounded["outputs"][0]["samples"], rounded["outputs"][0]["duration_seconds"]), (1008, 1.008))
+        self.assertEqual(rounded["effective_settings"]["effective_duration_seconds"], 1.008)
+        self.assertEqual(rounded["effective_settings"]["duration_seconds"], 1.005)
+        # Same seed and settings reproduce the bytes on this CPU stack; another seed does not.
+        again = self.run_request(worker, self.audio_request("attempt_again"))
+        self.assertEqual(again["outputs"][0]["sha256"], output["sha256"])
+        other = self.run_request(worker, self.audio_request("attempt_other", seed=4))
+        self.assertNotEqual(other["outputs"][0]["sha256"], output["sha256"])
+        from media_engine.contracts import WorkerError
+
+        with self.assertRaises(WorkerError) as caught:
+            worker.submit(self.audio_request("attempt_long", duration_seconds=2.5))
+        self.assertEqual((caught.exception.code, caught.exception.field), ("invalid_request", "duration_seconds"))
+        with self.assertRaises(WorkerError) as caught:
+            worker.submit({**self.audio_request("attempt_old"), "protocol": "media-worker/1.2"})
+        self.assertEqual((caught.exception.code, caught.exception.field), ("unsupported", "task"))
+        cancelled = worker.submit(self.audio_request("attempt_cancel", steps=200))
+        worker.cancel(cancelled["execution_id"])
+        self.assertEqual(self.finish(worker, execution=cancelled["execution_id"])["state"], "cancelled")
+
+    def test_waveform_matches_the_library_pipeline(self):
+        """Our decode, cut and 16-bit writer give the samples StableAudioPipeline returns."""
+        import struct
+
+        import torch
+        from diffusers import StableAudioPipeline
+
+        from media_engine import audio
+
+        worker = self.worker("diffusers-sdxl")
+        self.load(worker, self.audio)
+        snap = self.run_request(worker, self.audio_request("attempt_match", duration_seconds=1.005, guidance=4))
+        _, ours = audio.read_wav(worker.directory / snap["execution_id"] / "audio.wav")
+        pipe = StableAudioPipeline.from_pretrained(str(self.root / "audio"), local_files_only=True, use_safetensors=True)
+        pipe.set_progress_bar_config(disable=True)
+        with torch.inference_mode():
+            # The worker conditions on, and returns, the effective duration (1.008 s).
+            theirs = pipe(
+                "soft rain",
+                negative_prompt="loud drum",
+                audio_end_in_s=1.008,
+                num_inference_steps=2,
+                guidance_scale=4,
+                generator=torch.Generator("cpu").manual_seed(3),
+                output_type="pt",
+            ).audios[0]
+        self.assertEqual(theirs.shape, (2, 1008))
+        expected = audio.pcm16(theirs.T.flatten().tolist())
+        ours_values = struct.unpack(f"<{len(ours) // 2}h", ours)
+        theirs_values = struct.unpack(f"<{len(expected) // 2}h", expected)
+        self.assertEqual(len(ours_values), len(theirs_values))
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(ours_values, theirs_values)), 1)
+
+    def test_owned_backend_refuses_audio(self):
+        worker = self.worker("owned-sdxl")
+        self.assertNotIn("text-to-audio", worker.capabilities()["tasks"])
+        from media_engine.contracts import WorkerError
+
+        with self.assertRaises(WorkerError) as caught:
+            worker.validate_load({"protocol": PROTOCOL, "bundle": self.audio, "options": worker.capabilities()["load_defaults"]})
         self.assertEqual((caught.exception.code, caught.exception.field), ("unsupported", "family"))
 
 
