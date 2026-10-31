@@ -32,7 +32,7 @@ Revision 0.1.0 of this specification described the reference worker. Engine 0.7.
 | Network mode for remote supervisors                   | Remote execution    | 1.2      | Delivered (loopback-tested) |
 | Image-to-video task and the `svd` family              | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
 | Text-to-audio task and the `stable-audio-open` family | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
-| Targeted optimization options                         | Optimization        | 1.3      | Specified below        |
+| Targeted optimization options                         | Optimization        | 1.3      | Delivered (none advertised until benchmarked on the reference hardware) |
 | Owned native engine and protocol conformance suite    | Owned engine        | 1.x      | Suite delivered        |
 
 Arbitrary graph import, executable recipe code, plugin marketplaces, in-process multi-device execution and model downloading remain outside this specification. Nothing in a later stage weakens a rule stated for an earlier one.

@@ -9,6 +9,7 @@ rows are never edited after release except to add later test evidence.
 
 | Engine | Protocol minors served | Startup record `protocol` | Runtime versions tested         | Platform tested                       | Families           | Extras                         | Conformance suite                |
 | ------ | ---------------------- | ------------------------- | ------------------------------- | ------------------------------------- | ------------------ | ------------------------------ | -------------------------------- |
+| 0.8.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video, text-to-audio, optimization options) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.7.0 (15/15 integration tests) and 0.8.0 (18/18) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP and mutual TLS, default and pinned); Runtime 0.9.0 and 0.10.0: see below | Linux x64, CPU only (4-core x86_64, AVX-512), Python 3.12.13 (venv, CPU torch 2.6.0 + torchao 0.9.0: inference, conformance, benchmark tool) / 3.13 (protocol tests) | sdxl-base, esrgan, svd, stable-audio-open (unchanged) | `inference`, `inference-owned`, `inference-audio` (unchanged pins), `inference-optimize` (new: `torchao==0.9.0`) | `media-worker-conformance/1.3` |
 | 0.7.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video and text-to-audio) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.6.0 (11/11 integration tests) and 0.7.0 (15/15) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0 video, 0.10.0 audio) | Linux x64, CPU only, Python 3.12.13 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd, stable-audio-open (svd and stable-audio-open on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins), `inference-audio` (new: `torchsde==0.2.6`) | `media-worker-conformance/1.2` |
 | 0.6.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video only) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.5.0 (8/8 integration tests) and 0.6.0 (11/11) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0) | Linux x64, CPU only, Python 3.12.3 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd (svd on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins; svd needs nothing beyond `inference`) | `media-worker-conformance/1.1` |
 | 0.5.0  | 1.0, 1.1, 1.2 (network mode fields within 1.2) | `media-worker/1.1` | 0.4.0 and 0.5.0 (Go, `go test ./...`, all packages pass; the fixture over loopback HTTP, default and 1.1-pinned); no network-mode consumer yet (Runtime 0.7.0) | Linux x64, CPU only, Python 3.13 (protocol and network tests); TLS on loopback only | sdxl-base, esrgan | `inference`, `inference-owned` (unchanged; not re-run, extras not installed) | `media-worker-conformance/1.0`, over loopback HTTP and mutual TLS |
@@ -20,6 +21,57 @@ rows are never edited after release except to add later test evidence.
 The 0.5.0 row names Runtime 0.7.0 as the network-mode consumer; the Runtime plan schedules
 network mode as Runtime 0.8.0 (R4) and image-to-video as 0.9.0 (R5), which the release map in
 [implementation-plan.md](implementation-plan.md) now matches.
+
+## Optimizations in 0.8.0
+
+The benchmark index (`src/media_engine/optimizations.json`) ships empty, so no backend advertises
+an optimization on any device. Benchmark files:
+
+| File                                              | Backend      | Device class            | Cited by the index | Purpose |
+| ------------------------------------------------- | ------------ | ----------------------- | ------------------ | ------- |
+| `docs/benchmarks/2026-10-31-cpu-x86_64-tool-validation.json` | `owned-sdxl` | `{kind: cpu, architecture: x86_64}` | no | Validates `tools/benchmark.py` end to end on the tiny random-weight bundle (64×64, 3 steps); says nothing about real SDXL |
+
+## Conformance results for 0.8.0
+
+`media-worker-conformance/1.3` adds the `optimizations` section to the 1.2 sections; a worker
+below 1.3 passes it as not applicable, and a worker that advertises nothing passes it by refusing
+every candidate.
+
+| Backend                        | Device / transport            | Bundle                                                                  | Result     |
+| ------------------------------ | ----------------------------- | ----------------------------------------------------------------------- | ---------- |
+| test fixture (1.3 default)     | none, loopback HTTP           | fixture bundles from `serve_fixture.py`; advertises bfloat16, int8-weight-only, inductor (no benchmark: protocol surface only) | conformant |
+| test fixture (1.3 default)     | none, mutual TLS on 127.0.0.1 | fixture bundles                                                         | conformant, same section results as loopback HTTP |
+| test fixture (pinned to 1.2)   | none, loopback HTTP           | fixture bundles                                                         | conformant (image_to_video, text_to_audio, optimizations not applicable) |
+| test fixture (pinned to 1.1)   | none, loopback HTTP           | fixture bundles                                                         | conformant |
+| `diffusers-sdxl`               | CPU float32, loopback HTTP    | tiny random-weight SDXL + tiny RRDBNet + tiny svd + tiny stable-audio-open | conformant (optimizations: none advertised, all refused) |
+| `owned-sdxl`                   | CPU float32, loopback HTTP    | tiny random-weight SDXL + tiny RRDBNet                                  | conformant (image_to_video, text_to_audio not applicable: not served; optimizations: none advertised) |
+| `diffusers-sdxl`, `owned-sdxl` | RTX 4090 (reference)          | SDXL base 1.0 and the other reference bundles                           | not run: no CUDA device or real weights in this workspace |
+
+Run as for 0.7.0, in a Python 3.12.13 virtual environment with the pinned `inference`,
+`inference-audio` and `inference-optimize` sets on CPU torch 2.6.0. Every CPU-capable candidate
+(bfloat16, int8-weight-only, inductor) was also run through both real backends by
+`tests/test_inference.py` with a test-only index naming this CPU.
+
+## Optimization checklist (operator, reference RTX 4090)
+
+Nothing is advertised until this is done and a release cites the result. On the reference host:
+
+1. `uv sync --frozen --extra inference --extra inference-optimize`; confirm
+   `capabilities.unadvertised_optimizations` lists all four candidates with `no_benchmark`
+   (flash: `device_unsupported` means the build lacks the kernel or the GPU is below sm80).
+2. For each backend, `python tools/benchmark.py --backend diffusers-sdxl --device cuda:0
+   --catalog … --registration sdxl.json --option precision=bfloat16 --option attention=flash
+   --option quantization=int8-weight-only --option compile=inductor --precision float16` at
+   1024×1024, 30 steps, `--runs 5`; repeat with `owned-sdxl`. Repeat for the other families
+   where a candidate applies (esrgan: bfloat16, inductor; svd: flash, int8, inductor;
+   stable-audio-open: all four).
+3. Rerun each qualifying option set once more and confirm the output digests are identical to
+   the first run (determinism on one device and build); look at the images and listen to the clips
+   for each, and write the quality note from the recorded differences and that inspection.
+4. Add the accepted entries to `src/media_engine/optimizations.json` with the file's path and
+   SHA-256, commit the benchmark files under `docs/benchmarks/`, add a row to the table above
+   and run the conformance suite against each backend on `cuda:0`: its `optimizations` section
+   then loads and executes every advertised entry.
 
 ## Conformance results for 0.7.0
 

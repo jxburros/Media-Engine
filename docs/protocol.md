@@ -1,6 +1,6 @@
 # media-worker/1.3 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.7.0 speaks
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.8.0 speaks
 `media-worker/1.3` and still accepts `media-worker/1.0`, `media-worker/1.1` and
 `media-worker/1.2` requests; `/v1/info`, `/v1/capabilities` and the startup record list
 `supported_protocols`. Every 1.2 and 1.3 behavior is gated on the request's `protocol` minor: a
@@ -311,6 +311,9 @@ stays false.
 | `task_parameters.text-to-audio` (0.7.0)           | Inputs, parameters, `required_parameters`, defaults, outputs, `output_formats`, stages, `bundle_facts`, audio shape |
 | `capabilities.missing_task_dependencies` (0.7.0)  | Per task, the missing distributions that keep it unadvertised (`{"text-to-audio": ["torchsde"]}` without the `inference-audio` extra); readiness still follows `missing_dependencies` |
 | `memory_estimate.latents_mb`, `.waveform_mb` (0.7.0) | stable-audio-open: the sampling latents and the decoded waveform of the whole latent length |
+| load options `precision: bfloat16`, `attention: flash`, `quantization`, `compile` (0.8.0) | Optimization values, accepted only when `capabilities.optimizations` lists them; `quantization` and `compile` (baseline `none`) are new optional fields of 1.3 load bodies only |
+| `capabilities.optimizations`, `.unadvertised_optimizations` (0.8.0) | Each advertised optimization with its cited benchmark, and why every other candidate is not advertised |
+| `memory_estimate.optimizations` (0.8.0)           | Per selected optimization, what `value_mb` does and does not account for                         |
 
 Nothing else changed: no 1.0–1.2 request, event, error or output shape. A 1.2 (or older) caller
 that names `image-to-video` or `text-to-audio` gets `unsupported`, field `task`; an `svd` or
@@ -320,7 +323,9 @@ that names `image-to-video` or `text-to-audio` gets `unsupported`, field `task`;
 `image-to-video` or `text-to-audio` listed and must not request them; `defaults` is unchanged, so
 a supervisor that merges it into every request never sends a video or audio field. Minor 1.3 was
 first advertised by Engine 0.6.0, which did not serve text-to-audio; Engine 0.7.0 adds it without
-a new minor. The `tasks` list, not the minor, tells a caller what exists.
+a new minor, and Engine 0.8.0 adds the optimization options the same way. The `tasks` list, not
+the minor, tells a caller what exists; `capabilities.optimizations`, not the minor, tells it which
+optimizations it may select.
 
 ### Discovery in 1.3
 
@@ -569,6 +574,58 @@ decoded waveform before it is cut). Both are constant per bundle because the lib
 decodes the whole latent length whatever the duration; transformer attention, T5 encoder and VAE
 decoder activations are excluded and stated in `uncertainty`.
 
+
+### Optimizations
+
+Engine 0.8.0 adds four optimization candidates as explicit load-option values. None is ever
+applied implicitly: a caller selects one in the load body, it becomes part of the load identity
+(`loaded_bundle.options`, and the operation's `resolved_options`), and switching it is a fresh
+load, exactly like a precision change.
+
+| Option         | Value              | Families                                | Effect |
+| -------------- | ------------------ | --------------------------------------- | ------ |
+| `precision`    | `bfloat16`         | sdxl-base, esrgan, stable-audio-open    | Every component held and run in bfloat16; the SDXL VAE is not upcast |
+| `attention`    | `flash`            | sdxl-base, svd, stable-audio-open       | SDPA restricted to the FlashAttention kernel for each execution; needs `precision` float16 or bfloat16 |
+| `quantization` | `int8-weight-only` | sdxl-base, svd, stable-audio-open       | The denoiser's linear weights stored as int8 with per-channel scales; not combined with adapters |
+| `compile`      | `inductor`         | all                                     | The denoiser's forward compiled with `torch.compile(backend="inductor")`; the first execution of each shape compiles |
+
+**Advertising.** A candidate is listed in `capabilities.optimizations` only when the code that
+applies it is installed, the selected device can run it, and the release's benchmark index cites
+a benchmark for this backend and device class. Each entry carries the citation:
+
+```json
+{"option": "quantization", "value": "int8-weight-only", "families": ["sdxl-base"],
+ "device_class": {"kind": "cuda", "name": "NVIDIA GeForce RTX 4090", "compute_capability": "8.9"},
+ "benchmark": "docs/benchmarks/<date>-<device>.json", "benchmark_sha256": "<64 hex>",
+ "improvement": "…", "determinism": "…", "quality_note": "…",
+ "effect": "…", "adapters": false}
+```
+
+(`precisions` is added when the entry requires one, as flash does.) Every other candidate is
+listed in `capabilities.unadvertised_optimizations` as `{option, value, reason}` with `reason`
+one of `missing_dependency` (plus `missing`, the distribution names), `device_unsupported` or
+`no_benchmark`. **Engine 0.8.0 ships no benchmark entry**, so both backends advertise
+`optimizations: []` on every device; see the compatibility record for the checklist that adds
+the first one.
+
+**Requests.** A 1.3 load body's `options` may hold `quantization` and `compile` (both default to
+`none`, which is always accepted) and the values above. Refusals, checked before any file is read:
+
+| Body                                                              | Error                                    |
+| ----------------------------------------------------------------- | ---------------------------------------- |
+| a value not in `capabilities.optimizations`, or not for the bundle's family | `unsupported`, field `options`  |
+| `attention: flash` with a precision it does not list (including `auto`) | `unsupported`, field `options`     |
+| `quantization: int8-weight-only` with adapters                     | `unsupported`, field `adapters`          |
+| any optimization with `authorized_fallbacks` containing `cpu`      | `unsupported`, field `authorized_fallbacks` (a benchmark is valid for one device class) |
+| a 1.0–1.2 body with `quantization` or `compile`                    | `invalid_request` (unknown field, as in 0.7.0) |
+| a 1.0–1.2 body with `bfloat16` or `flash`                          | `unsupported`, field `options` (as in 0.7.0) |
+
+`auto` never resolves to an optimized value (`auto_options` is unchanged and `precisions` does not
+list bfloat16), and `lower_precision` never falls back to one. With an optimization selected,
+validation and load results add `memory_estimate.optimizations`: `[{option, value, effect}]`
+saying what `value_mb` does not count (int8 weights are still counted unquantized, compiled-graph
+memory is excluded). Events, progress, cancellation checkpoints and outputs are unchanged; the
+compiled forward leaves the cancellation hooks eager.
 
 ## Transport
 

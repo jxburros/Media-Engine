@@ -5,6 +5,80 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
 0.4.0.
 
+## 0.8.0 — targeted optimization (protocol 1.3)
+
+- **The advertising rule is mechanical.** A candidate is advertised only when the code that
+  applies it imports, the selected device can run it, and the packaged benchmark index
+  (`src/media_engine/optimizations.json`) holds an entry for this `backend_id` and device class
+  citing a benchmark file under `docs/benchmarks/` by path and SHA-256, with its improvement,
+  determinism and quality note. The device class is `{kind: cuda, name, compute_capability}` or
+  `{kind: cpu, architecture}`; an entry matches on every field it names. The index is release
+  data, edited by hand when a benchmark is accepted; the worker has no flag or environment
+  variable to add entries, so an operator cannot advertise an optimization the release has not
+  measured. Unadvertised candidates are listed with a coarse reason so the gap is visible.
+- **0.8.0 advertises nothing.** No benchmark has been recorded on the reference RTX 4090; the
+  index ships with `entries: []`. The machinery, the tool, the tests and the conformance section
+  are delivered, and the first entry is a data-only change after an operator runs
+  `tools/benchmark.py` on the reference hardware (checklist in `compatibility.md`). The CPU run
+  committed as `docs/benchmarks/2026-10-31-cpu-x86_64-tool-validation.json` validates the tool on
+  a tiny random-weight bundle and is deliberately not cited.
+- **Candidates and where they apply.** `precision: bfloat16` (sdxl-base, esrgan,
+  stable-audio-open; not svd, below), `attention: flash` (the attention families; needs an
+  explicit float16 or bfloat16), `quantization: int8-weight-only` (the attention families: it
+  quantizes `nn.Linear` weights only, so the convolutional upscaler gains nothing) and
+  `compile: inductor` (every family). Each is a value of a load option and part of the load
+  identity; `quantization` and `compile` are new optional fields of 1.3 load bodies (`none` is
+  the baseline), while 1.0–1.2 bodies keep their strict three-field shape, so a 1.2 body with
+  either field is still `invalid_request`, byte for byte as in 0.7.0.
+- **Flash attention without a kernel package.** The plan anticipated a pinned kernel package.
+  PyTorch 2.6 already ships FlashAttention-2 behind `scaled_dot_product_attention` on CUDA
+  (sm80+), and both backends attend through SDPA (`AttnProcessor2_0`), so `attention: flash`
+  restricts SDPA to that kernel for each execution of the load (`sdpa_kernel`) and fails rather
+  than silently falling back when a shape is unsupported. No dependency is added; the policy
+  prefers it.
+- **int8 weight-only through torchao.** `torchao==0.9.0` (the release built against torch 2.6) is
+  the new `inference-optimize` extra; it is pure Python on top of torch, and on CPU it runs
+  without triton (it logs an import notice). Only the denoiser (SDXL/svd UNet, Stable Audio
+  transformer) is quantized, after LoRA merging on the owned path; adapters are refused with
+  quantization on both backends in 0.8.0 because the reference backend's PEFT layers wrap the
+  linear layers torchao replaces. The memory estimate keeps counting unquantized weights (an
+  over-estimate, safe for budgets) and says so in `memory_estimate.optimizations`.
+- **Compile the forward, not the module.** `torch.compile` wraps the denoiser's `forward` only,
+  so the forward hooks that check cancellation and the step callbacks stay eager; cancellation and
+  progress are unchanged, which the CPU test asserts. Compiled graphs are dropped with
+  `torch._dynamo.reset()` on unload. On CPU inductor needs a C++ compiler (`$CXX` or `g++`), on
+  CUDA triton (bundled with the CUDA torch wheel); without one the candidate is
+  `device_unsupported`. The first execution of each shape includes compilation; the benchmark
+  records it separately as `first_execution_seconds`.
+- **No optimization with the CPU fallback, and never through `auto`.** A benchmark is valid for
+  one device class, so a load that selects an optimization may not authorize `cpu`
+  (`unsupported`, field `authorized_fallbacks`); `lower_precision` is still allowed. `auto_options`
+  is unchanged and `precisions` does not list bfloat16, so `auto` and the lower-precision fallback
+  never choose it.
+- **bfloat16 is not offered for svd.** The pinned diffusers `StableVideoDiffusionPipeline`
+  upcasts its VAE input only when the VAE is float16; with a bfloat16 VAE it feeds float32 frames
+  and fails. Patching library internals is not this release's business; the candidate's
+  families exclude svd until an owned video loop exists.
+- **Fix found on the way: CLIP projection models and their config dtype.** transformers 4.49
+  builds the inner model of `CLIPTextModelWithProjection` / `CLIPVisionModelWithProjection` in
+  the dtype its `config.json` records instead of the requested `torch_dtype`, so a bundle whose
+  `text_encoder_2` (or svd `image_encoder`) config says float32 loaded at float16 on the
+  reference backend as a float32 body with a float16 projection and failed with a dtype mismatch.
+  Real SDXL releases record float16 there, which is why it was not seen; the reference backend
+  now casts those components to the load precision after loading. The owned backend was never
+  affected (it casts every tensor itself).
+- **The benchmark tool runs in-process through the real worker.** `tools/benchmark.py` loads each
+  option set with a temporary index naming every candidate (so unadvertised ones can be
+  measured), warms up once, and records load time, first and steady-state execution time, device
+  peaks (reset per execution) and every output digest, plus max/mean differences from the
+  baseline in 8-bit levels (PNG) or 16-bit steps (WAV). Process RSS is recorded but never
+  compared, because it is a lifetime high-water mark. Qualification (≥1.05× faster or ≤0.95×
+  peak device memory, configurable) only prints candidate index entries with `REVIEW` markers for
+  determinism and quality; citing remains a release decision.
+- **Conformance suite `media-worker-conformance/1.3`** adds the `optimizations` section; it passes
+  for a worker that advertises nothing (every candidate must then be refused) and exercises every
+  offered optimization end to end otherwise.
+
 ## 0.7.0 — text-to-audio (protocol 1.3)
 
 - **One new dependency, in its own extra.** The `stable-audio-open` family's scheduler,
@@ -214,7 +288,7 @@ or impractical to own, is pinned by checksum, and is isolated in one module so i
 Every dependency is listed below with the backend that needs it and the reason it is not owned
 code. A dependency without an entry is a defect. No external service is used at any stage.
 
-## Ledger — Python worker (0.7.0; `inference-audio` added, other pins unchanged since 0.4.0)
+## Ledger — Python worker (0.8.0; `inference-optimize` added, other pins unchanged since 0.7.0)
 
 | Package       | Extra(s)                    | Imported by                                   | Why it is not owned code                                        | Next change                                      |
 | ------------- | --------------------------- | --------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
@@ -222,6 +296,7 @@ code. A dependency without an entry is a defect. No external service is used at 
 | diffusers     | inference, inference-owned  | reference (pipelines, incl. `StableVideoDiffusionPipeline` and `StableAudioPipeline`); owned and convert (model classes, scheduler, single-file key mapping) | Reference pipelines; SDXL, svd and Stable Audio model classes; checkpoint key mapping | Owned path keeps model classes only              |
 | transformers  | inference, inference-owned  | reference, owned, convert                     | CLIP model classes and tokenizers; the svd CLIP image encoder and processor; the T5 encoder and fast tokenizer (through its `tokenizers` dependency) | Owned path may replace CLIP tokenization later   |
 | torchsde      | inference-audio             | reference, stable-audio-open only (imported by diffusers' `CosineDPMSolverMultistepScheduler`; no engine module imports it) | The scheduler's Brownian-tree noise sampler; brings `scipy` and `trampoline` | Owned audio loop could own the noise sampler     |
+| torchao       | inference-optimize          | both backends, only when a load selects `quantization: int8-weight-only` (`optimize.py`) | Weight-only int8 tensor subclass and its dequantizing matmul; owning quantized kernels is native-engine work | Replaced by owned kernels in the native engine |
 | safetensors   | inference, inference-owned  | reference, owned (direct weight loading), upscaler, convert | Tensor loading/saving (headers are parsed by owned code)        | Keep                                             |
 | numpy         | inference, inference-owned  | diffusers internals (e.g. the Euler scheduler) on every path; no engine module imports it | Required by diffusers itself; pinned so the owned extra resolves identically | Drops out of the pin set with diffusers         |
 | accelerate    | inference                   | reference (Diffusers loading helpers)         | Diffusers' low-memory loading                                   | Not installed with inference-owned               |
@@ -231,13 +306,15 @@ code. A dependency without an entry is a defect. No external service is used at 
 
 `capabilities.dependencies` reports, per backend, the versions of the packages that backend
 imports: the reference backend lists all seven plus `torchsde` (`null` without the audio extra),
-the owned backend lists torch, diffusers, transformers and safetensors. The CPU test suite runs the owned backend, the upscaler and the
+the owned backend lists torch, diffusers, transformers and safetensors; from 0.8.0 both add
+`torchao` (`null` without the optimize extra). The CPU test suite runs the owned backend, the upscaler and the
 converter in an environment built from `inference-owned` alone (no accelerate, no peft).
 
 Standard-library-only by design: the HTTP/SSE server (`http.server`), JSON, hashing, PNG reading
 and writing (`png.py`: `zlib`, `struct`), the conformance suite (`unittest`, `urllib`, `socket`),
 TLS in network mode (`ssl`, from 0.5.0), frame archives (`video.py`: `zipfile`, `json`, from
-0.6.0), and WAV (`audio.py`: `wave`, `struct`, from 0.7.0). Test-only tooling not in
+0.6.0), WAV (`audio.py`: `wave`, `struct`, from 0.7.0), and the benchmark index and tool
+(`optimize.py`, `tools/benchmark.py`: `json`, `statistics`, from 0.8.0). Test-only tooling not in
 any extra: `jsonschema` was used ad hoc to check the schema against real bodies and is not a
 dependency.
 

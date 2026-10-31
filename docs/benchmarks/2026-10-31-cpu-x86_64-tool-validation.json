@@ -1,0 +1,343 @@
+{
+  "schema_version": 1,
+  "tool": "tools/benchmark.py",
+  "media_engine": "0.7.0",
+  "recorded_at": "2026-10-31T14:02:30+00:00",
+  "backend_id": "owned-sdxl",
+  "device_class": {
+    "kind": "cpu",
+    "architecture": "x86_64"
+  },
+  "device_identity": {
+    "device": "cpu",
+    "index": null,
+    "name": "cpu",
+    "total_memory_mb": 16091,
+    "host_id": "80b4cc5a5940cdfe18cf49a2fa38e896f2d662fadf4fa0d1a549fa7e44b4c083",
+    "host_id_source": "machine-id"
+  },
+  "dependencies": {
+    "torch": "2.6.0+cpu",
+    "diffusers": "0.32.2",
+    "transformers": "4.49.0",
+    "safetensors": "0.5.3",
+    "torchao": "0.9.0"
+  },
+  "bundle_digest": "sha256:ba29d9dc56b1e8725812baa21299fb5309ca1110da6f7035578daffc340b23e9",
+  "family": "sdxl-base",
+  "runs": 3,
+  "requests": [
+    {
+      "task": "text-to-image",
+      "parameters": {
+        "width": 64,
+        "height": 64,
+        "steps": 3,
+        "guidance": 6,
+        "sampler": "euler",
+        "scheduler": "euler",
+        "seed": 1
+      }
+    },
+    {
+      "task": "text-to-image",
+      "parameters": {
+        "width": 64,
+        "height": 64,
+        "steps": 3,
+        "guidance": 6,
+        "sampler": "euler",
+        "scheduler": "euler",
+        "seed": 2
+      }
+    },
+    {
+      "task": "text-to-image",
+      "parameters": {
+        "width": 64,
+        "height": 64,
+        "steps": 3,
+        "guidance": 6,
+        "sampler": "euler",
+        "scheduler": "euler",
+        "seed": 3
+      }
+    }
+  ],
+  "thresholds": {
+    "min_speedup": 1.05,
+    "max_memory_ratio": 0.95
+  },
+  "note": "Tool validation only, NOT a qualifying benchmark and NOT cited by the index: owned-sdxl on a 4-core x86_64 CPU (AVX-512) with the tiny random-weight SDXL-shaped bundle from tests/test_inference.py, 64x64, 3 steps. Timings of a network this small say nothing about real SDXL; bfloat16 pixel differences are amplified by the random weights.",
+  "results": [
+    {
+      "options": {
+        "precision": "float32",
+        "attention": "sdpa",
+        "offload": "none"
+      },
+      "load_seconds": 2.042,
+      "first_execution_seconds": 0.242,
+      "execution_seconds": [
+        0.284,
+        0.232,
+        0.21
+      ],
+      "median_seconds": 0.232,
+      "peak_allocated_mb": null,
+      "peak_reserved_mb": null,
+      "process_peak_rss_mb": 419.58203125,
+      "memory_estimate_mb": 5,
+      "outputs": [
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "6981f33b0ce766e1e4eaf41cd8597867602694c097f4f0f63a9f71475a9b5ae8"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "6ca335b2b1c387d8d3254e85218478166378a12693c6a03c78cfc5bfd7facc2a"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "d94143a56b3acdecae44dd91a3a0fb2c96f12811fb888800cfee50e4ba39fe60"
+          }
+        ]
+      ]
+    },
+    {
+      "options": {
+        "precision": "bfloat16",
+        "attention": "sdpa",
+        "offload": "none"
+      },
+      "load_seconds": 0.202,
+      "first_execution_seconds": 0.259,
+      "execution_seconds": [
+        0.209,
+        0.209,
+        0.208
+      ],
+      "median_seconds": 0.209,
+      "peak_allocated_mb": null,
+      "peak_reserved_mb": null,
+      "process_peak_rss_mb": 434.4609375,
+      "memory_estimate_mb": 2,
+      "outputs": [
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "7de6b413df0c76c99ef3ec5ffa9cd2949685163d8a44fa4724d363b930f98d65"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "dd04a8df74172047b6316d0021e1386845ea67d7f4d1d388462720c3404164b7"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "2ede77bc5f935b99ca17ce8ba381562db286089ff8d004dd9b91ab3f753280fd"
+          }
+        ]
+      ],
+      "summary": {
+        "speedup": 1.11,
+        "differences": [
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 238,
+              "mean": 48.9232,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 251,
+              "mean": 49.7496,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 253,
+              "mean": 49.2854,
+              "unit": "8-bit levels"
+            }
+          ]
+        ],
+        "qualifies": true
+      }
+    },
+    {
+      "options": {
+        "precision": "float32",
+        "attention": "sdpa",
+        "offload": "none",
+        "quantization": "int8-weight-only"
+      },
+      "load_seconds": 0.205,
+      "first_execution_seconds": 2.749,
+      "execution_seconds": [
+        0.994,
+        3.114,
+        1.203
+      ],
+      "median_seconds": 1.203,
+      "peak_allocated_mb": null,
+      "peak_reserved_mb": null,
+      "process_peak_rss_mb": 450.55078125,
+      "memory_estimate_mb": 5,
+      "outputs": [
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "23da399f0d62fe9fead775aee099f603989ca62cfcc7b9e0d76b0f3ecbf7e9b9"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "a6e21d4fd7b484fcccd9d0c1f4664a9a51e49cf51262db7bb2b119b35a43a7b7"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "04f50a3fc405c33da1a8c2565025c4a5c2fb359db41bbf95e742fe28166793e0"
+          }
+        ]
+      ],
+      "summary": {
+        "speedup": 0.193,
+        "differences": [
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.0772,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.0845,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.079,
+              "unit": "8-bit levels"
+            }
+          ]
+        ],
+        "qualifies": false
+      }
+    },
+    {
+      "options": {
+        "precision": "float32",
+        "attention": "sdpa",
+        "offload": "none",
+        "compile": "inductor"
+      },
+      "load_seconds": 0.636,
+      "first_execution_seconds": 10.295,
+      "execution_seconds": [
+        0.497,
+        0.445,
+        0.479
+      ],
+      "median_seconds": 0.479,
+      "peak_allocated_mb": null,
+      "peak_reserved_mb": null,
+      "process_peak_rss_mb": 502.41015625,
+      "memory_estimate_mb": 5,
+      "outputs": [
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "ac026fa1f4fa55758e3bc9b2fe3b6d11c9ef708e07eedec9c1fd7103ad877b0b"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "2a2ff235ee85c6f2a0632b610a9697bed7e7d8a070808329df92a0b05fe6e5c4"
+          }
+        ],
+        [
+          {
+            "output_id": "image",
+            "mime_type": "image/png",
+            "sha256": "c48685b46a822723f40e147fc82f2caa4dd4b939cdfc63a640db9195ab2502e3"
+          }
+        ]
+      ],
+      "summary": {
+        "speedup": 0.484,
+        "differences": [
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.0002,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.0001,
+              "unit": "8-bit levels"
+            }
+          ],
+          [
+            {
+              "output_id": "image",
+              "comparable": true,
+              "max": 1,
+              "mean": 0.0002,
+              "unit": "8-bit levels"
+            }
+          ]
+        ],
+        "qualifies": false
+      }
+    }
+  ]
+}

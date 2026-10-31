@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.8.0 — 2026-10-31
+
+Targeted optimization options (phase E5) within protocol `media-worker/1.3`; 1.0, 1.1 and 1.2 are
+still served unchanged, and a 1.2 load body keeps its strict three-field `options`.
+
+- **Four candidates, each an explicit load-option value and part of the load identity**:
+  `precision: bfloat16` (sdxl-base, esrgan, stable-audio-open), `attention: flash` (PyTorch's own
+  FlashAttention SDPA kernel on CUDA sm80+, with float16 or bfloat16; no extra package),
+  `quantization: int8-weight-only` (the denoiser's linear weights, through `torchao`; sdxl-base,
+  svd, stable-audio-open) and `compile: inductor` (the denoiser's forward, every family). 1.3 load
+  bodies gain the optional fields `quantization` and `compile` (baseline `none`). Both backends
+  apply them once at load; the reference backend serves every family, the owned backend its own.
+- **Advertised only with a cited benchmark**: `capabilities.optimizations` lists a candidate only
+  when it is installed, the device can run it and the packaged benchmark index
+  (`src/media_engine/optimizations.json`) cites a benchmark for this backend and device class,
+  with the benchmark path and SHA-256, improvement, determinism and quality note;
+  `capabilities.unadvertised_optimizations` gives every other candidate's reason
+  (`missing_dependency`, `device_unsupported`, `no_benchmark`). **The index ships empty**: nothing
+  has been benchmarked on the reference RTX 4090, so this release advertises no optimization on
+  any device. Adding one is a data change after the checklist in `docs/compatibility.md`.
+- **Never implicit**: `auto` and the `lower_precision` fallback never pick an optimized value; an
+  optimization cannot be combined with the `cpu` fallback (a benchmark is for one device class),
+  int8 weight-only is not combined with adapters, flash needs an explicit half precision, and an
+  unoffered value is `unsupported`, field `options`. `memory_estimate.optimizations` says what the
+  estimate does not count for each selected optimization.
+- **`tools/benchmark.py`**: measures option sets in-process through the real worker (load time,
+  first execution including compilation, steady-state time, peak device memory, output digests,
+  differences from the baseline in 8-bit levels or 16-bit steps), writes
+  `docs/benchmarks/<date>-<device class>.json` and prints the index entries a release could cite;
+  it never edits the index. A tool-validation run on this CPU with the tiny bundle is committed
+  and deliberately not cited.
+- **New extra `inference-optimize`** pinning `torchao==0.9.0` (`uv.lock` adds only torchao; no
+  existing pin moved). `capabilities.dependencies` reports `torchao` on both backends.
+- **Fix**: transformers 4.49 builds the inner model of CLIP `*WithProjection` components in their
+  `config.json` dtype, so a bundle whose `text_encoder_2` (or svd `image_encoder`) config records
+  float32 failed at float16 on the reference backend with a dtype mismatch at the projection. The
+  reference backend now casts those components to the load precision. Real SDXL releases record
+  float16 there, so released bundles were not affected; the owned backend never was.
+- **Conformance suite `media-worker-conformance/1.3`**: an `optimizations` section (citations,
+  refusals of unoffered and bogus values, `auto` never optimized, the 1.2 body shape, and every
+  offered optimization loaded and executed). `tests/serve_fixture.py` advertises bfloat16,
+  int8-weight-only and inductor as a protocol surface (citation: no benchmark), lists flash as
+  `device_unsupported`, and takes `--optimizations` (or `none`).
+- Schema (`$id` still 1.3): the new option values and fields, `optimization` and
+  `unadvertised_optimization` definitions and the estimate notes. `docs/protocol.md`
+  "Optimizations"; README "Optimization options"; decisions 0.8.0 entry and the torchao ledger
+  row; compatibility row, 0.8.0 conformance results, benchmark table and the optimization
+  checklist.
+
+Validation, stated plainly: there is no GPU in this workspace, so `attention: flash` and every
+CUDA measurement are implemented but not run, and no benchmark exists that could justify
+advertising anything. On CPU (4-core x86_64 with AVX-512, Python 3.12.13 venv, CPU torch 2.6.0
+`+cpu`, the pinned `inference`, `inference-audio` and `inference-optimize` sets) every CPU-capable
+candidate ran through both real backends on the tiny random-weight bundles: int8 weight-only and
+inductor stayed within one 8-bit level of float32 on SDXL, bfloat16 was reproducible and agreed
+across backends within one level, and one bfloat16 UNet evaluation was within 5% relative error of
+float32 (end-to-end bfloat16 pixels differ widely on random weights, which says nothing about real
+ones). The whole suite passes (98 tests, one IPv6 skip), and the conformance suite reports the
+fixture, `diffusers-sdxl` and `owned-sdxl` conformant on CPU. Runtime 0.7.0 (15/15 integration
+tests) and 0.8.0 (18/18) pass unchanged against the 0.8.0 fixture.
+
 ## 0.7.0 — 2026-10-29
 
 Text-to-audio (phase E4) within protocol `media-worker/1.3`, which 0.6.0 already advertises; 1.0,
