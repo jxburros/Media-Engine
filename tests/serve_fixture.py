@@ -19,6 +19,10 @@ changing the launch command. --protocol media-worker/1.2 (or MEDIA_ENGINE_FIXTUR
 serves exactly the Engine 0.5.0 fixture surface (no image-to-video or text-to-audio, no svd or
 stable-audio-open), and
 --protocol media-worker/1.1 the 0.3.0 surface, so supervisors can test negotiation and refusal.
+With 1.3 the fixture advertises the optimizations precision=bfloat16,
+quantization=int8-weight-only and compile=inductor (no benchmark: protocol surface only) and
+lists attention=flash as device_unsupported; --optimizations (MEDIA_ENGINE_FIXTURE_OPTIMIZATIONS)
+takes a comma-separated option=value list, or "none" to advertise none.
 
 Network mode takes the worker's own flags and rules (media_engine.server.network_configuration):
 --bind, --tls-cert, --tls-key, --tls-client-ca and --no-parent-watch, also read from
@@ -34,6 +38,7 @@ import sys
 from pathlib import Path
 from fixture import (
     FIXTURE_VERSION,
+    FIXTURE_OPTIMIZATIONS,
     TestBackend,
     make_adapter,
     make_audio_bundle,
@@ -44,6 +49,7 @@ from fixture import (
     make_svd_bundle,
 )
 from media_engine.contracts import SUPPORTED_PROTOCOLS
+from media_engine.optimize import CANDIDATE_KEYS
 from media_engine.server import (
     NetworkError,
     Worker,
@@ -93,6 +99,11 @@ parser.add_argument(
     help="override the float32 memory estimate (float16 is half) to drive budget fallbacks",
 )
 parser.add_argument("--output-side", type=int, default=number("OUTPUT_SIDE"))
+parser.add_argument(
+    "--optimizations",
+    default=env("OPTIMIZATIONS", ",".join(f"{o}={v}" for o, v in FIXTURE_OPTIMIZATIONS)),
+    help='comma-separated option=value optimizations to advertise (1.3), or "none"',
+)
 parser.add_argument("--max-retained", type=int, default=number("MAX_RETAINED") or 128)
 parser.add_argument("--max-storage-mb", type=int, default=number("MAX_STORAGE_MB") or 1024)
 add_network_arguments(parser)
@@ -112,6 +123,14 @@ protocols = SUPPORTED_PROTOCOLS[: SUPPORTED_PROTOCOLS.index(args.protocol) + 1]
 precisions = [p for p in args.precisions.split(",") if p]
 if not precisions or any(p not in ("float16", "float32") for p in precisions):
     parser.error("precisions must be float16 and/or float32")
+
+optimizations = []
+for item in args.optimizations.split(","):
+    if item and item != "none":
+        pair = tuple(item.split("=", 1))
+        if pair not in CANDIDATE_KEYS:
+            parser.error(f"unknown optimization {item}")
+        optimizations.append(pair)
 
 root = Path(args.root).resolve()
 handles = {
@@ -156,6 +175,7 @@ backend = TestBackend(
     output_side=args.output_side,
     device_index=args.device_index,
     host_id=args.host_id,
+    optimizations=optimizations,
 )
 worker = Worker(
     root / "work",
