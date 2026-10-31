@@ -5,6 +5,52 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
 0.4.0.
 
+## 1.0.0 — the owned native engine (protocol 1.3)
+
+- **Rust on candle, confirmed.** The native engine is `native/`, a Cargo workspace producing
+  `media-engine-native` (the server) and the library `media-engine-sdxl` (the model). candle's
+  CPU coverage was sufficient for everything 1.0.0 serves, so the ggml fallback was not needed.
+- **Fewer crates than the plan allowed.** Only `candle-core` (tensor execution, safetensors
+  loading, CUDA behind the `cuda` feature) and `png` are dependencies. candle-nn and
+  candle-transformers are not used: the SDXL UNet, the KL VAE, both CLIP text encoders, the Euler
+  scheduler, group/layer norm, attention and GEGLU are owned code read from the bundle's own
+  configuration files, so the native engine refuses an architecture it does not implement
+  (`unsupported`, field `configuration`) instead of guessing. `candle-core` is pinned at 0.9.2,
+  the newest release without a hard dependency on the `tokenizers` crate. cudarc enters only
+  with the first custom kernel; rustls only with network mode (below).
+- **Owned instead of depended on**, as the spec requires: the HTTP/1.1 and SSE server, JSON
+  (integers and floats kept apart, Python-compatible canonical form for digests), SHA-256, the
+  CLIP BPE tokenizer (the transformers algorithm without ftfy), seeded noise, LoRA merging,
+  bundle verification and every validation rule. The PNG writer is the `png` crate (deflate),
+  as recorded in the planned ledger.
+- **Seeds mean the same thing.** The engine reproduces PyTorch's CPU generator (mt19937 and
+  `normal_fill`'s 16-wide Box–Muller layout), so a seed draws the same initial latents as the
+  Python backends and the oracle can compare pixels, not just shapes. Byte-identical PNGs across
+  engines are still not promised; the oracle tolerance is one 8-bit level.
+- **Semantics are the owned pipeline's**: one generator per image seeded seed + k − 1, the
+  posterior sample drawn before the noise for image-to-image, `force_zeros_for_empty_prompt`,
+  penultimate CLIP hidden states with the second encoder's pooled projection, the VAE kept
+  float32 under float16 when `force_upcast`, cancellation checked at the same checkpoints and
+  the same stage and progress events.
+- **Scope of 1.0.0: sdxl-base first**, as the plan sets it. Other families are refused before
+  any file is read and are not advertised; each follows as its own increment after passing the
+  suite. Optimizations: none advertised (the benchmark rule of 0.8.0 applies to the native engine
+  too).
+- **Network mode is not in the native 1.0.0 binary.** It binds loopback only and refuses the
+  `--tls-*` flags and a non-loopback `--bind` at launch, so it can never serve plain HTTP off
+  the host; remote supervisors keep using the Python worker's mutual-TLS mode. rustls is added
+  to the ledger when this lands.
+- **A task the engine does not serve is `unsupported`, field `task`, at validation.** The Python
+  workers validate the shape of every protocol task even when no bundle for it is loaded; the
+  native engine refuses tasks outside its `tasks` list instead, which is what a caller that
+  follows `tasks` never sees.
+- **Build and release identity.** The binary's version is the Engine version (`Cargo.toml`,
+  reported as `worker_version` and `build: {package: media-engine-native, version}`); releases are
+  built with `cargo build --release --locked` from the committed `Cargo.lock`. The binary ships
+  as its own artifact; the Python package keeps the reference and owned backends.
+- **Engine 1.0.0 does not change the protocol.** The Python package is also 1.0.0, unchanged in
+  behavior from 0.8.0.
+
 ## 0.8.0 — targeted optimization (protocol 1.3)
 
 - **The advertising rule is mechanical.** A candidate is advertised only when the code that
@@ -322,15 +368,15 @@ Optional and not yet accepted: one pinned MP4 encoder wheel for the `video` outp
 lossless frame archive is the baseline (shipped in 0.6.0) and this entry is added only on
 evidence of need.
 
-## Ledger — native engine (planned, phase E6)
+## Ledger — native engine (1.0.0)
 
-| Crate   | Why it is not owned code                                   |
-| ------- | ---------------------------------------------------------- |
-| candle  | Tensor execution; replaced piecewise by owned kernels later |
-| cudarc  | Launching owned CUDA kernels                               |
-| rustls  | TLS for network mode                                       |
-| png     | Deflate-backed PNG encoding                                |
+| Crate        | Version | Why it is not owned code                                                            | Brings (transitively)                                   |
+| ------------ | ------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| candle-core  | 0.9.2   | Tensor storage and kernels (gemm on CPU, CUDA behind the `cuda` feature), safetensors loading | gemm, half, rayon, safetensors, memmap2, num-traits, rand, zip and their dependencies (see `native/Cargo.lock`) |
+| png          | 0.18.1  | Deflate-backed PNG encoding and decoding                                            | fdeflate, flate2, miniz_oxide, crc32fast, bitflags       |
 
-Owned instead of depended on: the HTTP/1.1 and SSE server, the CLIP BPE tokenizer, WAV and ZIP
-writers, validation, bundle verification. A `tokenizers` crate is justified only for the T5
-tokenizer of the audio family and is recorded when that family reaches the native engine.
+Not yet added, each with the increment that needs it: cudarc (the first custom CUDA kernel),
+rustls (network mode), a `tokenizers` crate (the T5 tokenizer, only when stable-audio-open
+reaches the native engine). Owned: the HTTP/1.1 and SSE server, JSON, SHA-256, the CLIP BPE
+tokenizer, seeded noise, the SDXL models and scheduler, LoRA merging, validation, bundle
+verification; WAV and ZIP writers arrive with the families that need them.

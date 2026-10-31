@@ -8,3 +8,4 @@ build/
 /catalog.json
 .env
 .venv-*/
+native/target/
