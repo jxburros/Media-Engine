@@ -381,6 +381,11 @@ Engine 1.0.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` cal
 its startup record keeps `protocol: "media-worker/1.1"` for those launchers and reports `highest_protocol`.
 `tests/serve_fixture.py --protocol media-worker/1.2` (or `1.1`) pins the fixture to an older surface.
 
+To smoke-test this worker together with Media Runtime on your own local models (any backend,
+including `media-engine-native`), use Runtime's
+[testbench](https://github.com/jxburros/Media-Runtime/tree/main/testbench): one config file listing
+your model directories, one command, and an HTML report of every feature with its outputs.
+
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
 SDXL base weights carry CreativeML Open RAIL++-M terms, and Stable Video Diffusion and Stable Audio
 Open weights carry Stability AI's terms; all are supplied by the operator.
