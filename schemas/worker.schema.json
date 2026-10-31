@@ -874,15 +874,34 @@
               "enum": [
                 "float16",
                 "float32",
-                "auto"
+                "auto",
+                "bfloat16"
               ],
-              "description": "auto is media-worker/1.2 and later and listed in capabilities.auto_options"
+              "description": "auto is media-worker/1.2 and later and listed in capabilities.auto_options; bfloat16 is a media-worker/1.3 optimization, accepted only when capabilities.optimizations lists it"
             },
             "attention": {
-              "const": "sdpa"
+              "enum": [
+                "sdpa",
+                "flash"
+              ],
+              "description": "flash is a media-worker/1.3 optimization, accepted only when capabilities.optimizations lists it, with precision float16 or bfloat16"
             },
             "offload": {
               "const": "none"
+            },
+            "quantization": {
+              "enum": [
+                "none",
+                "int8-weight-only"
+              ],
+              "description": "media-worker/1.3 only; int8-weight-only only when capabilities.optimizations lists it"
+            },
+            "compile": {
+              "enum": [
+                "none",
+                "inductor"
+              ],
+              "description": "media-worker/1.3 only; inductor only when capabilities.optimizations lists it"
             }
           },
           "required": [
@@ -1021,6 +1040,65 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "options": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "quantization"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "compile"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "options": {
+                    "properties": {
+                      "precision": {
+                        "const": "bfloat16"
+                      }
+                    },
+                    "required": [
+                      "precision"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "options": {
+                    "properties": {
+                      "attention": {
+                        "const": "flash"
+                      }
+                    },
+                    "required": [
+                      "attention"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "protocol": {
+                "const": "media-worker/1.3"
+              }
+            }
+          }
         }
       ]
     },
@@ -1145,6 +1223,30 @@
         "duration": {
           "type": "object",
           "description": "stable-audio-open: the duration range and how duration scales memory (it does not)"
+        },
+        "optimizations": {
+          "type": "array",
+          "description": "media-worker/1.3: what value_mb does and does not account for, per selected optimization",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "option": {
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              },
+              "effect": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "option",
+              "value",
+              "effect"
+            ]
+          }
         }
       },
       "required": [
@@ -1712,6 +1814,129 @@
       },
       "required": [
         "duration_seconds"
+      ]
+    },
+    "optimization": {
+      "description": "media-worker/1.3: one entry of capabilities.optimizations; advertised only with a cited benchmark for this backend and device class",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "option": {
+          "enum": [
+            "precision",
+            "attention",
+            "quantization",
+            "compile"
+          ]
+        },
+        "value": {
+          "enum": [
+            "bfloat16",
+            "flash",
+            "int8-weight-only",
+            "inductor"
+          ]
+        },
+        "families": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "device_class": {
+          "type": "object"
+        },
+        "benchmark": {
+          "type": "string",
+          "minLength": 1
+        },
+        "benchmark_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "improvement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "determinism": {
+          "type": "string",
+          "minLength": 1
+        },
+        "quality_note": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effect": {
+          "type": "string"
+        },
+        "adapters": {
+          "type": "boolean",
+          "description": "whether the optimization may be combined with LoRA adapters"
+        },
+        "precisions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "float16",
+              "bfloat16"
+            ]
+          },
+          "description": "the load precisions it requires, when restricted"
+        }
+      },
+      "required": [
+        "option",
+        "value",
+        "families",
+        "device_class",
+        "benchmark",
+        "benchmark_sha256",
+        "improvement",
+        "determinism",
+        "quality_note",
+        "effect",
+        "adapters"
+      ]
+    },
+    "unadvertised_optimization": {
+      "description": "media-worker/1.3: one entry of capabilities.unadvertised_optimizations",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "option": {
+          "enum": [
+            "precision",
+            "attention",
+            "quantization",
+            "compile"
+          ]
+        },
+        "value": {
+          "enum": [
+            "bfloat16",
+            "flash",
+            "int8-weight-only",
+            "inductor"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "missing_dependency",
+            "device_unsupported",
+            "no_benchmark"
+          ]
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "option",
+        "value",
+        "reason"
       ]
     }
   },

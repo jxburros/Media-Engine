@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
-from . import audio, png, video
+from . import audio, optimize, png, video
 from .backend import Cancelled, backend_class
 from .contracts import (
     FAMILIES,
@@ -184,16 +184,29 @@ class Worker:
             raise WorkerError(400, "unsupported", "family")
         if "authorized_fallbacks" in body and level < 2:
             raise WorkerError(400, "unsupported", "authorized_fallbacks")
-        strict(body["options"], ("precision", "attention", "offload"))
+        # quantization and compile exist for 1.3 bodies only; older bodies keep the strict
+        # three-field shape (an extra field is invalid_request, exactly as in 0.7.0).
+        new_options = tuple(optimize.NEW_OPTIONS) if level >= optimize.SINCE else ()
+        strict(body["options"], ("precision", "attention", "offload"), new_options)
         options = body["options"]
         caps = self.capabilities()
         precisions = list(caps["precisions"])
         if level >= 2 and "precision" in caps.get("auto_options", []):
             precisions.append("auto")
+        offered = (
+            {(o["option"], o["value"]) for o in caps.get("optimizations", [])}
+            if level >= optimize.SINCE
+            else set()
+        )
         if (
-            options["precision"] not in precisions
-            or options["attention"] != "sdpa"
+            (options["precision"] not in precisions and ("precision", options["precision"]) not in offered)
+            or (options["attention"] != "sdpa" and ("attention", options["attention"]) not in offered)
             or options["offload"] != "none"
+            or any(
+                options[name] != off and (name, options[name]) not in offered
+                for name, off in optimize.NEW_OPTIONS.items()
+                if name in options
+            )
         ):
             raise WorkerError(400, "unsupported", "options")
         authorized = body.get("authorized_fallbacks", [])
@@ -208,6 +221,7 @@ class Worker:
         adapters = validate_adapters(body.get("adapters", []), self.catalog, version, verify)
         if adapters and family != "sdxl-base":
             raise WorkerError(400, "unsupported", "adapters")
+        optimize.check_load(options, version, caps, family, adapters, authorized)
         plan = self.backend.plan(root, options, adapters, family, authorized)
         return root, adapters, family, plan
 
@@ -215,6 +229,9 @@ class Worker:
         estimate = self.backend.estimate(
             root, plan["options"], adapters, family, plan["device"]
         )
+        notes = optimize.estimate_note(plan["options"])
+        if notes:
+            estimate = {**estimate, "optimizations": notes}
         if level >= 2 and family == "sdxl-base":
             estimate = {
                 **estimate,

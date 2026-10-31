@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "about": "Benchmark index: an optimization is advertised only for a backend and device class listed here, citing a benchmark file under docs/benchmarks recorded with tools/benchmark.py. Engine 0.8.0 ships no entry because no benchmark has been recorded on the reference hardware.",
+  "reference_hardware": {"kind": "cuda", "name": "NVIDIA GeForce RTX 4090", "compute_capability": "8.9"},
+  "entries": []
+}

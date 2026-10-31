@@ -1,6 +1,8 @@
 include uv.lock .python-version engine-spec.md CHANGELOG.md
 recursive-include schemas *.json
 recursive-include docs *.md
+recursive-include docs/benchmarks *.json
+recursive-include tools *.py
 recursive-include examples *.json
 recursive-include tests *.py
 recursive-include tests/certs *.pem *.key *.cnf *.md

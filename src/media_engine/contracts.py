@@ -15,7 +15,7 @@ SUPPORTED_PROTOCOLS = (
     "media-worker/1.2",
     "media-worker/1.3",
 )
-WORKER_VERSION = "0.7.0"
+WORKER_VERSION = "0.8.0"
 TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
 TASK_SINCE = {
@@ -173,7 +173,7 @@ MAX_VIDEO_SIZES = 8
 MAX_AUDIO_SECONDS = 600
 AUTO_OPTIONS = ["precision"]
 FALLBACKS = ["cpu", "lower_precision"]
-PRECISION_BYTES = {"float16": 2, "float32": 4}
+PRECISION_BYTES = {"float16": 2, "float32": 4, "bfloat16": 2}
 SAFETENSORS_BYTES = {
     "F64": 8,
     "I64": 8,

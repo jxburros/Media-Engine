@@ -8,6 +8,7 @@ import resource
 import socket
 from pathlib import Path
 
+from . import optimize
 from .contracts import (
     ADAPTER_FORMAT,
     ADAPTER_TARGETS,
@@ -64,6 +65,8 @@ AUDIO_DEPENDENCIES = (
     ("safetensors", "safetensors"),
     ("torchsde", "torchsde"),
 )
+# Optional: int8 weight-only quantization (the inference-optimize extra); reported, never required.
+OPTIMIZE_DEPENDENCIES = (("torchao", "torchao"),)
 # Per family, the dependencies beyond which it is not served (sdxl-base uses the backend's own).
 FAMILY_DEPENDENCIES = {
     "esrgan": UPSCALE_DEPENDENCIES,
@@ -74,6 +77,25 @@ FAMILY_DEPENDENCIES = {
 
 class Cancelled(Exception):
     pass
+
+
+def uniform_precision(pipe, names, precision):
+    """Cast CLIP *WithProjection components to the load precision after library loading.
+
+    transformers 4.49 builds the inner text/vision model of a `CLIP*ModelWithProjection` in the
+    dtype its config.json records (`torch_dtype`), not the dtype requested, and loads float32
+    weights into it as float32; only the projection follows the request. A bundle whose
+    config.json says float32, loaded at float16 or bfloat16, would then fail at the projection
+    with a dtype mismatch. Casting the whole component restores the requested precision; these
+    classes keep no module in float32 on purpose.
+    """
+    import torch
+
+    dtype = getattr(torch, precision)
+    for name in names:
+        component = getattr(pipe, name, None)
+        if component is not None:
+            component.to(dtype)
 
 
 def offline_environment():
@@ -240,10 +262,13 @@ class TorchBackend:
     # Families this backend's code implements, whatever is installed; others are `unsupported`.
     families = ("sdxl-base", "esrgan")
 
-    def __init__(self, device="cuda:0", memory_budget_mb=None):
+    def __init__(self, device="cuda:0", memory_budget_mb=None, optimization_index=None):
         self.device = device
         self.run_device = device
         self.memory_budget_mb = memory_budget_mb
+        # None reads the packaged benchmark index; tests pass their own entries.
+        self.optimization_index = optimization_index
+        self.load_options = None
         self.loaded_estimate = None
         self.applied_fallbacks = []
         self.family = None
@@ -338,8 +363,10 @@ class TorchBackend:
                 else None
                 for name, module in self.dependencies
                 + (AUDIO_DEPENDENCIES[-1:] if "stable-audio-open" in self.families else ())
+                + OPTIMIZE_DEPENDENCIES
             },
             "max_concurrency": 1,
+            **self.optimization_survey(families),
             "model_families": families or ["sdxl-base"],
             "loaders": self.loaders(families),
             "tasks": tasks,
@@ -368,6 +395,34 @@ class TorchBackend:
 
     def precisions(self):
         return ["float32"] if self.device == "cpu" else ["float16", "float32"]
+
+    def optimization_survey(self, families):
+        """`optimizations` (advertised, each citing its benchmark) and why the rest are not."""
+        if self.missing_dependencies():
+            advertised, unadvertised = [], []
+        else:
+            advertised, unadvertised = optimize.survey(
+                self.backend_id,
+                self.device,
+                families,
+                self.optimization_index,
+                self.missing_dependencies,
+            )
+        return {"optimizations": advertised, "unadvertised_optimizations": unadvertised}
+
+    def denoiser(self):
+        """The module an optimization applies to: the one that dominates execution time."""
+        if self.family == "esrgan":
+            return self.upscaler
+        if self.family == "svd":
+            return self.video.unet
+        if self.family == "stable-audio-open":
+            return self.audio.transformer
+        return self.sdxl_unet()
+
+    def apply_optimizations(self, options):
+        if optimize.requested({k: v for k, v in options.items() if k != "precision"}):
+            optimize.denoiser_optimizations(self.denoiser(), options)
 
     def device_identity(self):
         host_id, source = host_identity()
@@ -507,17 +562,23 @@ class TorchBackend:
             raise WorkerError(400, "unsupported", "family")
         self.run_device = device or self.device
         self.family = family
+        self.load_options = dict(options)
         if family == "esrgan":
-            return self.load_upscaler(root, options)
-        if family == "svd":
-            return self.load_video(root, options)
-        if family == "stable-audio-open":
-            return self.load_audio(root, options)
-        return self.load_pipeline(root, options, adapters)
+            self.load_upscaler(root, options)
+        elif family == "svd":
+            self.load_video(root, options)
+        elif family == "stable-audio-open":
+            self.load_audio(root, options)
+        else:
+            self.load_pipeline(root, options, adapters)
+        # Optimizations are part of this load's identity: applied once, here, never per request.
+        self.apply_optimizations(options)
 
     def unload(self):
         self.upscaler = self.upscale_config = self.video = self.audio = None
         self.unload_pipeline()
+        optimize.release(self.load_options)
+        self.load_options = None
         measurements = self.release_device()
         self.run_device, self.family, self.applied_fallbacks = self.device, None, []
         return measurements
@@ -538,6 +599,10 @@ class TorchBackend:
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
         """Write every output for the request into `directory`; return (records, measurements)."""
+        with optimize.attention_scope(self.load_options):
+            return self.dispatch(request, directory, emit, cancelled, image_path)
+
+    def dispatch(self, request, directory, emit, cancelled, image_path=None):
         if request["task"] == "upscale":
             return self.upscale(request, directory, emit, cancelled, image_path)
         if request["task"] == "image-to-video":
@@ -605,10 +670,13 @@ class DiffusersBackend(TorchBackend):
     ownership = "reference"
     families = ("sdxl-base", "esrgan", "svd", "stable-audio-open")
 
-    def __init__(self, device="cuda:0", memory_budget_mb=None):
-        super().__init__(device, memory_budget_mb)
+    def __init__(self, device="cuda:0", memory_budget_mb=None, optimization_index=None):
+        super().__init__(device, memory_budget_mb, optimization_index)
         self.pipe = None
         self.img2img = None
+
+    def sdxl_unet(self):
+        return self.pipe.unet
 
     def load_pipeline(self, root, options, adapters=()):
         offline_environment()
@@ -626,6 +694,7 @@ class DiffusersBackend(TorchBackend):
         )
         pipe.unet.set_attn_processor(AttnProcessor2_0())
         pipe.vae.set_attn_processor(AttnProcessor2_0())
+        uniform_precision(pipe, ("text_encoder", "text_encoder_2"), options["precision"])
         if adapters:
             # The library injects PEFT layers; adapters are part of this load's identity.
             for record, adapter_root, weights, _scale, _layout in adapters:
@@ -664,6 +733,7 @@ class DiffusersBackend(TorchBackend):
         )
         pipe.unet.set_attn_processor(AttnProcessor2_0())
         pipe.vae.set_attn_processor(AttnProcessor2_0())
+        uniform_precision(pipe, ("image_encoder",), options["precision"])
         pipe.to(self.run_device)
         pipe.set_progress_bar_config(disable=True)
         self.video = pipe
