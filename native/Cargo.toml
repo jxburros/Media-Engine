@@ -1,0 +1,28 @@
+[package]
+name = "media-engine-native"
+version = "1.0.0"
+edition = "2021"
+description = "Owned native media-worker engine (native-sdxl) for Media Runtime"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "media-engine-native"
+path = "src/main.rs"
+
+[dependencies]
+sdxl = { path = "sdxl", package = "media-engine-sdxl" }
+
+[features]
+cuda = ["sdxl/cuda"]
+
+[workspace]
+members = ["sdxl"]
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 1
+
+[profile.dev]
+opt-level = 2

@@ -33,10 +33,13 @@ class OwnedPipelineBackend(TorchBackend):
     # `family`, on this backend.
     families = ("sdxl-base", "esrgan")
 
-    def __init__(self, device="cuda:0", memory_budget_mb=None):
-        super().__init__(device, memory_budget_mb)
+    def __init__(self, device="cuda:0", memory_budget_mb=None, optimization_index=None):
+        super().__init__(device, memory_budget_mb, optimization_index)
         self.components = None
         self.merged_adapters = []
+
+    def sdxl_unet(self):
+        return self.components["unet"]
 
     # ----- adapters --------------------------------------------------------------------------
     @staticmethod

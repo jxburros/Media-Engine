@@ -31,13 +31,42 @@ from media_engine.contracts import (
     output_ids,
     video_facts,
 )
-from media_engine import audio
+from media_engine import audio, optimize
 from media_engine import png as png_module
 from media_engine import video
 from media_engine.upscale import architecture, tile_count, validate_config
 
-FIXTURE_VERSION = "0.7.0-test-fixture"
+FIXTURE_VERSION = "1.0.0-test-fixture"
 NOTICE = "TEST FIXTURE ONLY - NOT MODEL WEIGHTS"
+# What the fixture advertises under capabilities.optimizations (1.3): every candidate but flash,
+# which it lists as device_unsupported so callers see both shapes. No benchmark exists for a
+# fixture; the citation says so and nothing about speed or quality is claimed.
+FIXTURE_OPTIMIZATIONS = (("precision", "bfloat16"), ("quantization", "int8-weight-only"), ("compile", "inductor"))
+
+
+def fixture_optimizations(pairs=FIXTURE_OPTIMIZATIONS):
+    advertised, unadvertised = [], []
+    for c in optimize.CANDIDATES:
+        key = {"option": c["option"], "value": c["value"]}
+        if (c["option"], c["value"]) not in pairs:
+            unadvertised.append({**key, "reason": "device_unsupported"})
+            continue
+        record = {
+            **key,
+            "families": list(c["families"]),
+            "device_class": {"kind": "test-fixture"},
+            "benchmark": "test-fixture (no benchmark; protocol surface only)",
+            "benchmark_sha256": "0" * 64,
+            "improvement": "none claimed: the fixture does not run inference",
+            "determinism": "fixture outputs depend on the seed only",
+            "quality_note": "fixture outputs are flat colors, not inference",
+            "effect": c["effect"],
+            "adapters": c["adapters"],
+        }
+        if "precisions" in c:
+            record["precisions"] = list(c["precisions"])
+        advertised.append(record)
+    return advertised, unadvertised
 
 
 def zero_safetensors(shapes):
@@ -357,6 +386,7 @@ class TestBackend:
         output_side=None,
         device_index=0,
         host_id="fixture-host",
+        optimizations=FIXTURE_OPTIMIZATIONS,
     ):
         self.generations = 0
         self.loads = 0
@@ -377,6 +407,7 @@ class TestBackend:
         self.default_frames = None
         self.audio_facts = None
         self.loaded_options = None
+        self.optimizations = tuple(optimizations)
 
     @property
     def level(self):
@@ -464,6 +495,9 @@ class TestBackend:
         caps["adapters"] = {**caps["adapters"], "families": ["sdxl-base"]}
         if self.level >= 3:
             caps["missing_task_dependencies"] = {}
+            advertised, unadvertised = fixture_optimizations(self.optimizations)
+            caps["optimizations"] = advertised
+            caps["unadvertised_optimizations"] = unadvertised
         return caps
 
     def device_identity(self):

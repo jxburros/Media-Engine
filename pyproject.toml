@@ -3,7 +3,7 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
-version = "0.7.0"
+version = "1.0.0"
 description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video, Stable Audio Open text-to-audio) for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
@@ -17,7 +17,13 @@ inference = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "accel
 # text-to-audio (stable-audio-open, reference backend): the family's scheduler imports torchsde.
 # Installed alongside `inference`; it adds nothing the other families need.
 inference-audio = ["torchsde==0.2.6"]
+# Optimization options (phase E5): int8 weight-only quantization (torchao). bfloat16, flash
+# attention (PyTorch's own SDPA kernel) and compile (inductor) need nothing beyond torch.
+# Installed alongside `inference` or `inference-owned`; nothing is advertised without a benchmark.
+inference-optimize = ["torchao==0.9.0"]
 [project.scripts]
 media-engine = "media_engine.server:main"
 [tool.setuptools.packages.find]
 where = ["src"]
+[tool.setuptools.package-data]
+media_engine = ["optimizations.json"]

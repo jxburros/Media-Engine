@@ -244,7 +244,7 @@ wheels = [
 
 [[package]]
 name = "media-engine"
-version = "0.7.0"
+version = "1.0.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -260,6 +260,9 @@ inference = [
 ]
 inference-audio = [
     { name = "torchsde" },
+]
+inference-optimize = [
+    { name = "torchao" },
 ]
 inference-owned = [
     { name = "diffusers" },
@@ -282,11 +285,12 @@ requires-dist = [
     { name = "safetensors", marker = "extra == 'inference-owned'", specifier = "==0.5.3" },
     { name = "torch", marker = "extra == 'inference'", specifier = "==2.6.0" },
     { name = "torch", marker = "extra == 'inference-owned'", specifier = "==2.6.0" },
+    { name = "torchao", marker = "extra == 'inference-optimize'", specifier = "==0.9.0" },
     { name = "torchsde", marker = "extra == 'inference-audio'", specifier = "==0.2.6" },
     { name = "transformers", marker = "extra == 'inference'", specifier = "==4.49.0" },
     { name = "transformers", marker = "extra == 'inference-owned'", specifier = "==4.49.0" },
 ]
-provides-extras = ["inference-owned", "inference", "inference-audio"]
+provides-extras = ["inference-owned", "inference", "inference-audio", "inference-optimize"]
 
 [[package]]
 name = "mpmath"
@@ -788,6 +792,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/01/d6/455ab3fbb2c61c71c8842753b566012e1ed111e7a4c82e0e1c20d0c76b62/torch-2.6.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b789069020c5588c70d5c2158ac0aa23fd24a028f34a8b4fcb8fcb4d7efcf5fb", size = 95607867, upload-time = "2025-01-29T16:25:55.649Z" },
     { url = "https://files.pythonhosted.org/packages/18/cf/ae99bd066571656185be0d88ee70abc58467b76f2f7c8bfeb48735a71fe6/torch-2.6.0-cp312-cp312-win_amd64.whl", hash = "sha256:7e1448426d0ba3620408218b50aa6ada88aeae34f7a239ba5431f6c8774b1239", size = 204120469, upload-time = "2025-01-29T16:24:01.821Z" },
     { url = "https://files.pythonhosted.org/packages/81/b4/605ae4173aa37fb5aa14605d100ff31f4f5d49f617928c9f486bb3aaec08/torch-2.6.0-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:9a610afe216a85a8b9bc9f8365ed561535c93e804c2a317ef7fabcc5deda0989", size = 66532538, upload-time = "2025-01-29T16:24:18.976Z" },
+]
+
+[[package]]
+name = "torchao"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7d/fe/a24225d30775192a4c5d9cea3ecb95e6adc69d0a8b5ed98eb8e58d362344/torchao-0.9.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bc708910301a9f98344d43f3fe2aa6d5e1fab706d772b6df47ff05087d664145", size = 5652091, upload-time = "2025-02-28T13:54:15.239Z" },
+    { url = "https://files.pythonhosted.org/packages/db/72/01f755514fb61eadc80b974eb4bd4f22f3009b35457773523e3bd497c511/torchao-0.9.0-py3-none-any.whl", hash = "sha256:ea5603c32762f1a9ade1a4dc7b00f5246623b24a28e49e666f614c79a408712a", size = 712541, upload-time = "2025-02-28T13:54:13.671Z" },
 ]
 
 [[package]]

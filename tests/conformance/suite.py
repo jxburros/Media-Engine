@@ -42,9 +42,17 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SUITE_VERSION = "media-worker-conformance/1.2"
+SUITE_VERSION = "media-worker-conformance/1.3"
 SECRET = "conformance-secret-prompt-7f3a"
 TERMINAL = {"succeeded", "failed", "cancelled"}
+# The optimization candidates of minor 1.3 and the reasons a worker may give for not offering one.
+OPTIMIZATION_CANDIDATES = {
+    ("precision", "bfloat16"),
+    ("attention", "flash"),
+    ("quantization", "int8-weight-only"),
+    ("compile", "inductor"),
+}
+UNADVERTISED_REASONS = {"missing_dependency", "device_unsupported", "no_benchmark"}
 
 
 def make_png(width, height, color=(0x20, 0x90, 0x50)):
@@ -870,6 +878,70 @@ class TextToAudio(Section):
         self.ensure_loaded()
 
 
+class Optimizations(Section):
+    """1.3 optimizations: each cited, explicit, never automatic, and a load-identity change."""
+
+    section = "optimizations"
+
+    def load_body(self, version=None, **options):
+        return {"protocol": version or self.version, "bundle": self.bundle, "options": {**self.options(), **options}}
+
+    def test_optimizations(self):
+        if self.minor() < 3:
+            return  # not applicable
+        offered = self.caps.get("optimizations")
+        self.assertIsInstance(offered, list)
+        pairs = set()
+        for record in offered:
+            pair = (record["option"], record["value"])
+            self.assertIn(pair, OPTIMIZATION_CANDIDATES)
+            for field in ("benchmark", "benchmark_sha256", "improvement", "determinism", "quality_note"):
+                self.assertIsInstance(record[field], str)
+                self.assertTrue(record[field], field)
+            self.assertIsInstance(record["families"], list)
+            pairs.add(pair)
+        for record in self.caps.get("unadvertised_optimizations", []):
+            self.assertIn((record["option"], record["value"]), OPTIMIZATION_CANDIDATES - pairs)
+            self.assertIn(record["reason"], UNADVERTISED_REASONS)
+        # Never automatic: auto resolution does not pick an optimized value.
+        if "precision" in self.caps.get("auto_options", []):
+            value = self.client.json("POST", "/v1/validate", self.load_body(precision="auto"))
+            self.assertNotIn(("precision", value["resolved_options"]["precision"]), pairs)
+        # Explicit baseline values need nothing advertised; bogus or unoffered values are refused.
+        value = self.client.json("POST", "/v1/validate", self.load_body(quantization="none", compile="none"))
+        self.assertTrue(value["valid"])
+        for option, bogus in (("quantization", "int3"), ("compile", "eager"), ("attention", "conformance")):
+            status, value, _ = self.client.call("POST", "/v1/validate", self.load_body(**{option: bogus}))
+            self.error(status, value, "unsupported", "options")
+        for option, candidate in sorted(OPTIMIZATION_CANDIDATES - pairs):
+            status, value, _ = self.client.call("POST", "/v1/validate", self.load_body(**{option: candidate}))
+            self.error(status, value, "unsupported", "options")
+        older = [v for v in self.protocols if 2 <= self.minor(v) < 3]
+        if older:
+            # A 1.2 load body keeps its three fields: the new ones are unknown fields there.
+            status, value, _ = self.client.call("POST", "/v1/validate", self.load_body(older[-1], quantization="none"))
+            self.error(status, value, "invalid_request")
+        # Each offered optimization for this family loads, is the loaded identity, and executes.
+        family = self.bundle.get("family", "sdxl-base")
+        for record in offered:
+            if family not in record["families"]:
+                continue
+            options = {record["option"]: record["value"]}
+            if "precisions" in record and self.options()["precision"] not in record["precisions"]:
+                options["precision"] = record["precisions"][0]
+            body = self.load_body(**options)
+            value = self.client.json("POST", "/v1/validate", body)
+            self.assertEqual(value["resolved_options"][record["option"]], record["value"])
+            self.operation("load", body)
+            loaded = self.client.json("GET", "/v1/info")["loaded_bundle"]
+            self.assertEqual(loaded["options"][record["option"]], record["value"])
+            snap = self.run_to_end(self.request(self.attempt("optimized")))
+            self.assertEqual(snap["state"], "succeeded", snap.get("error"))
+            self.discard(snap["execution_id"])
+        if offered:
+            self.operation("load", self.load_body())
+
+
 class Privacy(Section):
     section = "privacy"
 
@@ -897,7 +969,7 @@ class Privacy(Section):
             self.assertEqual(set(json.loads(text)), {"error"})
 
 
-SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, ImageToVideo, TextToAudio, Inputs, Retention, Privacy]
+SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, ImageToVideo, TextToAudio, Optimizations, Inputs, Retention, Privacy]
 
 
 def load_suite():

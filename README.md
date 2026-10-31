@@ -8,7 +8,9 @@ execution slot, SDXL text-to-image (up to four images per execution) and image-t
 upscaling, Stable Video Diffusion image-to-video as a lossless frame archive, Stable Audio Open
 text-to-audio as 16-bit PCM WAV, real sampling/tile/frame callbacks, cooperative cancellation, resumable SSE, opaque
 input/output handles, header-based memory estimates, automatic precision with caller-authorized
-fallbacks, device identity and an offline single-file checkpoint converter.
+fallbacks, device identity, an offline single-file checkpoint converter, and explicit optimization
+options (bfloat16, FlashAttention, int8 weight-only quantization, inductor compilation) that are
+advertised only once a benchmark on the device class is cited.
 
 The authoritative product scope is [engine-spec.md](engine-spec.md); the deferred capabilities it
 specifies are sequenced in [docs/implementation-plan.md](docs/implementation-plan.md). This release delivers two of
@@ -17,7 +19,14 @@ Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this proj
 components and runs the denoising loop itself). The `esrgan` upscaler network is engine code on
 both. The `svd` image-to-video and `stable-audio-open` text-to-audio families run on the reference
 backend only. Native engines, owned video and audio loops and custom GPU kernels are future
-stages; they are not advertised as capabilities.
+stages; they are not advertised as capabilities. Engine 0.8.0 advertises no optimization yet: its
+benchmark index is empty until one is recorded on the reference hardware.
+
+Engine 1.0.0 adds the third stage, the **owned native engine** (`native-sdxl`, `ownership:
+engine`): a separately built Rust executable in [native/](native/README.md) that implements the
+same protocol for the `sdxl-base` family with its own HTTP server, tokenizer, models and scheduler
+on the candle tensor library, and needs no Python on the host. It is conformant and reproduces the
+owned pipeline within one 8-bit level on CPU; it binds loopback only and serves sdxl-base only.
 
 ## Install
 
@@ -28,6 +37,7 @@ Installation is an explicit network action; serving never downloads models or ex
 ```sh
 uv sync --frozen --extra inference          # both backends (reference set)
 uv sync --frozen --extra inference-owned    # owned-sdxl and the upscaler only: no accelerate, no peft
+uv sync --frozen --extra inference --extra inference-optimize   # adds torchao for int8 weight-only
 uv sync --frozen --extra inference --extra inference-audio   # plus text-to-audio (torchsde)
 .venv/bin/media-engine --version
 .venv/bin/media-engine --probe
@@ -223,6 +233,33 @@ refused and no precision changes. Applied fallbacks are reported on the load ope
 startup record carry `device_identity` (device, index, name, total memory, a SHA-256 host ID from
 `/etc/machine-id` or the hostname, and pid) so a supervisor pool can tell workers apart.
 
+## Optimization options
+
+A 1.3 load may select `precision: bfloat16`, `attention: flash`, `quantization:
+int8-weight-only` or `compile: inductor`, but only values listed in
+`capabilities.optimizations`, each of which cites the benchmark that justified it (improvement,
+determinism, quality note). The rest are listed in `capabilities.unadvertised_optimizations` with
+the reason (`missing_dependency`, `device_unsupported`, `no_benchmark`). An optimization is part
+of the load identity, is never chosen by `auto` and cannot be combined with the `cpu` fallback.
+int8 weight-only needs the `inference-optimize` extra (`torchao`); the others need only torch (and
+a C++ compiler on CPU, or triton on CUDA, for inductor). Details: [protocol](docs/protocol.md#optimizations).
+
+**0.8.0 ships no benchmark**, so nothing is advertised on any device. To produce the evidence:
+
+```sh
+uv sync --frozen --extra inference --extra inference-optimize
+python tools/benchmark.py --backend diffusers-sdxl --device cuda:0 --catalog catalog.json \
+  --registration sdxl.json --precision float16 --option precision=bfloat16 \
+  --option attention=flash --option quantization=int8-weight-only --option compile=inductor
+```
+
+The tool loads each option set in-process, records load, first-execution (compilation) and
+steady-state times, peak device memory, output digests and per-pixel or per-sample differences
+from the baseline in `docs/benchmarks/<date>-<device class>.json`, and prints candidate index
+entries for the sets that qualify. A release cites an entry by adding it, with the file's SHA-256,
+to `src/media_engine/optimizations.json` (see the checklist in
+[docs/compatibility.md](docs/compatibility.md)).
+
 ## Network mode
 
 By default the worker listens on `127.0.0.1` over plain HTTP. For a supervisor on another host,
@@ -311,7 +348,7 @@ PYTHONPATH=src python -m tests.conformance.run --registration ROOT/conformance.j
   --launch python tests/serve_fixture.py ROOT
 ```
 
-The conformance suite (`tests/conformance`, `media-worker-conformance/1.2`) runs against any
+The conformance suite (`tests/conformance`, `media-worker-conformance/1.3`) runs against any
 worker: `--url URL` with the credential in `MEDIA_ENGINE_TOKEN`, or `--launch CMD…` to start it
 and check its startup record too. It reports each section and says "conformant" only when none
 failed or was skipped; a backend is advertised only after it passes. Results are kept in
@@ -326,7 +363,9 @@ runs the suite over TLS with the committed test certificates in `tests/certs`.
 SDXL-shaped bundle and a tiny RRDBNet, and image-to-video through the reference backend on a tiny
 random-weight svd bundle (64×64, two frames, two steps), and text-to-audio through the reference
 backend on a tiny random-weight stable-audio-open bundle (1 kHz stereo, one second, two steps;
-skipped without `torchsde`); `tests/test_convert.py` converts a tiny single-file
+skipped without `torchsde`), and every CPU-capable optimization through both backends with a
+test-only benchmark index (int8 weight-only skipped without `torchao`, inductor without a C++
+compiler); `tests/test_convert.py` converts a tiny single-file
 checkpoint built from it. They are skipped unless the inference extra is installed (`uv sync --frozen --extra
 inference` then `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`). It proves the
 owned loop and the reference pipeline execute the same contract and, for the same seed and settings,
@@ -334,8 +373,11 @@ produce pixel-identical text-to-image output and image-to-image output within on
 CPU stack, and that LoRA adapters change the output identically on both backends; it says nothing
 about image quality. Run the Runtime
 repository's `go test ./...` with both repositories beside each other for cross-process durable-job tests.
+The native engine has its own tests: `cargo test --workspace --manifest-path native/Cargo.toml`, and
+`MEDIA_ENGINE_NATIVE=native/target/release/media-engine-native` makes `tests/test_native.py` run the
+conformance suite against the binary and compare it with `owned-sdxl` on the tiny bundle.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.7.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.7.0;
+Engine 1.0.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.8.0 (and 1.3 callers such as Runtime 0.9.0 and 0.10.0);
 its startup record keeps `protocol: "media-worker/1.1"` for those launchers and reports `highest_protocol`.
 `tests/serve_fixture.py --protocol media-worker/1.2` (or `1.1`) pins the fixture to an older surface.
 

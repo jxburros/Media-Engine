@@ -14,6 +14,8 @@ runs text-to-audio through the reference backend only.
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -21,7 +23,7 @@ from pathlib import Path
 
 from fixture import describe_bundle, make_png
 from media_engine import png
-from media_engine.contracts import DEFAULTS, PROTOCOL, digest
+from media_engine.contracts import DEFAULTS, PROTOCOL, WorkerError, digest
 
 # The owned pipeline needs only the inference-owned extra; the reference backend needs the full set.
 HAVE_OWNED = all(
@@ -35,6 +37,10 @@ HAVE_INFERENCE = HAVE_OWNED and all(
 HAVE_VIDEO = HAVE_OWNED and importlib.util.find_spec("PIL") is not None
 # text-to-audio needs the family's model classes plus torchsde (the inference-audio extra).
 HAVE_AUDIO = HAVE_OWNED and importlib.util.find_spec("torchsde") is not None
+# int8 weight-only quantization needs torchao (the inference-optimize extra); inductor on CPU
+# needs a C++ compiler.
+HAVE_TORCHAO = HAVE_OWNED and importlib.util.find_spec("torchao") is not None
+HAVE_COMPILER = shutil.which(os.environ.get("CXX") or "g++") is not None
 
 
 def pixels(data):
@@ -561,7 +567,8 @@ class OwnedInferenceTests(Harness, unittest.TestCase):
         names = {name for name, _ in OwnedPipelineBackend.dependencies}
         self.assertEqual(names, {"torch", "diffusers", "transformers", "safetensors"})
         caps = self.worker("owned-sdxl").capabilities()
-        self.assertEqual(set(caps["dependencies"]), names)
+        # torchao is reported (null when absent) because int8 weight-only uses it; it is optional.
+        self.assertEqual(set(caps["dependencies"]), names | {"torchao"})
 
 
 @unittest.skipUnless(HAVE_INFERENCE, "inference extra is not installed")
@@ -844,3 +851,197 @@ class AudioInferenceTests(Harness, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def cpu_benchmark_index():
+    """A test-only benchmark index naming this CPU, so the real backends advertise every candidate.
+
+    It stands in for an entry a release would cite; it claims nothing about speed or quality.
+    """
+    from media_engine import optimize
+
+    return [
+        {
+            "option": c["option"],
+            "value": c["value"],
+            "backend_ids": ["diffusers-sdxl", "owned-sdxl"],
+            "device_class": optimize.device_class("cpu"),
+            "families": list(c["families"]),
+            "benchmark": "test-only: tests/test_inference.py",
+            "benchmark_sha256": "0" * 64,
+            "improvement": "none claimed",
+            "determinism": "test-only",
+            "quality_note": "test-only",
+        }
+        for c in optimize.CANDIDATES
+    ]
+
+
+@unittest.skipUnless(HAVE_INFERENCE, "inference extra not installed")
+class OptimizationInferenceTests(Harness, unittest.TestCase):
+    """Each optimization applied through the real backends on CPU float32/bfloat16 (E5)."""
+
+    BASE = {"attention": "sdpa", "offload": "none"}
+
+    def optimized(self, backend_id):
+        from media_engine.backend import backend_class
+        from media_engine.server import Worker
+
+        backend = backend_class(backend_id)("cpu", None, cpu_benchmark_index())
+        name = f"{backend_id}-{len(os.listdir(self.root)) if self.root.exists() else 0}-{time.monotonic_ns()}"
+        return Worker(
+            self.root / "optimized" / name,
+            backend,
+            {
+                "tiny": str(self.model_dir),
+                "tiny-upscaler": str(self.root / "upscaler"),
+                "tiny-video": str(self.root / "video"),
+                "tiny-audio": str(self.root / "audio"),
+            },
+        )
+
+    def image(self, backend_id, precision="float32", **options):
+        worker = self.optimized(backend_id)
+        self.load(worker, self.bundle, options={"precision": precision, **self.BASE, **options})
+        snap = self.run_request(worker, self.request("attempt_opt"))
+        return self.output(worker, snap), worker
+
+    def test_advertising_on_this_cpu(self):
+        from media_engine.backend import backend_class
+
+        for backend_id in ("diffusers-sdxl", "owned-sdxl"):
+            packaged = backend_class(backend_id)("cpu").capabilities()
+            # 0.8.0 ships no benchmark, so a real backend advertises nothing anywhere.
+            self.assertEqual(packaged["optimizations"], [])
+            reasons = {u["option"]: u["reason"] for u in packaged["unadvertised_optimizations"]}
+            self.assertEqual(reasons["attention"], "device_unsupported")
+            self.assertEqual(reasons["precision"], "no_benchmark")
+            caps = backend_class(backend_id)("cpu", None, cpu_benchmark_index()).capabilities()
+            offered = {o["option"]: o for o in caps["optimizations"]}
+            self.assertIn("precision", offered)
+            self.assertNotIn("attention", offered)  # FlashAttention is a CUDA kernel
+            self.assertEqual("quantization" in offered, HAVE_TORCHAO)
+            self.assertEqual("compile" in offered, HAVE_COMPILER)
+            self.assertEqual(caps["dependencies"]["torchao"] is not None, HAVE_TORCHAO)
+
+    def test_bfloat16_is_reproducible_and_agrees_across_backends(self):
+        import torch
+
+        outputs = {}
+        for backend_id in ("diffusers-sdxl", "owned-sdxl"):
+            data, worker = self.image(backend_id, "bfloat16")
+            unet = worker.backend.denoiser()
+            self.assertEqual(next(unet.parameters()).dtype, torch.bfloat16)
+            again = self.run_request(worker, self.request("attempt_again"))
+            self.assertEqual(hashlib.sha256(data).hexdigest(), again["outputs"][0]["sha256"])
+            self.assertEqual(worker.info()["loaded_bundle"]["memory_estimate"]["precision"], "bfloat16")
+            outputs[backend_id] = data
+        self.assertLessEqual(difference(outputs["diffusers-sdxl"], outputs["owned-sdxl"]), 1)
+
+    def test_bfloat16_denoiser_is_within_its_stated_tolerance(self):
+        """One UNet evaluation: bfloat16 within 5% relative mean error of float32.
+
+        End-to-end pixels are not compared: three steps of a random-weight network amplify the
+        rounding of bfloat16's 8-bit mantissa without bound, which says nothing about real weights.
+        """
+        import torch
+        from diffusers import UNet2DConditionModel
+
+        unet = UNet2DConditionModel.from_pretrained(str(self.model_dir), subfolder="unet").eval()
+        generator = torch.Generator().manual_seed(0)
+        sample = torch.randn(2, 4, 8, 8, generator=generator)
+        context = torch.randn(2, 77, 64, generator=generator)
+        added = {"text_embeds": torch.randn(2, 32, generator=generator), "time_ids": torch.randn(2, 6, generator=generator)}
+        with torch.inference_mode():
+            reference = unet(sample, torch.tensor([500.0]), context, added_cond_kwargs=added).sample
+            unet.to(torch.bfloat16)
+            reduced = unet(
+                sample.bfloat16(),
+                torch.tensor([500.0]),
+                context.bfloat16(),
+                added_cond_kwargs={k: v.bfloat16() for k, v in added.items()},
+            ).sample.float()
+        relative = ((reference - reduced).abs().mean() / reference.abs().mean()).item()
+        self.assertLess(relative, 0.05)
+
+    @unittest.skipUnless(HAVE_TORCHAO, "torchao (inference-optimize extra) not installed")
+    def test_int8_weight_only_quantizes_the_denoiser(self):
+        baseline, _ = self.image("owned-sdxl")
+        for backend_id in ("diffusers-sdxl", "owned-sdxl"):
+            data, worker = self.image(backend_id, quantization="int8-weight-only")
+            quantized = [
+                m for m in worker.backend.denoiser().modules()
+                if type(m).__name__ == "Linear" and "Quantized" in type(m.weight).__name__
+            ]
+            self.assertTrue(quantized)
+            # Measured on this tiny bundle: within one 8-bit level of float32 (a fact, not a claim).
+            self.assertLessEqual(difference(baseline, data), 2)
+            self.assertEqual(
+                {n["option"] for n in worker.info()["loaded_bundle"]["memory_estimate"]["optimizations"]},
+                {"quantization"},
+            )
+
+    @unittest.skipUnless(HAVE_COMPILER, "no C++ compiler for inductor")
+    def test_inductor_matches_eager_and_keeps_cancellation(self):
+        eager, _ = self.image("owned-sdxl")
+        compiled, worker = self.image("owned-sdxl", compile="inductor")
+        self.assertLessEqual(difference(eager, compiled), 1)
+        # Hooks and step callbacks stay eager: progress and cancellation behave as before.
+        execution = worker.submit(self.request("attempt_cancel_compiled"))["execution_id"]
+        worker.cancel(execution)
+        self.assertEqual(self.finish(worker, execution=execution)["state"], "cancelled")
+        unload = worker.control("unload", {"protocol": PROTOCOL})
+        self.assertEqual(self.finish(worker, operation=unload["operation_id"])["state"], "succeeded")
+
+    def test_upscaler_in_bfloat16(self):
+        worker = self.optimized("owned-sdxl")
+        self.load(worker, self.upscaler, options={"precision": "bfloat16", **self.BASE})
+        record = worker.store_input(make_png(64, 64))
+        snap = self.run_request(
+            worker,
+            {
+                "protocol": PROTOCOL,
+                "attempt_id": "attempt_upscale_bf16",
+                "bundle_digest": self.upscaler["bundle_digest"],
+                "task": "upscale",
+                "inputs": {"image": record["input_id"]},
+                "parameters": {"width": 64, "height": 64},
+            },
+        )
+        self.assertEqual(png.header(self.output(worker, snap))[:2], (128, 128))
+
+    @unittest.skipUnless(HAVE_VIDEO and HAVE_AUDIO and HAVE_TORCHAO, "video, audio and optimize extras needed")
+    def test_video_and_audio_accept_their_optimizations(self):
+        worker = self.optimized("diffusers-sdxl")
+        # bfloat16 is not offered for svd (the library pipeline feeds its VAE float32 then).
+        bf16 = {"protocol": PROTOCOL, "bundle": self.video, "options": {"precision": "bfloat16", **self.BASE}}
+        with self.assertRaises(WorkerError) as caught:
+            worker.validate_load(bf16)
+        self.assertEqual((caught.exception.code, caught.exception.field), ("unsupported", "options"))
+        self.load(worker, self.video, options={"precision": "float32", **self.BASE, "quantization": "int8-weight-only"})
+        record = worker.store_input(make_png(64, 64))
+        snap = self.run_request(
+            worker,
+            {
+                "protocol": PROTOCOL,
+                "attempt_id": "attempt_video_opt",
+                "bundle_digest": self.video["bundle_digest"],
+                "task": "image-to-video",
+                "inputs": {"image": record["input_id"]},
+                "parameters": {"width": 64, "height": 64, "seed": 3, "steps": 2},
+            },
+        )
+        self.assertEqual([o["output_id"] for o in snap["outputs"]], ["frames", "poster"])
+        self.load(worker, self.audio, options={"precision": "bfloat16", **self.BASE, "quantization": "int8-weight-only"})
+        snap = self.run_request(
+            worker,
+            {
+                "protocol": PROTOCOL,
+                "attempt_id": "attempt_audio_opt",
+                "bundle_digest": self.audio["bundle_digest"],
+                "task": "text-to-audio",
+                "inputs": {"prompt": "soft rain"},
+                "parameters": {"seed": 3, "steps": 2, "duration_seconds": 1},
+            },
+        )
+        self.assertEqual(snap["outputs"][0]["mime_type"], "audio/wav")
