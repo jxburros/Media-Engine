@@ -185,8 +185,8 @@ fn check_conversion(conversion: &Value) -> Result<()> {
     if keys != expected || mapped.values().any(|v| !v.as_int().is_some_and(|i| i >= 0)) {
         return Err(invalid());
     }
-    if map.get("schema_version").map_or(false, |v| *v != Value::Int(1))
-        || map.get("unmapped_keys").map_or(false, |v| *v != Value::Array(vec![]))
+    if map.get("schema_version").is_some_and(|v| *v != Value::Int(1))
+        || map.get("unmapped_keys").is_some_and(|v| *v != Value::Array(vec![]))
     {
         return Err(invalid());
     }
@@ -217,7 +217,7 @@ pub fn bundle_path(bundle: &Value, catalog: &BTreeMap<String, String>, verify: b
     if map["schema_version"] != Value::Int(1)
         || family != Some(FAMILY)
         || since.is_none_or(|s| s > level)
-        || map.get("format").map_or(false, |f| f.as_str() != Some("diffusers-safetensors"))
+        || map.get("format").is_some_and(|f| f.as_str() != Some("diffusers-safetensors"))
         || map["pipeline"].as_str() != Some("text-to-image")
     {
         return Err(bad("unsupported", "family"));

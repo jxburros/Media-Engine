@@ -217,13 +217,13 @@ impl Backend {
         let mut run_device = self.device.clone();
         if accelerator {
             let precision = resolved["precision"].as_str().unwrap().to_string();
-            let mut over = available && budget_mb.is_some_and(|b| estimate(&precision).map_or(false, |e| e as u64 > b));
+            let mut over = available && budget_mb.is_some_and(|b| estimate(&precision).is_ok_and(|e| e as u64 > b));
             if over && authorized.iter().any(|a| a == "lower_precision") {
                 let budget_value = budget_mb.unwrap();
                 let lower: Vec<&str> = precisions
                     .iter()
                     .copied()
-                    .filter(|p| c::precision_bytes(p) < c::precision_bytes(&precision) && estimate(p).map_or(false, |e| e as u64 <= budget_value))
+                    .filter(|p| c::precision_bytes(p) < c::precision_bytes(&precision) && estimate(p).is_ok_and(|e| e as u64 <= budget_value))
                     .collect();
                 if let Some(first) = lower.first() {
                     applied.push(obj! {
@@ -975,6 +975,13 @@ impl Worker {
         })();
         let _ = std::fs::remove_dir_all(&temporary);
         let mut s = self.lock();
+        // Decided under the lock cancel() takes: a cancel recorded before publication wins, so
+        // `cancel_requested` is true exactly when the execution does not succeed.
+        let requested = s.executions.get(execution_id).is_some_and(|e| e.cancel_requested);
+        let outcome = match outcome {
+            Outcome::Succeeded(..) if requested => Outcome::Cancelled,
+            other => other,
+        };
         let state = match outcome {
             Outcome::Succeeded(records, measurements) => {
                 if let Some(e) = s.executions.get_mut(execution_id) {

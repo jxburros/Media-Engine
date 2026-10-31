@@ -182,8 +182,14 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
         return Err(fail(401, "unauthorized", None));
     }
     match (method.as_str(), path.as_str()) {
-        ("GET", "/v1/info") => return Ok(respond(response, 200, &worker.info())),
-        ("GET", "/v1/capabilities") => return Ok(respond(response, 200, &worker.capabilities())),
+        ("GET", "/v1/info") => return {
+            respond(response, 200, &worker.info());
+            Ok(())
+        },
+        ("GET", "/v1/capabilities") => return {
+            respond(response, 200, &worker.capabilities());
+            Ok(())
+        },
         ("POST", "/v1/validate") => {
             let body = body_json(&mut request)?;
             let value = if body.get("bundle").is_some() {
@@ -193,12 +199,18 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
             } else {
                 worker.validate_execution(&body)?
             };
-            return Ok(respond(response, 200, &value));
+            return {
+                respond(response, 200, &value);
+                Ok(())
+            };
         }
         ("POST", "/v1/model/load") | ("POST", "/v1/model/unload") => {
             let body = body_json(&mut request)?;
             let action = path.rsplit('/').next().unwrap();
-            return Ok(respond(response, 202, &worker.control(action, body)?));
+            return {
+                respond(response, 202, &worker.control(action, body)?);
+                Ok(())
+            };
         }
         ("POST", "/v1/inputs") => {
             if request.header("content-type") != Some("image/png") {
@@ -206,15 +218,24 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
             }
             let limit = (worker.max_input_mb * 1024 * 1024) as usize;
             let data = request.body(limit).map_err(|status| fail(status, "invalid_request", None))?;
-            return Ok(respond(response, 201, &worker.store_input(&data)?));
+            return {
+                respond(response, 201, &worker.store_input(&data)?);
+                Ok(())
+            };
         }
         ("POST", "/v1/executions") => {
             let body = body_json(&mut request)?;
-            return Ok(respond(response, 202, &worker.submit(body)?));
+            return {
+                respond(response, 202, &worker.submit(body)?);
+                Ok(())
+            };
         }
         ("GET", "/v1/executions") => {
             let attempt = http::query_value(&request.query, "attempt_id").unwrap_or_default();
-            return Ok(respond(response, 200, &worker.attempt(&attempt)?));
+            return {
+                respond(response, 200, &worker.attempt(&attempt)?);
+                Ok(())
+            };
         }
         _ => {}
     }
@@ -225,20 +246,30 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
         if method == "DELETE" && !running {
             s.operations.remove(operation_id);
             drop(s);
-            return Ok(respond(response, 200, &obj! {"released" => true}));
+            return {
+                respond(response, 200, &obj! {"released" => true});
+                Ok(())
+            };
         }
         drop(s);
         if method == "GET" {
-            return Ok(respond(response, 200, &op));
+            return {
+                respond(response, 200, &op);
+                Ok(())
+            };
         }
         return Err(fail(409, "busy", None));
     }
     if let Some(input_id) = path.strip_prefix("/v1/inputs/").filter(|i| contracts::is_input_id(i)) {
         return match method.as_str() {
-            "GET" => Ok(respond(response, 200, &worker.input_record(input_id)?)),
+            "GET" => {
+                respond(response, 200, &worker.input_record(input_id)?);
+                Ok(())
+            },
             "DELETE" => {
                 worker.release_input(input_id)?;
-                Ok(respond(response, 200, &obj! {"released" => true}))
+                respond(response, 200, &obj! {"released" => true});
+                Ok(())
             }
             _ => Err(fail(404, "not_found", None)),
         };
