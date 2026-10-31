@@ -22,6 +22,12 @@ backend only. Native engines, owned video and audio loops and custom GPU kernels
 stages; they are not advertised as capabilities. Engine 0.8.0 advertises no optimization yet: its
 benchmark index is empty until one is recorded on the reference hardware.
 
+Engine 1.0.0 adds the third stage, the **owned native engine** (`native-sdxl`, `ownership:
+engine`): a separately built Rust executable in [native/](native/README.md) that implements the
+same protocol for the `sdxl-base` family with its own HTTP server, tokenizer, models and scheduler
+on the candle tensor library, and needs no Python on the host. It is conformant and reproduces the
+owned pipeline within one 8-bit level on CPU; it binds loopback only and serves sdxl-base only.
+
 ## Install
 
 Reference environment: Linux x64, Python **3.12.14**, NVIDIA/CUDA, PyTorch **2.6.0**,
@@ -367,8 +373,11 @@ produce pixel-identical text-to-image output and image-to-image output within on
 CPU stack, and that LoRA adapters change the output identically on both backends; it says nothing
 about image quality. Run the Runtime
 repository's `go test ./...` with both repositories beside each other for cross-process durable-job tests.
+The native engine has its own tests: `cargo test --workspace --manifest-path native/Cargo.toml`, and
+`MEDIA_ENGINE_NATIVE=native/target/release/media-engine-native` makes `tests/test_native.py` run the
+conformance suite against the binary and compare it with `owned-sdxl` on the tiny bundle.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 0.8.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.8.0;
+Engine 1.0.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.8.0 (and 1.3 callers such as Runtime 0.9.0 and 0.10.0);
 its startup record keeps `protocol: "media-worker/1.1"` for those launchers and reports `highest_protocol`.
 `tests/serve_fixture.py --protocol media-worker/1.2` (or `1.1`) pins the fixture to an older surface.
 

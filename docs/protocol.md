@@ -1,6 +1,6 @@
 # media-worker/1.3 implementation contract
 
-This document concretizes [engine-spec.md](../engine-spec.md). Engine 0.8.0 speaks
+This document concretizes [engine-spec.md](../engine-spec.md). Engine 1.0.0 speaks
 `media-worker/1.3` and still accepts `media-worker/1.0`, `media-worker/1.1` and
 `media-worker/1.2` requests; `/v1/info`, `/v1/capabilities` and the startup record list
 `supported_protocols`. Every 1.2 and 1.3 behavior is gated on the request's `protocol` minor: a
@@ -684,6 +684,16 @@ classifier-free guidance, noises image inputs and decodes). Both honor identical
 events and cancellation checkpoints. Component classes stay the installed Diffusers/Transformers
 model classes. The supervisor selects the worker and therefore the backend; a request's
 `backend_id` must match the launched backend. Matching image bytes between backends are not promised.
+
+Engine 1.0.0 adds a third backend as a separate executable, `media-engine-native`
+(`backend_id: native-sdxl`, `ownership: engine`; see [native/README.md](../native/README.md)). It
+implements this contract directly for the `sdxl-base` family (text-to-image with `count`,
+image-to-image, adapters, `auto` and fallbacks) with the same launch contract and the same
+registrations and digests. Its `tasks`, `model_families` and `loaders` list only what it serves;
+any other task is `unsupported`, field `task`, and any other family `unsupported`, field
+`family`, before a file is read. It binds loopback only (no network mode yet) and advertises no
+optimization. Seeds draw the same noise as the Python backends on CPU; on the same CPU it
+reproduces `owned-sdxl` within one 8-bit level, but matching bytes are still not promised.
 
 ## Bundles and control
 

@@ -15,7 +15,9 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
   candle-transformers are not used: the SDXL UNet, the KL VAE, both CLIP text encoders, the Euler
   scheduler, group/layer norm, attention and GEGLU are owned code read from the bundle's own
   configuration files, so the native engine refuses an architecture it does not implement
-  (`unsupported`, field `configuration`) instead of guessing. `candle-core` is pinned at 0.9.2,
+  (the load operation fails with `unsupported`, field `configuration`, and stderr names the config
+  field) instead of guessing; stricter than Python, image-to-image with a size that is not a
+  multiple of the VAE factor fails the execution rather than being cropped. `candle-core` is pinned at 0.9.2,
   the newest release without a hard dependency on the `tokenizers` crate. cudarc enters only
   with the first custom kernel; rustls only with network mode (below).
 - **Owned instead of depended on**, as the spec requires: the HTTP/1.1 and SSE server, JSON
@@ -27,6 +29,17 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
   `normal_fill`'s 16-wide Box–Muller layout), so a seed draws the same initial latents as the
   Python backends and the oracle can compare pixels, not just shapes. Byte-identical PNGs across
   engines are still not promised; the oracle tolerance is one 8-bit level.
+- **Two numerical facts found on the way.** PyTorch's AVX2 and AVX-512 CPU builds both produce
+  the AVX2 `normal_fill` kernel's bits, so that kernel (avx_mathfun with FMA contraction) is
+  ported beside the scalar one and selected as ATen selects it, including
+  `ATEN_CPU_CAPABILITY`. And candle-core 0.9.2's tiled CPU `conv2d` returns wrong values for some
+  shapes (a 2×32×32×32 input with a 3×3 kernel is off by up to 114 against a direct sum), so on
+  CPU the engine convolves as one matrix product per kernel tap, checked by a unit test against a
+  float64 direct sum; CUDA uses candle's convolution. The workaround is most of the native CPU
+  time (about 340 ms against the Python owned pipeline's 80 ms for the tiny bundle).
+- **CUDA seeds will not match the Python CUDA path.** The engine always draws noise from the
+  PyTorch CPU generator algorithm, while `owned-sdxl` on CUDA uses PyTorch's CUDA generator; a seed
+  is reproducible on the native engine across devices, not across engines on CUDA.
 - **Semantics are the owned pipeline's**: one generator per image seeded seed + k − 1, the
   posterior sample drawn before the noise for image-to-image, `force_zeros_for_empty_prompt`,
   penultimate CLIP hidden states with the second encoder's pooled projection, the VAE kept

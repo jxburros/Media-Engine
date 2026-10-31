@@ -9,6 +9,7 @@ rows are never edited after release except to add later test evidence.
 
 | Engine | Protocol minors served | Startup record `protocol` | Runtime versions tested         | Platform tested                       | Families           | Extras                         | Conformance suite                |
 | ------ | ---------------------- | ------------------------- | ------------------------------- | ------------------------------------- | ------------------ | ------------------------------ | -------------------------------- |
+| 1.0.0  | 1.0, 1.1, 1.2, 1.3 (Python package unchanged from 0.8.0; `media-engine-native` adds `native-sdxl`) | `media-worker/1.1` (`highest_protocol` 1.3), both executables | 0.8.0 (18/18 integration tests) and 0.10.0 (26/26) against the Python fixture (Go, `go test ./...`, all packages pass); Runtime 0.10.0 does not accept `native-sdxl` yet (Runtime 1.0.0, phase R7) | Linux x64, CPU only (4-core x86_64, AVX-512); Python 3.12.13 venv (CPU torch 2.6.0) / 3.13; Rust 1.97.0 (`cargo build --release --locked`), `cuda` feature not compiled | Python: unchanged; native: sdxl-base only | Python: unchanged; native: candle-core 0.9.2, png 0.18.1 | `media-worker-conformance/1.3` (fixture, both Python backends and `native-sdxl`) |
 | 0.8.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video, text-to-audio, optimization options) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.7.0 (15/15 integration tests) and 0.8.0 (18/18) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP and mutual TLS, default and pinned); Runtime 0.9.0 and 0.10.0: see below | Linux x64, CPU only (4-core x86_64, AVX-512), Python 3.12.13 (venv, CPU torch 2.6.0 + torchao 0.9.0: inference, conformance, benchmark tool) / 3.13 (protocol tests) | sdxl-base, esrgan, svd, stable-audio-open (unchanged) | `inference`, `inference-owned`, `inference-audio` (unchanged pins), `inference-optimize` (new: `torchao==0.9.0`) | `media-worker-conformance/1.3` |
 | 0.7.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video and text-to-audio) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.6.0 (11/11 integration tests) and 0.7.0 (15/15) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0 video, 0.10.0 audio) | Linux x64, CPU only, Python 3.12.13 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd, stable-audio-open (svd and stable-audio-open on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins), `inference-audio` (new: `torchsde==0.2.6`) | `media-worker-conformance/1.2` |
 | 0.6.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video only) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.5.0 (8/8 integration tests) and 0.6.0 (11/11) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0) | Linux x64, CPU only, Python 3.12.3 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd (svd on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins; svd needs nothing beyond `inference`) | `media-worker-conformance/1.1` |
@@ -21,6 +22,30 @@ rows are never edited after release except to add later test evidence.
 The 0.5.0 row names Runtime 0.7.0 as the network-mode consumer; the Runtime plan schedules
 network mode as Runtime 0.8.0 (R4) and image-to-video as 0.9.0 (R5), which the release map in
 [implementation-plan.md](implementation-plan.md) now matches.
+
+## Conformance and oracle results for 1.0.0
+
+| Backend                        | Device / transport            | Bundle                                   | Result     |
+| ------------------------------ | ----------------------------- | ---------------------------------------- | ---------- |
+| `native-sdxl`                  | CPU float32, loopback HTTP    | tiny random-weight SDXL (+ RRDBNet registration, not served) | conformant, no skipped section (upscale, image_to_video, text_to_audio not applicable; optimizations: none advertised); three consecutive runs |
+| `native-sdxl` vs `owned-sdxl`  | CPU float32                   | tiny random-weight SDXL + tiny LoRA      | oracle: every image within one 8-bit level (text-to-image, guidance 1, no negative prompt, count 2, image-to-image, LoRA 0.8); identical stage/progress/state event shapes and effective settings; cancellation terminal with nothing published |
+| `native-sdxl` vs `owned-sdxl`  | CPU float32                   | wider SDXL-shaped bundle (3 levels, depths [1,2,3], quick_gelu + gelu encoders, sharded weights) | within one 8-bit level (`native/sdxl/tests/oracle.py`) |
+| `native-sdxl`                  | RTX 4090 (reference)          | SDXL base 1.0                            | not run: the `cuda` feature was not compiled; no CUDA device or real weights here |
+
+The Python rows of 0.8.0 were re-run on the 1.0.0 tree with the same results (100 tests, all
+passing; skips: IPv6 and the two native tests without `MEDIA_ENGINE_NATIVE`). Runtime's
+integration suite launches the Python fixture, so "Runtime against the native worker" waits for
+Runtime phase R7, which adds `native-sdxl` to its backend list.
+
+## Native engine checklist (operator, reference RTX 4090)
+
+1. `cargo build --release --locked --features cuda --manifest-path native/Cargo.toml` with the
+   CUDA toolkit; record the toolkit and driver versions.
+2. Run the conformance suite against `media-engine-native --device cuda:0` with SDXL base 1.0;
+   record the result here.
+3. 1024×1024, 30 steps, float16: compare one image with `owned-sdxl` visually (seeds differ on
+   CUDA, see decisions) and record wall time and peak memory against the estimate.
+4. Cancel once during sampling and once during decoding; confirm nothing is published.
 
 ## Optimizations in 0.8.0
 

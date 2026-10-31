@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.0.0 — 2026-10-31
+
+The owned native engine (phase E6). Protocol unchanged (`media-worker/1.0`–`1.3`); the Python
+package is unchanged in behavior from 0.8.0 apart from its version.
+
+- **`media-engine-native`**, a separately built Rust executable in `native/` (Cargo workspace,
+  `Cargo.lock` committed), advertising `backend_id: native-sdxl` and `ownership: engine`. It
+  implements the launch contract (`--probe`, `--version`, the startup record, `--catalog`, a
+  private `--directory`, `MEDIA_ENGINE_TOKEN`, `--port 0`, `--device`, SIGTERM/SIGINT and the
+  supervised-stdin watch) and the full 1.3 surface for `sdxl-base`: text-to-image with `count`,
+  image-to-image, LoRA adapters, `auto` precision and authorized fallbacks, device identity,
+  retention limits, idempotent attempts, resumable SSE, cooperative cancellation and opaque
+  output handles, with the same registrations, digests, error codes and fields.
+- **Owned code throughout**: the HTTP/1.1 and SSE server, JSON, SHA-256, bundle and adapter
+  verification and all validation (`native/src`); the CLIP BPE tokenizer, both CLIP encoders, the
+  SDXL UNet, the KL VAE, the Euler scheduler, LoRA merging and PyTorch-compatible seeded noise
+  (`native/sdxl`). Dependencies: `candle-core` 0.9.2 (tensors; CUDA behind the `cuda` feature)
+  and `png` 0.18.1 only.
+- **Semantics are the owned pipeline's**, checked by an oracle: on CPU float32 every compared
+  image is within one 8-bit level of `owned-sdxl` (about half exactly equal), event shapes and
+  effective settings are identical, cancellation behaves the same at every checkpoint, and LoRA
+  adapters change the output the same way. `tests/test_native.py` (when `MEDIA_ENGINE_NATIVE` is
+  set) runs this and the conformance suite, which reports the binary conformant with no skipped
+  section.
+- **Not in 1.0.0, stated plainly**: network mode (the binary binds loopback only and refuses
+  `--tls-*` and non-loopback binds), families other than sdxl-base (refused before any file is
+  read and not advertised), optimizations (none advertised), and a CUDA build (the `cuda` feature
+  was not compiled; there is no GPU here). On CPU the engine is about four times slower than the
+  Python owned pipeline on the tiny bundle because of a workaround for a candle-core 0.9.2 CPU
+  convolution bug (see decisions). Runtime 0.10.0 does not accept `native-sdxl` yet; that is
+  Runtime phase R7.
+- Docs: `native/README.md`; `docs/protocol.md` "Backends"; README; decisions 1.0.0 entry and the
+  native ledger (replacing the planned one); compatibility row, 1.0.0 conformance and oracle
+  results and the native checklist; spec status line.
+
+Validation: Linux x64, 4-core x86_64 CPU only; Rust 1.97.0; the Python suites (100 tests) in a
+Python 3.12.13 venv with CPU torch 2.6.0; Runtime 0.8.0 (18/18 integration tests) and 0.10.0
+(26/26) pass unchanged against the 1.0.0 fixture.
+
 ## 0.8.0 — 2026-10-31
 
 Targeted optimization options (phase E5) within protocol `media-worker/1.3`; 1.0, 1.1 and 1.2 are

@@ -15,7 +15,7 @@ SUPPORTED_PROTOCOLS = (
     "media-worker/1.2",
     "media-worker/1.3",
 )
-WORKER_VERSION = "0.8.0"
+WORKER_VERSION = "1.0.0"
 TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
 TASK_SINCE = {

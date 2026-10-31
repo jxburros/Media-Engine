@@ -36,7 +36,7 @@ from media_engine import png as png_module
 from media_engine import video
 from media_engine.upscale import architecture, tile_count, validate_config
 
-FIXTURE_VERSION = "0.8.0-test-fixture"
+FIXTURE_VERSION = "1.0.0-test-fixture"
 NOTICE = "TEST FIXTURE ONLY - NOT MODEL WEIGHTS"
 # What the fixture advertises under capabilities.optimizations (1.3): every candidate but flash,
 # which it lists as device_unsupported so callers see both shapes. No benchmark exists for a
