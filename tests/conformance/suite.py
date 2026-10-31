@@ -7,7 +7,9 @@ Configuration comes from the environment so the same suite measures any backend:
   MEDIA_ENGINE_REGISTRATION    path to a JSON document {"bundle": <sdxl-base registration>,
                                "upscaler": <esrgan registration, needed when upscale is
                                advertised>, "video": <svd registration, needed when
-                               image-to-video is advertised>, "options": <optional load options>}
+                               image-to-video is advertised>, "audio": <stable-audio-open
+                               registration, needed when text-to-audio is advertised>,
+                               "options": <optional load options>}
   MEDIA_ENGINE_STARTUP_RECORD  the worker's startup record (JSON text) when the suite launched it
   MEDIA_ENGINE_TLS_CA          for an https:// URL (network mode): PEM CA that issued the
                                worker's certificate (default: the system trust store)
@@ -40,7 +42,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SUITE_VERSION = "media-worker-conformance/1.1"
+SUITE_VERSION = "media-worker-conformance/1.2"
 SECRET = "conformance-secret-prompt-7f3a"
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
@@ -276,6 +278,12 @@ class Discovery(Section):
             self.assertEqual(video["outputs"][:2], ["frames", "poster"])
             self.assertEqual(video["output_formats"]["frames"], "application/zip")
             self.assertEqual(video["output_formats"]["poster"], "image/png")
+        if "text-to-audio" in self.caps["tasks"]:
+            self.assertGreaterEqual(self.minor(), 3)
+            sound = self.caps["task_parameters"]["text-to-audio"]
+            self.assertEqual(sound["outputs"], ["audio"])
+            self.assertEqual(sound["output_formats"]["audio"], "audio/wav")
+            self.assertEqual(sound["stages"], ["encoding", "sampling", "decoding", "saving"])
 
     def test_startup_record(self):
         if not self.startup:
@@ -331,6 +339,16 @@ class Negotiation(Section):
                 body = {"protocol": older[-1], "bundle": video, "options": self.options()}
                 status, value, _ = self.client.call("POST", "/v1/validate", body)
                 self.error(status, value, "unsupported", "family")
+        if "text-to-audio" in self.caps["tasks"] and older:
+            # Likewise no audio for a 1.2 caller: the task and the stable-audio-open family.
+            body = audio_request(older[-1], "attempt_n", "sha256:" + "0" * 64)
+            status, value, _ = self.client.call("POST", "/v1/validate", body)
+            self.error(status, value, "unsupported", "task")
+            sound = (self.registration or {}).get("audio")
+            if sound and self.minor(older[-1]) >= 2:
+                body = {"protocol": older[-1], "bundle": sound, "options": self.options()}
+                status, value, _ = self.client.call("POST", "/v1/validate", body)
+                self.error(status, value, "unsupported", "family")
 
 
 class Validation(Section):
@@ -353,6 +371,10 @@ class Validation(Section):
                 if not (self.registration or {}).get("video"):
                     self.skipTest("image-to-video is advertised but no video registration was supplied")
                 body = video_request(self.version, "attempt_v", self.registration["video"]["bundle_digest"], "input_" + "0" * 32)
+            elif task == "text-to-audio":
+                if not (self.registration or {}).get("audio"):
+                    self.skipTest("text-to-audio is advertised but no audio registration was supplied")
+                body = audio_request(self.version, "attempt_v", self.registration["audio"]["bundle_digest"])
             else:
                 body = self.request("attempt_v")
                 body["task"] = task
@@ -752,6 +774,102 @@ class ImageToVideo(Section):
         self.ensure_loaded()
 
 
+def audio_request(version, attempt, bundle_digest, **params):
+    return {
+        "protocol": version,
+        "attempt_id": attempt,
+        "bundle_digest": bundle_digest,
+        "task": "text-to-audio",
+        "inputs": {"prompt": "a conformance test tone"},
+        "parameters": {"seed": 5, "steps": 2, "duration_seconds": 1, **params},
+    }
+
+
+def wav_facts(data):
+    """(sample_rate, channels, samples) of a canonical 16-bit PCM WAV, checked byte by byte."""
+    riff, size, wave, fmt, fmt_size = struct.unpack("<4sI4s4sI", data[:20])
+    encoding, channels, rate, byte_rate, align, bits = struct.unpack("<HHIIHH", data[20:36])
+    chunk, length = struct.unpack("<4sI", data[36:44])
+    assert (riff, wave, fmt, chunk, fmt_size) == (b"RIFF", b"WAVE", b"fmt ", b"data", 16), "not a canonical WAV"
+    assert (encoding, bits, align, byte_rate) == (1, 16, 2 * channels, rate * 2 * channels), "not 16-bit PCM"
+    assert size == len(data) - 8 and length == len(data) - 44, "WAV length does not match its header"
+    return rate, channels, length // align
+
+
+class TextToAudio(Section):
+    section = "text_to_audio"
+
+    def test_text_to_audio(self):
+        if "text-to-audio" not in self.caps["tasks"]:
+            return  # not applicable
+        sound = (self.registration or {}).get("audio")
+        if not sound:
+            self.skipTest("text-to-audio is advertised but no audio registration was supplied")
+        self.operation("load", {"protocol": self.version, "bundle": sound, "options": self.options()})
+        loaded = self.client.json("GET", "/v1/info")["loaded_bundle"]
+        self.assertEqual(loaded["tasks"], ["text-to-audio"])
+        for key in ("sample_rate", "channels", "hop_length", "duration_range"):
+            self.assertIn(key, loaded)
+        low, high = loaded["duration_range"]
+        rate, hop = loaded["sample_rate"], loaded["hop_length"]
+        self.assertEqual(self.client.json("GET", "/v1/capabilities")["limits"]["duration_seconds"], [low, high])
+
+        def body(name, **params):
+            return audio_request(self.version, self.attempt(name), sound["bundle_digest"], **params)
+
+        bad = body("image")
+        bad["inputs"]["image"] = "input_" + "0" * 32
+        status, value, _ = self.client.call("POST", "/v1/executions", bad)
+        self.error(status, value, "invalid_request", "image")
+        status, value, _ = self.client.call("POST", "/v1/executions", body("long", duration_seconds=high + 1))
+        self.error(status, value, "invalid_request", "duration_seconds")
+        status, value, _ = self.client.call("POST", "/v1/executions", body("steps", steps=201))
+        self.error(status, value, "invalid_request", "steps")
+        status, value, _ = self.client.call("POST", "/v1/executions", self.request(self.attempt("wrongtask")) | {"bundle_digest": sound["bundle_digest"]})
+        self.error(status, value, "unsupported", "task")
+
+        # A duration that is not a whole number of latent frames is rounded up, and reported.
+        requested = low + 0.5 * hop / rate
+        frames = int(-(-requested * rate // hop))
+        expected = frames * hop / rate
+        validated = self.client.json("POST", "/v1/validate", body("validate", duration_seconds=requested))
+        self.assertAlmostEqual(validated["effective_settings"]["effective_duration_seconds"], expected)
+        self.assertEqual(validated["outputs"], ["audio"])
+        snap = self.run_to_end(body("audio", duration_seconds=requested))
+        self.assertEqual(snap["state"], "succeeded", snap.get("error"))
+        stages = [e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"]
+        self.assertEqual(stages, ["encoding", "sampling", "decoding", "saving"])
+        progress = [e["data"] for e in snap["events"] if e["type"] == "progress" and e["data"]["stage"] == "sampling"]
+        self.assertEqual([p["completed_steps"] for p in progress], [1, 2])
+        self.assertEqual(snap["effective_settings"]["duration_seconds"], requested)
+        (output,) = snap["outputs"]
+        self.assertEqual((output["output_id"], output["mime_type"]), ("audio", "audio/wav"))
+        self.assertEqual((output["sample_rate"], output["channels"]), (rate, loaded["channels"]))
+        self.assertAlmostEqual(output["duration_seconds"], expected)
+        self.assertGreaterEqual(output["duration_seconds"], requested)  # never trimmed below the request
+        status, data, headers = self.client.call("GET", f"/v1/executions/{snap['execution_id']}/outputs/audio")
+        self.assertEqual((status, headers["Content-Type"]), (200, "audio/wav"))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), output["sha256"])
+        self.assertEqual(len(data), output["size"])
+        self.assertEqual(wav_facts(data), (rate, loaded["channels"], frames * hop))
+        self.discard(snap["execution_id"])
+
+        accepted = self.submit(body("cancel", steps=200))
+        sent = threading.Event()
+
+        def on_event(event):
+            if not sent.is_set() and event["type"] == "stage" and event["data"]["stage"] == "sampling":
+                sent.set()
+                self.client.call("POST", f"/v1/executions/{accepted['execution_id']}/cancel")
+
+        self.client.events(accepted["execution_id"], on_event=on_event)
+        cancelled = self.wait(accepted["execution_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertEqual(cancelled["outputs"], [])
+        self.discard(accepted["execution_id"])
+        self.ensure_loaded()
+
+
 class Privacy(Section):
     section = "privacy"
 
@@ -779,7 +897,7 @@ class Privacy(Section):
             self.assertEqual(set(json.loads(text)), {"error"})
 
 
-SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, ImageToVideo, Inputs, Retention, Privacy]
+SECTIONS = [Discovery, Negotiation, Validation, Lifecycle, SingleFlight, Idempotency, Events, Cancellation, Outputs, MultiOutput, Upscale, ImageToVideo, TextToAudio, Inputs, Retention, Privacy]
 
 
 def load_suite():

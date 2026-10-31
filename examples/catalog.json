@@ -1,1 +1,1 @@
-{"sdxl-base": "/absolute/path/to/local/sdxl-base", "upscaler": "/absolute/path/to/local/realesrgan-x4", "video": "/absolute/path/to/local/stable-video-diffusion-img2vid-xt"}
+{"sdxl-base": "/absolute/path/to/local/sdxl-base", "upscaler": "/absolute/path/to/local/realesrgan-x4", "video": "/absolute/path/to/local/stable-video-diffusion-img2vid-xt", "audio": "/absolute/path/to/local/stable-audio-open-1.0"}

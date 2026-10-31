@@ -5,6 +5,70 @@ Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
 0.4.0.
 
+## 0.7.0 — text-to-audio (protocol 1.3)
+
+- **One new dependency, in its own extra.** The `stable-audio-open` family's scheduler,
+  `CosineDPMSolverMultistepScheduler`, draws its noise from a Brownian tree through
+  `torchsde`; diffusers registers it only as a stand-in that fails on use without it. So the
+  plan's `inference-audio` extra is not empty: it pins `torchsde==0.2.6`, which brings `scipy`
+  and `trampoline` (recorded in `uv.lock`; scipy resolves per Python version). No `torchaudio`:
+  the Oobleck VAE is a diffusers model class and the WAV is written by the standard library. The
+  extra is installed alongside `inference`; without it the task is not advertised and
+  `capabilities.missing_task_dependencies` says why (below). `uv.lock` is refreshed for this
+  extra only; no existing pin moved.
+- **Reference weights:** `stabilityai/stable-audio-open-1.0` (44.1 kHz stereo, up to 47.55 s) in
+  Diffusers format with safetensors weights. Stability AI licenses it under the Stability AI
+  Community License, separately from this project (the operator checks the model card of the
+  revision installed; the repository is gated). Its T5 encoder derives from `google-t5/t5-base`
+  (Apache-2.0). Operators supply and approve the weights; nothing here downloads them. No real
+  weights were available in this workspace.
+- **Reference backend only.** As for `svd`: `DiffusersBackend.families` adds `stable-audio-open`,
+  the owned backend refuses it (`unsupported`, field `family`) before reading any file and never
+  lists it. An owned audio loop is an optimization-stage item after the reference path is
+  validated on hardware.
+- **Approved classes as the library writes them.** `model_index.json` names the projection model
+  `["stable_audio", "StableAudioProjectionModel"]` (the pipeline module, not `diffusers`), and the
+  scheduler check, previously Euler for every Diffusers family, is now the family's
+  `scheduler_class`. `tokenizer/tokenizer.json` is required so `T5TokenizerFast` loads without
+  sentencepiece, which is not pinned.
+- **Facts come from the configs.** Sample rate and channels from the VAE config, the latent
+  granularity (`hop_length`) as the product of its `downsampling_ratios`, the longest clip from
+  the transformer's `sample_size`; library defaults (the reference bundle's values) where a
+  config is silent. The plan's "duration within the bundle's advertised range (reference 1–47)"
+  is an optional `audio.json` range, defaulting to 1 s to the whole seconds the latent length
+  allows, mirroring `video.json`. They are reported on validation, load and `loaded_bundle`, and
+  `limits.duration_seconds` follows the loaded bundle as `video_sizes` does.
+- **Duration rounding is up, to whole latent frames, and reported.** The library always samples
+  the whole latent length and cuts the decoded waveform at `int(end × sample_rate)`. The worker
+  cuts at the smallest whole number of latent frames covering the request, so the clip is never
+  shorter than asked and ends on a latent boundary, and conditions the model on that effective
+  duration so the conditioning describes the clip returned. Arithmetic is decimal on the number as
+  written. `effective_settings` and the output record report the effective duration; a request
+  past the range is `invalid_request`, never trimmed. The CPU test checks the samples against the
+  library pipeline run with the same effective duration (within one 16-bit step).
+- **Parameters.** `seed`, `steps` (1–200, the plan's range) and `duration_seconds` are required;
+  `guidance` (0–30) defaults to the library's 7 and is listed in `task_defaults`, not `defaults`,
+  so supervisors that merge `defaults` never send it to an image task. Image fields, the
+  sampler/scheduler fields and `count` are refused by name rather than ignored; the family has
+  one scheduler.
+- **WAV format.** Canonical 44-byte RIFF header, PCM 16-bit, interleaved little-endian; samples
+  clamped to [-1, 1], scaled by 32767 and rounded to nearest (`measurements.clipped_samples`
+  counts what was clamped). The server reads the header back and checks the file holds exactly
+  the frames it declares before publishing; the exact file size is reserved at submission.
+- **`missing_task_dependencies`.** The spec asks for the missing dependency per task in
+  `capabilities.missing_dependencies`, but that list already decides `ready` and whether a load
+  is accepted: adding `torchsde` there would make a worker without the audio extra refuse SDXL.
+  The per-task names are a separate response addition instead; `missing_dependencies` keeps its
+  meaning. `capabilities.dependencies` on the reference backend adds `torchsde`.
+- **Memory estimate.** Weights plus the sampling latents and decoded waveform of the whole latent
+  length (constant per bundle, because the library samples and decodes all of it whatever the
+  duration); attention, T5 and decoder activations excluded and stated.
+- **Same minor.** 0.6.0 already advertised `media-worker/1.3`; text-to-audio is added within it
+  and gated the same way: a 1.2 caller naming the task or the family gets `unsupported`. The
+  schema `$id` stays 1.3 and gains the audio shapes. The fixture pinned to 1.2 still reproduces
+  0.5.0 exactly. Conformance suite `media-worker-conformance/1.2` adds the `text_to_audio`
+  section; no 1.1 assertion changed.
+
 ## 0.6.0 — image-to-video (protocol 1.3)
 
 - **No new dependency.** The `svd` family uses model and pipeline classes already in the pinned
@@ -150,13 +214,14 @@ or impractical to own, is pinned by checksum, and is isolated in one module so i
 Every dependency is listed below with the backend that needs it and the reason it is not owned
 code. A dependency without an entry is a defect. No external service is used at any stage.
 
-## Ledger — Python worker (0.6.0; pins unchanged since 0.4.0)
+## Ledger — Python worker (0.7.0; `inference-audio` added, other pins unchanged since 0.4.0)
 
 | Package       | Extra(s)                    | Imported by                                   | Why it is not owned code                                        | Next change                                      |
 | ------------- | --------------------------- | --------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
 | torch         | inference, inference-owned  | reference (incl. svd), owned, upscaler, convert | Tensor execution and CUDA kernels                               | Remains until the native engine                  |
-| diffusers     | inference, inference-owned  | reference (pipelines, incl. `StableVideoDiffusionPipeline`); owned and convert (model classes, scheduler, single-file key mapping) | Reference pipelines; SDXL model classes; checkpoint key mapping | Owned path keeps model classes only              |
-| transformers  | inference, inference-owned  | reference, owned, convert                     | CLIP model classes and tokenizers; the svd CLIP image encoder and processor | Owned path may replace CLIP tokenization later   |
+| diffusers     | inference, inference-owned  | reference (pipelines, incl. `StableVideoDiffusionPipeline` and `StableAudioPipeline`); owned and convert (model classes, scheduler, single-file key mapping) | Reference pipelines; SDXL, svd and Stable Audio model classes; checkpoint key mapping | Owned path keeps model classes only              |
+| transformers  | inference, inference-owned  | reference, owned, convert                     | CLIP model classes and tokenizers; the svd CLIP image encoder and processor; the T5 encoder and fast tokenizer (through its `tokenizers` dependency) | Owned path may replace CLIP tokenization later   |
+| torchsde      | inference-audio             | reference, stable-audio-open only (imported by diffusers' `CosineDPMSolverMultistepScheduler`; no engine module imports it) | The scheduler's Brownian-tree noise sampler; brings `scipy` and `trampoline` | Owned audio loop could own the noise sampler     |
 | safetensors   | inference, inference-owned  | reference, owned (direct weight loading), upscaler, convert | Tensor loading/saving (headers are parsed by owned code)        | Keep                                             |
 | numpy         | inference, inference-owned  | diffusers internals (e.g. the Euler scheduler) on every path; no engine module imports it | Required by diffusers itself; pinned so the owned extra resolves identically | Drops out of the pin set with diffusers         |
 | accelerate    | inference                   | reference (Diffusers loading helpers)         | Diffusers' low-memory loading                                   | Not installed with inference-owned               |
@@ -165,14 +230,14 @@ code. A dependency without an entry is a defect. No external service is used at 
 | setuptools    | build                       | packaging                                     | Packaging                                                       | Keep                                             |
 
 `capabilities.dependencies` reports, per backend, the versions of the packages that backend
-imports: the reference backend lists all seven, the owned backend lists torch, diffusers,
-transformers and safetensors. The CPU test suite runs the owned backend, the upscaler and the
+imports: the reference backend lists all seven plus `torchsde` (`null` without the audio extra),
+the owned backend lists torch, diffusers, transformers and safetensors. The CPU test suite runs the owned backend, the upscaler and the
 converter in an environment built from `inference-owned` alone (no accelerate, no peft).
 
 Standard-library-only by design: the HTTP/SSE server (`http.server`), JSON, hashing, PNG reading
 and writing (`png.py`: `zlib`, `struct`), the conformance suite (`unittest`, `urllib`, `socket`),
 TLS in network mode (`ssl`, from 0.5.0), frame archives (`video.py`: `zipfile`, `json`, from
-0.6.0), and later WAV (`wave`). Test-only tooling not in
+0.6.0), and WAV (`audio.py`: `wave`, `struct`, from 0.7.0). Test-only tooling not in
 any extra: `jsonschema` was used ad hoc to check the schema against real bodies and is not a
 dependency.
 

@@ -10,6 +10,7 @@ import zlib
 from pathlib import Path
 from media_engine.backend import Cancelled, plan_load, task_parameters
 from media_engine.contracts import (
+    AUDIO_LIMITS,
     AUTO_OPTIONS,
     DEFAULTS,
     FALLBACKS,
@@ -21,6 +22,8 @@ from media_engine.contracts import (
     TASK_DEFAULTS,
     TASKS,
     VIDEO_LIMITS,
+    audio_facts,
+    audio_length,
     digest,
     effective_steps,
     memory_estimate,
@@ -28,11 +31,12 @@ from media_engine.contracts import (
     output_ids,
     video_facts,
 )
+from media_engine import audio
 from media_engine import png as png_module
 from media_engine import video
 from media_engine.upscale import architecture, tile_count, validate_config
 
-FIXTURE_VERSION = "0.6.0-test-fixture"
+FIXTURE_VERSION = "0.7.0-test-fixture"
 NOTICE = "TEST FIXTURE ONLY - NOT MODEL WEIGHTS"
 
 
@@ -241,6 +245,59 @@ def make_svd_bundle(root, handle="video", bundle_id="fixture-video", frames=2, s
     return describe_bundle(root, handle, bundle_id, "svd")
 
 
+# 8 kHz stereo with a 256-sample latent frame keeps fixture clips small; 1488 latent frames give
+# 47.616 s, so the default range is the reference bundle's 1–47 s.
+AUDIO_CONFIG = {"sampling_rate": 8000, "audio_channels": 2, "downsampling_ratios": [2, 4, 4, 8], "sample_size": 1488}
+
+
+def make_audio_bundle(root, handle="audio", bundle_id="fixture-audio", duration=None, **config):
+    """A stable-audio-open directory with tiny random stand-in weights and the audio facts above.
+
+    As with make_svd_bundle the weights are a few seeded random floats per role, not a network;
+    the real bundle for inference tests is built in test_inference.py. `duration` writes an
+    audio.json range; otherwise the range follows from the configs.
+    """
+    root = Path(root)
+    config = {**AUDIO_CONFIG, **config}
+    roles = {r: list(c) for r, c in FAMILIES["stable-audio-open"]["approved_classes"].items()}
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model_index.json").write_text(
+        json.dumps({"_class_name": "StableAudioPipeline", **roles}, indent=2, sort_keys=True)
+    )
+    configs = {
+        "transformer": ("config.json", {"_class_name": "StableAudioDiTModel", "in_channels": 3, "sample_size": config["sample_size"]}),
+        "vae": ("config.json", {"_class_name": "AutoencoderOobleck", "sampling_rate": config["sampling_rate"], "audio_channels": config["audio_channels"], "downsampling_ratios": config["downsampling_ratios"]}),
+        "text_encoder": ("config.json", {"model_type": "t5"}),
+        "tokenizer": ("tokenizer.json", {"model": {"type": "WordLevel"}}),
+        "projection_model": ("config.json", {"_class_name": "StableAudioProjectionModel"}),
+        "scheduler": ("scheduler_config.json", {"_class_name": "CosineDPMSolverMultistepScheduler"}),
+    }
+    weights = {"transformer": "diffusion_pytorch_model", "vae": "diffusion_pytorch_model", "text_encoder": "model", "projection_model": "diffusion_pytorch_model"}
+    for index, (role, (name, settings)) in enumerate(configs.items()):
+        folder = root / role
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_text(json.dumps(settings, indent=2, sort_keys=True))
+        if role in weights:
+            (folder / (weights[role] + ".safetensors")).write_bytes(
+                random_safetensors({role + ".weight": [4, 2]}, 10 + index)
+            )
+    if duration is not None:
+        (root / "audio.json").write_text(json.dumps({"duration_seconds": duration}))
+    return describe_bundle(root, handle, bundle_id, "stable-audio-open")
+
+
+def fixture_tone(seed, samples, rate, channels):
+    """A seeded sine tone per channel (not inference): reproducible from the seed, never silent."""
+    import math
+
+    frequency = 110 + seed % 440
+    return audio.pcm16(
+        0.25 * math.sin(2 * math.pi * frequency * (k / rate) + c)
+        for k in range(samples)
+        for c in range(channels)
+    )
+
+
 def make_checkpoint(root):
     """A bare single-file SDXL-style checkpoint: one safetensors file, no model_index/config."""
     root = Path(root)
@@ -318,6 +375,7 @@ class TestBackend:
         self.family = None
         self.scale = None
         self.default_frames = None
+        self.audio_facts = None
         self.loaded_options = None
 
     @property
@@ -373,10 +431,12 @@ class TestBackend:
         }
         if not self.current:
             return caps  # Pinned to 1.1: exactly the 0.3.0 fixture's surface.
-        # Pinned to 1.2: exactly the 0.5.0 fixture's surface (no svd, video limits or task).
+        # Pinned to 1.2: exactly the 0.5.0 fixture's surface (no svd or stable-audio-open, no
+        # video or audio limits or tasks).
         families = {n: f for n, f in FAMILIES.items() if f["since"] <= self.level}
         tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values())]
-        limits = {k: v for k, v in LIMITS.items() if self.level >= 3 or k not in VIDEO_LIMITS}
+        newer = VIDEO_LIMITS + AUDIO_LIMITS
+        limits = {k: v for k, v in LIMITS.items() if self.level >= 3 or k not in newer}
         if self.level >= 3:
             limits["video_sizes"] = SVD_SIZES  # what the fixture's video bundle serves
         if self.output_side:
@@ -402,6 +462,8 @@ class TestBackend:
             fallbacks=FALLBACKS,
         )
         caps["adapters"] = {**caps["adapters"], "families": ["sdxl-base"]}
+        if self.level >= 3:
+            caps["missing_task_dependencies"] = {}
         return caps
 
     def device_identity(self):
@@ -456,11 +518,12 @@ class TestBackend:
             else None
         )
         self.default_frames = video_facts(root)["default_frames"] if family == "svd" else None
+        self.audio_facts = audio_facts(root) if family == "stable-audio-open" else None
         time.sleep(0.02)
 
     def unload(self):
         self.family, self.scale, self.run_device, self.applied_fallbacks = None, None, self.device, []
-        self.default_frames = None
+        self.default_frames = self.audio_facts = None
         return {"allocated_mb": 0, "reserved_mb": 0}
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
@@ -469,6 +532,8 @@ class TestBackend:
             return self.upscale(request, directory, emit, cancelled, image_path)
         if request["task"] == "image-to-video":
             return self.generate_video(request, directory, emit, cancelled, image_path)
+        if request["task"] == "text-to-audio":
+            return self.generate_audio(request, directory, emit, cancelled)
         if request["task"] == "image-to-image":
             # The fixture proves the handle resolves to the uploaded bytes; it does not sample.
             assert Path(image_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
@@ -599,3 +664,49 @@ class TestBackend:
             {"output_id": "poster", "path": poster, "mime_type": "image/png", "width": width, "height": height},
         ]
         return records, {"test_fixture": True, "effective_steps": params["steps"], "frames": frames, "peak_allocated_mb": 0}
+
+    def generate_audio(self, request, directory, emit, cancelled):
+        """Real stages, progress, checkpoints and WAV; the samples are a seeded tone, not inference."""
+        params = {**TASK_DEFAULTS["text-to-audio"], **request["parameters"]}
+        facts = self.audio_facts
+        length = audio_length(params["duration_seconds"], facts)
+        emit("stage", {"stage": "encoding"})
+        time.sleep(0.02)
+        if request["inputs"]["prompt"] == "fail":
+            raise RuntimeError("secret prompt and private path must never be exposed")
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "sampling"})
+        for step in range(params["steps"]):
+            time.sleep(0.03)
+            if cancelled.is_set():
+                raise Cancelled()
+            emit(
+                "progress",
+                {"stage": "sampling", "scope": "stage", "completed_steps": step + 1, "total_steps": params["steps"]},
+            )
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "decoding"})
+        time.sleep(0.02)
+        pcm = fixture_tone(params["seed"], length["samples"], facts["sample_rate"], facts["channels"])
+        if cancelled.is_set():
+            raise Cancelled()
+        emit("stage", {"stage": "saving"})
+        path = Path(directory) / "audio.wav"
+        audio.write_wav(path, pcm, facts["sample_rate"], facts["channels"])
+        record = {
+            "output_id": "audio",
+            "path": path,
+            "mime_type": audio.MIME_TYPE,
+            "sample_rate": facts["sample_rate"],
+            "channels": facts["channels"],
+            "duration_seconds": length["effective_duration_seconds"],
+        }
+        return [record], {
+            "test_fixture": True,
+            "effective_steps": params["steps"],
+            "latent_frames": length["latent_frames"],
+            "samples": length["samples"],
+            "peak_allocated_mb": 0,
+        }

@@ -17,9 +17,9 @@ This specification describes proposed behavior. `MUST` defines a required behavi
 
 ## Delivery status
 
-Revision 0.1.0 of this specification described the reference worker. Engine 0.6.0 adds protocol 1.3 with image-to-video (the `svd` family on the reference backend, as a lossless frame archive and poster) to what Engine 0.5.0 delivered: network mode over mutual TLS within protocol 1.2, on top of what Engine 0.4.0 delivered: protocol 1.2 (multiple outputs, upscaling, loaders and conversion, automatic settings and fallbacks, device identity and the conformance suite) on top of what Engine 0.3.0 delivered: the owned SDXL pipeline backend, `media-worker/1.1`, image-to-image and LoRA adapters; [docs/protocol.md](docs/protocol.md) is the implementation contract for what ships. Revision 0.2.0 specifies the capabilities the first revision deferred so that each has an explicit stage, protocol version and acceptance rule before implementation. The [implementation plan](docs/implementation-plan.md) orders them.
+Revision 0.1.0 of this specification described the reference worker. Engine 0.7.0 adds text-to-audio within protocol 1.3 (the `stable-audio-open` family on the reference backend, as 16-bit PCM WAV) to what Engine 0.6.0 delivered: protocol 1.3 with image-to-video (the `svd` family on the reference backend, as a lossless frame archive and poster), on top of what Engine 0.5.0 delivered: network mode over mutual TLS within protocol 1.2, on top of what Engine 0.4.0 delivered: protocol 1.2 (multiple outputs, upscaling, loaders and conversion, automatic settings and fallbacks, device identity and the conformance suite) on top of what Engine 0.3.0 delivered: the owned SDXL pipeline backend, `media-worker/1.1`, image-to-image and LoRA adapters; [docs/protocol.md](docs/protocol.md) is the implementation contract for what ships. Revision 0.2.0 specifies the capabilities the first revision deferred so that each has an explicit stage, protocol version and acceptance rule before implementation. The [implementation plan](docs/implementation-plan.md) orders them.
 
-| Capability                                            | Stage               | Protocol | Status in Engine 0.6.0 |
+| Capability                                            | Stage               | Protocol | Status in Engine 0.7.0 |
 | ----------------------------------------------------- | ------------------- | -------- | ---------------------- |
 | Reference worker, text-to-image, cancellation, SSE    | Reference worker    | 1.0      | Delivered              |
 | Image-to-image, owned pipeline, memory estimates      | Owned pipeline      | 1.1      | Delivered              |
@@ -31,7 +31,7 @@ Revision 0.1.0 of this specification described the reference worker. Engine 0.6.
 | Device identity for supervisor worker pools           | Additional tasks    | 1.2      | Delivered              |
 | Network mode for remote supervisors                   | Remote execution    | 1.2      | Delivered (loopback-tested) |
 | Image-to-video task and the `svd` family              | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
-| Text-to-audio task and the `stable-audio-open` family | Additional media    | 1.3      | Specified below        |
+| Text-to-audio task and the `stable-audio-open` family | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
 | Targeted optimization options                         | Optimization        | 1.3      | Specified below        |
 | Owned native engine and protocol conformance suite    | Owned engine        | 1.x      | Suite delivered        |
 

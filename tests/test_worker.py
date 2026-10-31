@@ -9,6 +9,7 @@ from pathlib import Path
 from fixture import (
     TestBackend,
     describe_bundle,
+    make_audio_bundle,
     make_adapter,
     make_bundle,
     make_checkpoint,
@@ -408,7 +409,8 @@ class ProtocolTwelveTests(unittest.TestCase):
         self.assertIn("upscale", caps["tasks"])
         self.assertEqual(
             {l["families"][0]: l["format"] for l in caps["loaders"]},
-            {"sdxl-base": "diffusers-safetensors", "esrgan": "single-file-safetensors", "svd": "diffusers-safetensors"},
+            {"sdxl-base": "diffusers-safetensors", "esrgan": "single-file-safetensors", "svd": "diffusers-safetensors",
+             "stable-audio-open": "diffusers-safetensors"},
         )
         self.assertEqual(caps["task_parameters"]["text-to-image"]["outputs"], ["image"])
         self.assertEqual(caps["limits"]["count"], [1, 4])
@@ -952,6 +954,359 @@ class FrameArchiveTests(unittest.TestCase):
         (self.root / "plain.zip").write_bytes(b"not a zip at all")
         with self.assertRaises(ValueError):
             video.read_manifest(self.root / "plain.zip")
+
+
+class TextToAudioTests(unittest.TestCase):
+    """media-worker/1.3: text-to-audio with the stable-audio-open family and 16-bit PCM WAV."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.bundle = make_bundle(self.root / "model")
+        self.audio = make_audio_bundle(self.root / "audio")
+        self.catalog = {"fixture": str(self.root / "model"), "audio": str(self.root / "audio")}
+        self.backend = TestBackend()
+        self.worker = Worker(self.root / "work", self.backend, self.catalog)
+
+    def tearDown(self):
+        while self.worker.active or self.worker.state in {"loading", "unloading"}:
+            time.sleep(0.01)
+        self.temp.cleanup()
+
+    def load(self, bundle=None, worker=None):
+        worker = worker or self.worker
+        op = worker.control(
+            "load",
+            {"protocol": PROTOCOL, "bundle": bundle or self.audio, "options": self.backend.capabilities()["load_defaults"]},
+        )
+        while worker.operations[op["operation_id"]]["state"] == "running":
+            time.sleep(0.01)
+        record = worker.operations[op["operation_id"]]
+        self.assertEqual(record["state"], "succeeded", record["error"])
+        return record
+
+    def request(self, attempt="attempt_a", protocol=PROTOCOL, inputs=None, **params):
+        return {
+            "protocol": protocol,
+            "attempt_id": attempt,
+            "bundle_digest": self.audio["bundle_digest"],
+            "task": "text-to-audio",
+            "inputs": inputs or {"prompt": "soft rain on a tin roof"},
+            "parameters": {"seed": 9, "steps": 3, "duration_seconds": 1, **params},
+        }
+
+    def wait(self, execution):
+        while self.worker.snapshot(execution)["state"] == "running":
+            time.sleep(0.01)
+        return self.worker.snapshot(execution)
+
+    def code(self, call, *args):
+        with self.assertRaises(WorkerError) as caught:
+            call(*args)
+        return caught.exception.code, caught.exception.field
+
+    def test_capabilities_and_bundle_facts(self):
+        caps = self.worker.capabilities()
+        self.assertIn("text-to-audio", caps["tasks"])
+        sound = caps["task_parameters"]["text-to-audio"]
+        self.assertEqual(sound["outputs"], ["audio"])
+        self.assertEqual(sound["output_formats"], {"audio": "audio/wav"})
+        self.assertEqual(sound["defaults"], {"guidance": 7})
+        self.assertEqual(sound["stages"], ["encoding", "sampling", "decoding", "saving"])
+        self.assertEqual(caps["limits"]["duration_seconds"], [1, 47])
+        self.assertEqual(caps["limits"]["audio_steps"], [1, 200])
+        loader = next(l for l in caps["loaders"] if l["families"] == ["stable-audio-open"])
+        self.assertEqual(loader["roles"], ["transformer", "vae", "text_encoder", "tokenizer", "projection_model", "scheduler"])
+        self.assertEqual(loader["tasks"], ["text-to-audio"])
+        self.assertNotIn("duration_seconds", caps["defaults"])
+        validated = self.worker.validation({"protocol": PROTOCOL, "bundle": self.audio, "options": caps["load_defaults"]})
+        self.assertEqual((validated["family"], validated["tasks"]), ("stable-audio-open", ["text-to-audio"]))
+        self.assertEqual(
+            {k: validated[k] for k in ("sample_rate", "channels", "hop_length", "duration_range")},
+            {"sample_rate": 8000, "channels": 2, "hop_length": 256, "duration_range": [1, 47]},
+        )
+        estimate = validated["memory_estimate"]
+        # 1488 latent frames × 3 channels × 5 float32 tensors, and 1488 × 256 samples × 2 channels.
+        self.assertEqual(estimate["latents_mb"], 5 * 3 * 1488 * 4 // 1024**2)
+        self.assertEqual(estimate["waveform_mb"], 1488 * 256 * 2 * 4 // 1024**2)
+        self.assertEqual(estimate["value_mb"], (5 * 3 * 1488 * 4 + 1488 * 256 * 2 * 4) // 1024**2)
+        self.assertIn("whole latent length", estimate["basis"])
+        self.load()
+        loaded = self.worker.info()["loaded_bundle"]
+        self.assertEqual((loaded["family"], loaded["tasks"], loaded["sample_rate"]), ("stable-audio-open", ["text-to-audio"], 8000))
+        # With an audio bundle loaded, limits.duration_seconds is that bundle's range.
+        root = self.root / "short"
+        short = make_audio_bundle(root, handle="short", bundle_id="short", duration=[0.5, 2.5], audio_channels=1)
+        self.catalog["short"] = str(root)
+        self.load(short)
+        self.assertEqual(self.worker.capabilities()["limits"]["duration_seconds"], [0.5, 2.5])
+        self.assertEqual(self.worker.info()["loaded_bundle"]["channels"], 1)
+        self.load(self.bundle)
+        self.assertEqual(self.worker.capabilities()["limits"]["duration_seconds"], [1, 47])
+
+    def test_audio_bundle_layout_is_checked(self):
+        from media_engine.contracts import family_facts
+
+        root = self.root / "audio"
+        self.assertEqual(bundle_path(self.audio, self.catalog), root.resolve())
+
+        def refused(field="configuration"):
+            bad = describe_bundle(root, "audio", "bad", "stable-audio-open")
+            self.assertEqual(self.code(bundle_path, bad, self.catalog), ("unsupported", field))
+
+        for declared in ({"duration_seconds": [1, 48]}, {"duration_seconds": [2, 1]}, {"duration_seconds": [0, 5]},
+                         {"duration_seconds": [1, 5], "sample_rate": 8000}, {"duration_seconds": [1, True]}):
+            (root / "audio.json").write_text(json.dumps(declared))
+            refused()
+        (root / "audio.json").unlink()
+        vae = json.loads((root / "vae/config.json").read_text())
+        for change in ({"sampling_rate": 500}, {"audio_channels": 3}, {"downsampling_ratios": []}, {"sampling_rate": 44100.0}):
+            (root / "vae/config.json").write_text(json.dumps({**vae, **change}))
+            refused()
+        # The library defaults where the configs are silent: the reference bundle's 44.1 kHz
+        # stereo, 2048-sample frames, 1024 frames (47.55 s, so 1–47 s).
+        (root / "vae/config.json").write_text(json.dumps({"_class_name": "AutoencoderOobleck"}))
+        (root / "transformer/config.json").write_text(json.dumps({"_class_name": "StableAudioDiTModel"}))
+        reference = describe_bundle(root, "audio", "reference", "stable-audio-open")
+        bundle_path(reference, self.catalog)
+        self.assertEqual(family_facts(root, "stable-audio-open"),
+                         {"sample_rate": 44100, "channels": 2, "hop_length": 2048, "duration_range": [1, 47]})
+        # The tokenizer must load as T5TokenizerFast from tokenizer.json (no sentencepiece).
+        (root / "tokenizer/tokenizer.json").rename(root / "tokenizer/spiece.json")
+        refused("tokenizer")
+        (root / "tokenizer/spiece.json").rename(root / "tokenizer/tokenizer.json")
+        scheduler = json.loads((root / "scheduler/scheduler_config.json").read_text())
+        (root / "scheduler/scheduler_config.json").write_text(json.dumps({**scheduler, "_class_name": "EulerDiscreteScheduler"}))
+        refused("pipeline")
+        (root / "scheduler/scheduler_config.json").write_text(json.dumps(scheduler))
+        index = json.loads((root / "model_index.json").read_text())
+        (root / "model_index.json").write_text(json.dumps({**index, "projection_model": ["diffusers", "StableAudioProjectionModel"]}))
+        refused("projection_model")
+        (root / "model_index.json").write_text(json.dumps({**index, "_class_name": "StableDiffusionXLPipeline"}))
+        refused("pipeline")
+        (root / "model_index.json").write_text(json.dumps(index))
+        # An sdxl-base directory registered as stable-audio-open fails on its roles.
+        self.assertEqual(self.code(bundle_path, dict(self.bundle, family="stable-audio-open"), self.catalog)[0], "unsupported")
+
+    def test_validation_and_older_callers(self):
+        body = self.request(duration_seconds=1.01)
+        validated = self.worker.validate_execution(body)
+        self.assertEqual((validated["outputs"], validated["effective_steps"]), (["audio"], 3))
+        self.assertNotIn("sample_rate", validated["effective_settings"])  # bundle facts: not loaded yet
+        self.load()
+        validated = self.worker.validate_execution(body)
+        # 1.01 s × 8000 Hz = 8080 samples, 31.56 frames of 256 → 32 frames, 8192 samples, 1.024 s.
+        self.assertEqual(
+            validated["effective_settings"],
+            {"seed": 9, "steps": 3, "duration_seconds": 1.01, "guidance": 7, "effective_steps": 3,
+             "sample_rate": 8000, "channels": 2, "latent_frames": 32, "effective_duration_seconds": 1.024},
+        )
+        # A whole number of frames is exact: 1 s is 31.25 frames → 32; 1.024 s is exactly 32.
+        exact = self.worker.validate_execution(self.request(duration_seconds=1.024))["effective_settings"]
+        self.assertEqual((exact["latent_frames"], exact["effective_duration_seconds"]), (32, 1.024))
+        cases = {
+            ("invalid_request", "image"): {"inputs": {"prompt": "x", "image": "input_" + "0" * 32}},
+            ("invalid_request", "prompt"): {"inputs": {"prompt": "  "}},
+            ("invalid_request", None): {"inputs": {"negative_prompt": "x"}},
+            ("invalid_request", "steps"): {"steps": 201},
+            ("invalid_request", "seed"): {"seed": -1},
+            ("invalid_request", "guidance"): {"guidance": 31},
+            ("invalid_request", "width"): {"width": 64},
+            ("invalid_request", "scheduler"): {"scheduler": "euler"},
+            ("invalid_request", "count"): {"count": 2},
+            # Past the loaded bundle's range (the request-level checks follow below).
+            ("invalid_request", "duration_seconds"): {"duration_seconds": 47.5},
+        }
+        for index, (expected, change) in enumerate(cases.items()):
+            broken = self.request(f"attempt_{index}", inputs=change.pop("inputs", None), **change)
+            self.assertEqual(self.code(self.worker.submit, broken), expected, change)
+        for value in (0, -1, True, "1", float("inf"), 601):
+            self.assertEqual(self.code(self.worker.validate_execution, self.request(duration_seconds=value)), ("invalid_request", "duration_seconds"), value)
+        missing = self.request()
+        del missing["parameters"]["duration_seconds"]
+        self.assertEqual(self.code(self.worker.submit, missing), ("invalid_request", None))
+        # A 1.2 caller sees no audio: the task, the family and the bundle are all refused.
+        self.assertEqual(self.code(self.worker.submit, self.request(protocol="media-worker/1.2")), ("unsupported", "task"))
+        self.assertEqual(self.code(self.worker.validate_execution, self.request(protocol="media-worker/1.2")), ("unsupported", "task"))
+        old_load = {"protocol": "media-worker/1.2", "bundle": self.audio, "options": self.backend.capabilities()["load_defaults"]}
+        self.assertEqual(self.code(self.worker.validate_load, old_load), ("unsupported", "family"))
+        self.assertEqual(self.code(bundle_path, self.audio, self.catalog, True, "media-worker/1.2"), ("unsupported", "family"))
+        # Task routing by the loaded family, both ways.
+        t2i = {**self.request(), "task": "text-to-image", "parameters": {**DEFAULTS, "seed": 1, "width": 64, "height": 64}}
+        self.assertEqual(self.code(self.worker.submit, t2i), ("unsupported", "task"))
+        self.load(self.bundle)
+        self.assertEqual(self.code(self.worker.submit, dict(self.request(), bundle_digest=self.bundle["bundle_digest"])), ("unsupported", "task"))
+
+    def test_owned_backend_does_not_serve_audio(self):
+        from media_engine.backend import AUDIO_DEPENDENCIES, DiffusersBackend
+        from media_engine.pipeline import OwnedPipelineBackend
+
+        self.assertIn("stable-audio-open", DiffusersBackend.families)
+        self.assertNotIn("stable-audio-open", OwnedPipelineBackend.families)
+        owned = Worker(self.root / "owned", OwnedPipelineBackend("cpu"), self.catalog)
+        body = {"protocol": PROTOCOL, "bundle": self.audio, "options": {"precision": "float32", "attention": "sdpa", "offload": "none"}}
+        self.assertEqual(self.code(owned.validate_load, body), ("unsupported", "family"))
+        self.assertNotIn("stable-audio-open", OwnedPipelineBackend("cpu").served_families())
+        self.assertEqual(self.code(OwnedPipelineBackend("cpu").load, self.root / "audio", body["options"], (), "stable-audio-open"), ("unsupported", "family"))
+        self.assertNotIn("text-to-audio", OwnedPipelineBackend("cpu").missing_task_dependencies())
+        # Without torchsde (the inference-audio extra) the reference backend stays ready but
+        # does not advertise text-to-audio, and says why per task.
+        reference = DiffusersBackend("cpu")
+        real = reference.missing_dependencies
+        reference.missing_dependencies = lambda dependencies=None: (
+            ["torchsde"] if dependencies == AUDIO_DEPENDENCIES else real(dependencies)
+        )
+        caps = reference.capabilities()
+        self.assertNotIn("text-to-audio", caps["tasks"])
+        self.assertNotIn("stable-audio-open", caps["model_families"])
+        self.assertEqual(caps["missing_task_dependencies"]["text-to-audio"], ["torchsde"])
+        self.assertNotIn("torchsde", caps["missing_dependencies"])  # readiness is the base set's
+        self.assertIn("torchsde", caps["dependencies"])
+
+    def test_execution_output_progress_and_storage(self):
+        from media_engine import audio
+
+        self.load()
+        snap = self.wait(self.worker.submit(self.request(duration_seconds=1.01))["execution_id"])
+        self.assertEqual(snap["state"], "succeeded", snap["error"])
+        self.assertEqual([e["data"]["stage"] for e in snap["events"] if e["type"] == "stage"],
+                         ["encoding", "sampling", "decoding", "saving"])
+        sampling = [e["data"]["completed_steps"] for e in snap["events"] if e["type"] == "progress"]
+        self.assertEqual(sampling, [1, 2, 3])
+        (output,) = snap["outputs"]
+        self.assertEqual(
+            {k: output[k] for k in ("output_id", "mime_type", "sample_rate", "channels", "samples", "duration_seconds")},
+            {"output_id": "audio", "mime_type": "audio/wav", "sample_rate": 8000, "channels": 2, "samples": 8192, "duration_seconds": 1.024},
+        )
+        self.assertEqual(output["size"], 44 + 8192 * 2 * 2)
+        self.assertEqual(snap["effective_settings"]["effective_duration_seconds"], 1.024)
+        self.assertEqual(snap["measurements"]["latent_frames"], 32)
+        folder = self.worker.directory / snap["execution_id"]
+        self.assertEqual([p.name for p in folder.iterdir()], ["audio.wav"])
+        facts, pcm = audio.read_wav(folder / "audio.wav")
+        self.assertEqual((facts["samples"], len(pcm)), (8192, 8192 * 4))
+        self.assertGreaterEqual(self.worker.storage_used(), output["size"])
+        again = self.wait(self.worker.submit(self.request("attempt_again", duration_seconds=1.01))["execution_id"])
+        self.assertEqual(again["outputs"][0]["sha256"], output["sha256"])
+        other = self.wait(self.worker.submit(self.request("attempt_other", seed=10, duration_seconds=1.01))["execution_id"])
+        self.assertNotEqual(other["outputs"][0]["sha256"], output["sha256"])
+        token = "z" * 40
+        server = create_server(self.worker, token, 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            import hashlib
+
+            response = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/v1/executions/{snap['execution_id']}/outputs/audio",
+                headers={"Authorization": "Bearer " + token},
+            ))
+            self.assertEqual(response.headers["Content-Type"], "audio/wav")
+            self.assertEqual(hashlib.sha256(response.read()).hexdigest(), output["sha256"])
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.worker.release(snap["execution_id"])
+        self.assertFalse(folder.exists())
+        # A clip that cannot fit is refused before sampling, never shortened (47 s is 1.5 MB).
+        self.worker.max_storage_mb = 1
+        self.assertEqual(self.code(self.worker.submit, self.request("attempt_large", duration_seconds=47)), ("storage_full", None))
+
+    def test_a_wav_that_lies_fails_the_execution(self):
+        self.load()
+        original = self.backend.generate_audio
+
+        def lying(request, directory, emit, cancelled):
+            records, measurements = original(request, directory, emit, cancelled)
+            path = records[0]["path"]
+            path.write_bytes(path.read_bytes()[:-2])  # one sample short of its header
+            return records, measurements
+
+        self.backend.generate_audio = lying
+        snap = self.wait(self.worker.submit(self.request())["execution_id"])
+        self.assertEqual((snap["state"], snap["error"]["code"]), ("failed", "execution_failed"))
+        self.assertFalse((self.worker.directory / snap["execution_id"]).exists())
+
+    def test_cancellation_during_sampling(self):
+        self.load()
+        run = self.worker.submit(self.request(steps=200))
+        while not self.worker.snapshot(run["execution_id"])["progress"]:
+            time.sleep(0.01)
+        self.worker.cancel(run["execution_id"])
+        cancelled = self.wait(run["execution_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertLess(cancelled["progress"]["completed_steps"], 200)
+        self.assertEqual(cancelled["outputs"], [])
+        self.assertFalse((self.worker.directory / run["execution_id"]).exists())
+
+    def test_pinned_to_1_2_has_no_audio(self):
+        protocols = ("media-worker/1.0", "media-worker/1.1", "media-worker/1.2")
+        pinned = Worker(self.root / "pinned", TestBackend(protocols=protocols), self.catalog, protocols=protocols)
+        caps = pinned.capabilities()
+        self.assertNotIn("text-to-audio", caps["tasks"])
+        self.assertNotIn("stable-audio-open", caps["model_families"])
+        self.assertNotIn("text-to-audio", caps["task_defaults"])
+        self.assertFalse(set(caps["limits"]) & {"duration_seconds", "audio_steps", "sample_rate", "audio_channels"})
+        self.assertNotIn("missing_task_dependencies", caps)
+        self.assertEqual(self.code(pinned.submit, self.request()), ("protocol_mismatch", "protocol"))
+        self.assertEqual(self.code(pinned.submit, self.request(protocol="media-worker/1.2")), ("unsupported", "task"))
+
+
+class WavTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_round_trip_header_and_quantization(self):
+        import struct
+        import wave
+        from media_engine import audio
+
+        pcm = audio.pcm16([0.0, 1.0, -1.0, 0.5, 2.0, -3.0])
+        self.assertEqual(struct.unpack("<6h", pcm), (0, 32767, -32767, 16384, 32767, -32767))
+        path = self.root / "a.wav"
+        self.assertEqual(audio.write_wav(path, pcm, 1000, 2), {"sample_rate": 1000, "channels": 2, "samples": 3})
+        data = path.read_bytes()
+        self.assertEqual(len(data), audio.size(3, 2))
+        self.assertEqual(data[:4] + data[8:16] + data[36:40], b"RIFFWAVEfmt data")
+        self.assertEqual(struct.unpack("<HHIIHH", data[20:36]), (1, 2, 1000, 4000, 4, 16))
+        self.assertEqual(audio.read_header(path), {"sample_rate": 1000, "channels": 2, "samples": 3, "duration_seconds": 0.003})
+        self.assertEqual(audio.read_wav(path)[1], pcm)
+        with wave.open(str(path)) as opened:
+            self.assertEqual((opened.getnchannels(), opened.getsampwidth(), opened.getframerate(), opened.getnframes()), (2, 2, 1000, 3))
+        for bad in (b"", pcm[:3]):
+            with self.assertRaises(ValueError):
+                audio.write_wav(self.root / "b.wav", bad, 1000, 2)
+
+    def test_reader_refuses_what_is_not_canonical_pcm16(self):
+        import struct
+        import wave
+        from media_engine import audio
+
+        path = self.root / "good.wav"
+        audio.write_wav(path, audio.pcm16([0.1] * 8), 1000, 1)
+        good = path.read_bytes()
+        eight_bit = self.root / "eight.wav"
+        with wave.open(str(eight_bit), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(1)
+            stream.setframerate(1000)
+            stream.writeframes(bytes(8))
+        cases = {
+            "truncated": good[:-2],
+            "padded": good + b"\0\0",
+            "riff": b"RIFX" + good[4:],
+            "float": good[:20] + struct.pack("<H", 3) + good[22:],
+            "header": good[:30],
+            "eight": eight_bit.read_bytes(),
+            "empty": good[:40] + struct.pack("<I", 0),
+        }
+        for name, data in cases.items():
+            (self.root / name).write_bytes(data)
+            with self.assertRaises(ValueError, msg=name):
+                audio.read_header(self.root / name)
 
 
 if __name__ == "__main__":

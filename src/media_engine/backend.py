@@ -27,6 +27,8 @@ from .contracts import (
     VIDEO_GUIDANCE,
     WORKER_VERSION,
     WorkerError,
+    audio_facts,
+    audio_length,
     effective_steps,
     memory_estimate,
     output_ids,
@@ -52,6 +54,22 @@ VIDEO_DEPENDENCIES = (
     ("safetensors", "safetensors"),
     ("Pillow", "PIL"),
 )
+# The stable-audio-open family's model classes plus torchsde, which the family's scheduler
+# (CosineDPMSolverMultistepScheduler, via its Brownian-tree noise sampler) imports; the WAV is
+# written by audio.py with the standard library. torchsde is the inference-audio extra.
+AUDIO_DEPENDENCIES = (
+    ("torch", "torch"),
+    ("diffusers", "diffusers"),
+    ("transformers", "transformers"),
+    ("safetensors", "safetensors"),
+    ("torchsde", "torchsde"),
+)
+# Per family, the dependencies beyond which it is not served (sdxl-base uses the backend's own).
+FAMILY_DEPENDENCIES = {
+    "esrgan": UPSCALE_DEPENDENCIES,
+    "svd": VIDEO_DEPENDENCIES,
+    "stable-audio-open": AUDIO_DEPENDENCIES,
+}
 
 
 class Cancelled(Exception):
@@ -127,6 +145,19 @@ def task_parameters(tasks):
                 "manifest": "frames.json",
                 "compression": "stored",
             },
+        },
+        "text-to-audio": {
+            "inputs": ["prompt", "negative_prompt"],
+            "parameters": ["guidance", "duration_seconds"],
+            "required_parameters": ["seed", "steps", "duration_seconds"],
+            "defaults": dict(TASK_DEFAULTS["text-to-audio"]),
+            "outputs": OUTPUTS["text-to-audio"],
+            "output_formats": {"audio": "audio/wav"},
+            "families": ["stable-audio-open"],
+            "stages": ["encoding", "sampling", "decoding", "saving"],
+            # Sample rate, channels and the duration range come from the loaded bundle.
+            "bundle_facts": ["sample_rate", "channels", "hop_length", "duration_range"],
+            "audio": {"encoding": "pcm_s16le", "container": "wav", "duration": "rounded up to whole latent frames (hop_length samples) and reported"},
         },
     }
     return {task: table[task] for task in tasks}
@@ -219,6 +250,8 @@ class TorchBackend:
         self.upscaler = None
         self.upscale_config = None
         self.video = None
+        self.audio = None
+        self.audio_facts = None
 
     def missing_dependencies(self, dependencies=None):
         return [
@@ -241,11 +274,23 @@ class TorchBackend:
         families = []
         if not self.missing_dependencies():
             families.append("sdxl-base")
-        if not self.missing_dependencies(UPSCALE_DEPENDENCIES):
-            families.append("esrgan")
-        if "svd" in self.families and not self.missing_dependencies(VIDEO_DEPENDENCIES):
-            families.append("svd")
+        for family, dependencies in FAMILY_DEPENDENCIES.items():
+            if family in self.families and not self.missing_dependencies(dependencies):
+                families.append(family)
         return families
+
+    def missing_task_dependencies(self):
+        """Per task this backend implements, the distributions whose absence keeps it unadvertised.
+
+        `missing_dependencies` stays the base set that decides readiness; a family extra that is
+        absent (torchsde for text-to-audio) only removes that family's task.
+        """
+        missing = {}
+        for family, dependencies in FAMILY_DEPENDENCIES.items():
+            names = self.missing_dependencies(dependencies) if family in self.families else []
+            for task in FAMILIES[family]["tasks"] if names else ():
+                missing[task] = names
+        return missing
 
     def loaders(self, families):
         return [
@@ -277,6 +322,7 @@ class TorchBackend:
             # After an authorized CPU fallback the loaded bundle runs on the host CPU.
             "ready": not missing and (device_available or self.run_device == "cpu"),
             "missing_dependencies": missing,
+            "missing_task_dependencies": self.missing_task_dependencies(),
             "device": self.device,
             "device_available": device_available,
             "memory_budget_mb": self.memory_budget_mb,
@@ -291,6 +337,7 @@ class TorchBackend:
                 if importlib.util.find_spec(module) is not None
                 else None
                 for name, module in self.dependencies
+                + (AUDIO_DEPENDENCIES[-1:] if "stable-audio-open" in self.families else ())
             },
             "max_concurrency": 1,
             "model_families": families or ["sdxl-base"],
@@ -464,10 +511,12 @@ class TorchBackend:
             return self.load_upscaler(root, options)
         if family == "svd":
             return self.load_video(root, options)
+        if family == "stable-audio-open":
+            return self.load_audio(root, options)
         return self.load_pipeline(root, options, adapters)
 
     def unload(self):
-        self.upscaler = self.upscale_config = self.video = None
+        self.upscaler = self.upscale_config = self.video = self.audio = None
         self.unload_pipeline()
         measurements = self.release_device()
         self.run_device, self.family, self.applied_fallbacks = self.device, None, []
@@ -493,6 +542,8 @@ class TorchBackend:
             return self.upscale(request, directory, emit, cancelled, image_path)
         if request["task"] == "image-to-video":
             return self.generate_video(request, directory, emit, cancelled, image_path)
+        if request["task"] == "text-to-audio":
+            return self.generate_audio(request, directory, emit, cancelled)
         return self.generate_images(request, directory, emit, cancelled, image_path)
 
     def upscale(self, request, directory, emit, cancelled, image_path):
@@ -552,7 +603,7 @@ class DiffusersBackend(TorchBackend):
 
     backend_id = "diffusers-sdxl"
     ownership = "reference"
-    families = ("sdxl-base", "esrgan", "svd")
+    families = ("sdxl-base", "esrgan", "svd", "stable-audio-open")
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
         super().__init__(device, memory_budget_mb)
@@ -741,6 +792,116 @@ class DiffusersBackend(TorchBackend):
                     "effective_steps": steps,
                     "frames": frames,
                     "decode_chunks": chunks,
+                    **self.measurements(),
+                }
+        finally:
+            hook.remove()
+            self.finish()
+
+    # ----- text-to-audio (stable-audio-open) --------------------------------------------------
+    def load_audio(self, root, options):
+        offline_environment()
+        import torch
+        from diffusers import StableAudioPipeline
+
+        self.apply_budget()
+        pipe = StableAudioPipeline.from_pretrained(
+            str(root),
+            local_files_only=True,
+            use_safetensors=True,
+            torch_dtype=getattr(torch, options["precision"]),
+        )
+        pipe.to(self.run_device)
+        pipe.set_progress_bar_config(disable=True)
+        self.audio = pipe
+        self.audio_facts = audio_facts(root)
+
+    def generate_audio(self, request, directory, emit, cancelled):
+        import torch
+
+        from . import audio
+
+        pipe = self.audio
+        if pipe is None:
+            raise RuntimeError("Model not loaded")
+        params = {**TASK_DEFAULTS["text-to-audio"], **request["parameters"]}
+        facts = self.audio_facts
+        length = audio_length(params["duration_seconds"], facts)
+        steps = params["steps"]
+        sampling = []
+
+        def started(_module, _inputs):
+            # Prompt and timing encoding end at the first transformer call; each call checks.
+            if cancelled.is_set():
+                raise Cancelled()
+            if not sampling:
+                sampling.append(True)
+                emit("stage", {"stage": "sampling"})
+
+        def step(index, _timestep, _latents):
+            if cancelled.is_set():
+                raise Cancelled()
+            emit(
+                "progress",
+                {"stage": "sampling", "completed_steps": index + 1, "total_steps": steps, "scope": "stage"},
+            )
+
+        self.begin(cancelled)
+        hook = pipe.transformer.register_forward_pre_hook(started)
+        try:
+            with torch.inference_mode():
+                emit("stage", {"stage": "encoding"})
+                latents = pipe(
+                    request["inputs"]["prompt"],
+                    negative_prompt=request["inputs"].get("negative_prompt"),
+                    # The model is conditioned on the clip it returns: the effective duration.
+                    audio_start_in_s=0.0,
+                    audio_end_in_s=length["effective_duration_seconds"],
+                    num_inference_steps=steps,
+                    guidance_scale=params["guidance"],
+                    generator=torch.Generator(device=self.run_device).manual_seed(params["seed"]),
+                    callback=step,
+                    callback_steps=1,
+                    output_type="latent",
+                ).audios
+                if cancelled.is_set():
+                    raise Cancelled()
+                emit("stage", {"stage": "decoding"})
+                # The library decodes the whole latent length and cuts the waveform; so do we, at
+                # the latent-frame boundary that covers the request (never before it).
+                waveform = pipe.vae.decode(latents).sample[0, :, : length["samples"]]
+                if waveform.shape[-1] != length["samples"] or waveform.shape[0] != facts["channels"]:
+                    raise RuntimeError("decoded waveform does not match the bundle's facts")
+                if cancelled.is_set():
+                    raise Cancelled()
+                emit("stage", {"stage": "saving"})
+                pcm = (
+                    (waveform.float().clamp(-1, 1) * audio.FULL_SCALE)
+                    .round()
+                    .to(torch.int16)
+                    .T.contiguous()
+                    .cpu()
+                    .numpy()
+                    .astype("<i2")
+                    .tobytes()
+                )
+                path = Path(directory) / "audio.wav"
+                audio.write_wav(path, pcm, facts["sample_rate"], facts["channels"])
+                record = {
+                    "output_id": "audio",
+                    "path": path,
+                    "mime_type": audio.MIME_TYPE,
+                    "sample_rate": facts["sample_rate"],
+                    "channels": facts["channels"],
+                    "duration_seconds": length["effective_duration_seconds"],
+                }
+                clipped = int((waveform.abs() > 1).sum())
+                return [record], {
+                    "effective_steps": steps,
+                    "latent_frames": length["latent_frames"],
+                    "samples": length["samples"],
+                    # Samples beyond full scale before 16-bit quantization (they are clamped).
+                    "clipped_samples": clipped,
                     **self.measurements(),
                 }
         finally:

@@ -9,6 +9,7 @@ rows are never edited after release except to add later test evidence.
 
 | Engine | Protocol minors served | Startup record `protocol` | Runtime versions tested         | Platform tested                       | Families           | Extras                         | Conformance suite                |
 | ------ | ---------------------- | ------------------------- | ------------------------------- | ------------------------------------- | ------------------ | ------------------------------ | -------------------------------- |
+| 0.7.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video and text-to-audio) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.6.0 (11/11 integration tests) and 0.7.0 (15/15) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0 video, 0.10.0 audio) | Linux x64, CPU only, Python 3.12.13 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd, stable-audio-open (svd and stable-audio-open on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins), `inference-audio` (new: `torchsde==0.2.6`) | `media-worker-conformance/1.2` |
 | 0.6.0  | 1.0, 1.1, 1.2, 1.3 (1.3: image-to-video only) | `media-worker/1.1` (`highest_protocol` 1.3) | 0.5.0 (8/8 integration tests) and 0.6.0 (11/11) (Go, `go test ./...`, all packages pass; fixture over loopback HTTP, default and 1.1-pinned); no 1.3 consumer yet (Runtime 0.9.0) | Linux x64, CPU only, Python 3.12.3 (venv, CPU torch 2.6.0: inference, conformance) / 3.13 (protocol tests) | sdxl-base, esrgan, svd (svd on `diffusers-sdxl` only) | `inference`, `inference-owned` (unchanged pins; svd needs nothing beyond `inference`) | `media-worker-conformance/1.1` |
 | 0.5.0  | 1.0, 1.1, 1.2 (network mode fields within 1.2) | `media-worker/1.1` | 0.4.0 and 0.5.0 (Go, `go test ./...`, all packages pass; the fixture over loopback HTTP, default and 1.1-pinned); no network-mode consumer yet (Runtime 0.7.0) | Linux x64, CPU only, Python 3.13 (protocol and network tests); TLS on loopback only | sdxl-base, esrgan | `inference`, `inference-owned` (unchanged; not re-run, extras not installed) | `media-worker-conformance/1.0`, over loopback HTTP and mutual TLS |
 | 0.4.0  | 1.0, 1.1, 1.2          | `media-worker/1.1`        | 0.3.0 (14/14, fixture default and fixture pinned to 1.1); 0.4.0 and 0.5.0 (Go, `go test ./...`, default and 1.1-pinned fixture) | Linux x64, CPU only, Python 3.12.3 (venv) / 3.13 (protocol tests) | sdxl-base, esrgan | `inference`, `inference-owned` | `media-worker-conformance/1.0`   |
@@ -19,6 +20,48 @@ rows are never edited after release except to add later test evidence.
 The 0.5.0 row names Runtime 0.7.0 as the network-mode consumer; the Runtime plan schedules
 network mode as Runtime 0.8.0 (R4) and image-to-video as 0.9.0 (R5), which the release map in
 [implementation-plan.md](implementation-plan.md) now matches.
+
+## Conformance results for 0.7.0
+
+`media-worker-conformance/1.2` adds the `text_to_audio` section (and text-to-audio checks in
+discovery, negotiation and validation) to the 1.1 sections; a worker that does not advertise
+text-to-audio passes it as not applicable.
+
+| Backend                        | Device / transport            | Bundle                                                                  | Result     |
+| ------------------------------ | ----------------------------- | ----------------------------------------------------------------------- | ---------- |
+| test fixture (1.3 default)     | none, loopback HTTP           | fixture bundles from `serve_fixture.py` (incl. `video`, `audio`)        | conformant |
+| test fixture (1.3 default)     | none, mutual TLS on 127.0.0.1 | fixture bundles                                                         | conformant, same section results as loopback HTTP |
+| test fixture (pinned to 1.2)   | none, loopback HTTP           | fixture bundles                                                         | conformant (image_to_video, text_to_audio not applicable) |
+| test fixture (pinned to 1.1)   | none, loopback HTTP           | fixture bundles                                                         | conformant |
+| `diffusers-sdxl`               | CPU float32, loopback HTTP    | tiny random-weight SDXL + tiny RRDBNet + tiny svd + tiny stable-audio-open (1 kHz stereo) | conformant |
+| `owned-sdxl`                   | CPU float32, loopback HTTP    | tiny random-weight SDXL + tiny RRDBNet                                  | conformant (image_to_video, text_to_audio not applicable: not served) |
+| `diffusers-sdxl`               | RTX 4090 (reference)          | SDXL base 1.0, Real-ESRGAN, SVD img2vid-xt, Stable Audio Open 1.0        | not run: no CUDA device or real weights in this workspace |
+
+The fixture rows run in CI (`tests/test_conformance_fixture.py`, `tests/test_network.py`). The CPU
+rows were run in a Python 3.12.13 virtual environment with the pinned `inference` and
+`inference-audio` sets and CPU torch 2.6.0 (`torch==2.6.0+cpu`, not the locked CUDA wheel) with
+`python -m tests.conformance.run --registration … --launch …/python -m media_engine.server
+--backend … --device cpu --port 0 --max-retained 10 --catalog …`, using the tiny bundles
+`tests/test_inference.py` builds. Runtime 0.6.0 and 0.7.0 were run from clean checkouts of their
+release commits against this tree's fixture; neither consumes 1.3.
+
+## Text-to-audio checklist (operator, reference RTX 4090)
+
+The stable-audio-open path of 0.7.0 is implemented and exercised on CPU with a tiny random-weight
+bundle only. On the reference host:
+
+1. `uv sync --frozen --extra inference --extra inference-audio`; approve a local
+   `stable-audio-open-1.0` Diffusers bundle (safetensors only, `tokenizer/tokenizer.json`
+   present, no top-level single-file checkpoint); validate it and confirm `sample_rate` 44100,
+   `channels` 2, `hop_length` 2048 and `duration_range` [1, 47]; record the estimate.
+2. Run the conformance suite against `diffusers-sdxl` with that bundle as `audio` at
+   `--device cuda:0`; record the result here.
+3. 10 s and 47 s at 100 and 200 steps, float16 and float32: record wall time and peak allocated
+   memory against the estimate, and that the WAVs are 10.031 s and 47.044 s (216 and 1013 latent frames) at 44.1 kHz stereo.
+4. Listen to one clip per precision; record `measurements.clipped_samples`; cancel once during
+   sampling and confirm nothing is published.
+5. Compare one 10 s clip's samples with the library pipeline at `audio_end_in_s` 10.031 (same
+   seed, steps and guidance) on the same device.
 
 ## Conformance results for 0.6.0
 

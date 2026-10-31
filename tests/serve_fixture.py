@@ -10,11 +10,14 @@ The first stdout line is the startup record. ROOT receives these catalog handles
   checkpoint   bare single-file checkpoint (needs conversion)        ROOT/checkpoint
   video        svd bundle (1.3): num_frames 2, sizes 64×64,          ROOT/video
                1024×576 and 576×1024; tiny random stand-in weights
+  audio        stable-audio-open bundle (1.3): 8 kHz stereo,         ROOT/audio
+               256-sample latent frames, 1–47 s; tiny random stand-in weights
 plus ROOT/catalog.json (handle → directory), ROOT/registrations.json (handle → bundle or
 adapter registration) and ROOT/conformance.json (the conformance suite's registration document).
 Every option also reads an environment variable so a supervisor's test can set it without
 changing the launch command. --protocol media-worker/1.2 (or MEDIA_ENGINE_FIXTURE_PROTOCOL)
-serves exactly the Engine 0.5.0 fixture surface (no image-to-video, no svd), and
+serves exactly the Engine 0.5.0 fixture surface (no image-to-video or text-to-audio, no svd or
+stable-audio-open), and
 --protocol media-worker/1.1 the 0.3.0 surface, so supervisors can test negotiation and refusal.
 
 Network mode takes the worker's own flags and rules (media_engine.server.network_configuration):
@@ -33,6 +36,7 @@ from fixture import (
     FIXTURE_VERSION,
     TestBackend,
     make_adapter,
+    make_audio_bundle,
     make_bundle,
     make_checkpoint,
     make_converted,
@@ -117,12 +121,14 @@ handles = {
     "converted": root / "converted",
     "checkpoint": root / "checkpoint",
     "video": root / "video",
+    "audio": root / "audio",
 }
 registrations = {
     "fixture": make_bundle(handles["fixture"]),
     "fixture-lora": make_adapter(handles["fixture-lora"]),
     "upscaler": make_esrgan_bundle(handles["upscaler"]),
     "video": make_svd_bundle(handles["video"]),
+    "audio": make_audio_bundle(handles["audio"]),
 }
 registrations["converted"] = make_converted(handles["converted"], reference=handles["fixture"])
 make_checkpoint(handles["checkpoint"])
@@ -135,6 +141,7 @@ catalog = {handle: str(path) for handle, path in handles.items()}
             "bundle": registrations["fixture"],
             "upscaler": registrations["upscaler"],
             "video": registrations["video"],
+            "audio": registrations["audio"],
             "adapter": registrations["fixture-lora"],
         },
         indent=2,

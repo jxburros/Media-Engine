@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
-from . import png, video
+from . import audio, png, video
 from .backend import Cancelled, backend_class
 from .contracts import (
     FAMILIES,
@@ -31,6 +31,7 @@ from .contracts import (
     SUPPORTED_PROTOCOLS,
     WORKER_VERSION,
     WorkerError,
+    audio_length,
     effective_settings,
     effective_steps,
     family_facts,
@@ -112,6 +113,9 @@ class Worker:
         if self.loaded_family == "svd" and "video_sizes" in backend.get("limits", {}):
             # Sizes are a bundle fact: with an svd bundle loaded, advertise the sizes it serves.
             backend["limits"] = {**backend["limits"], "video_sizes": self.loaded_facts["video_sizes"]}
+        if self.loaded_family == "stable-audio-open" and "duration_seconds" in backend.get("limits", {}):
+            # Likewise the duration range is the loaded stable-audio-open bundle's.
+            backend["limits"] = {**backend["limits"], "duration_seconds": self.loaded_facts["duration_range"]}
         return {
             **backend,
             "session_id": self.session_id,
@@ -174,7 +178,8 @@ class Worker:
             and FAMILIES[name]["since"] <= level
             and name not in getattr(self.backend, "families", FAMILIES)
         ):
-            # A family this backend's code does not implement (svd on owned-sdxl), refused before
+            # A family this backend's code does not implement (svd or stable-audio-open on
+            # owned-sdxl), refused before
             # any file is read, as an unknown family is.
             raise WorkerError(400, "unsupported", "family")
         if "authorized_fallbacks" in body and level < 2:
@@ -373,7 +378,7 @@ class Worker:
     def storage_used(self):
         return sum(
             p.stat().st_size
-            for pattern in ("exec_*/*.png", "exec_*/*.zip", "inputs/*.png")
+            for pattern in ("exec_*/*.png", "exec_*/*.zip", "exec_*/*.wav", "inputs/*.png")
             for p in self.directory.glob(pattern)
         )
 
@@ -438,6 +443,19 @@ class Worker:
                 # Only sizes the bundle advertises; the input is never resized to fit one.
                 raise WorkerError(400, "invalid_request", "video_size")
             return {"frames": params.get("frames", self.loaded_facts["default_frames"])}
+        if task == "text-to-audio":
+            facts = self.loaded_facts
+            low, high = facts["duration_range"]
+            if not low <= params["duration_seconds"] <= high:
+                # Outside the bundle's range is refused; a clip is never trimmed to fit it.
+                raise WorkerError(400, "invalid_request", "duration_seconds")
+            length = audio_length(params["duration_seconds"], facts)
+            return {
+                "sample_rate": facts["sample_rate"],
+                "channels": facts["channels"],
+                "latent_frames": length["latent_frames"],
+                "effective_duration_seconds": length["effective_duration_seconds"],
+            }
         if task != "upscale":
             return {}
         scale = self.loaded_facts["scale"]
@@ -497,12 +515,18 @@ class Worker:
                     raise WorkerError(400, "invalid_request", "width")
                 image_path = self.directory / "inputs" / (record["input_id"] + ".png")
             expected = output_ids(task, body["parameters"])
-            width = facts.get("output_width", body["parameters"]["width"])
-            height = facts.get("output_height", body["parameters"]["height"])
-            # One image-sized reservation per output file, and per frame inside a frame archive;
-            # an oversized video is refused here, before sampling, never shortened.
-            files = len(expected) + (facts["frames"] - 1 if task == "image-to-video" else 0)
-            reserve = (width * height * 4 + 65536) * files
+            if task == "text-to-audio":
+                # The WAV's exact size is known from the bundle's facts before sampling; a clip
+                # that cannot fit is refused here, never shortened.
+                samples = audio_length(body["parameters"]["duration_seconds"], self.loaded_facts)["samples"]
+                reserve = audio.size(samples, self.loaded_facts["channels"]) + 65536
+            else:
+                width = facts.get("output_width", body["parameters"]["width"])
+                height = facts.get("output_height", body["parameters"]["height"])
+                # One image-sized reservation per output file, and per frame inside a frame
+                # archive; an oversized video is refused here, before sampling, never shortened.
+                files = len(expected) + (facts["frames"] - 1 if task == "image-to-video" else 0)
+                reserve = (width * height * 4 + 65536) * files
             if (
                 len(self.executions) + len(self.inputs) >= self.max_retained
                 or self.storage_used() + reserve > self.max_storage_mb * 1024**2
@@ -548,7 +572,7 @@ class Worker:
         """Verify every advertised output exists, then fsync, hash and publish each one.
 
         Type-specific facts are read back from the file (PNG header; the frame archive's
-        validated frames.json), never taken from the backend's word.
+        validated frames.json; the WAV header), never taken from the backend's word.
         """
         entry = self.executions[execution_id]
         by_id = {r["output_id"]: r for r in records}
@@ -575,6 +599,14 @@ class Worker:
                     "frames": manifest["frames"],
                     "fps": manifest["fps"],
                     "duration_seconds": video.duration_seconds(manifest["frames"], manifest["fps"]),
+                }
+            elif record["mime_type"] == audio.MIME_TYPE:
+                header = audio.read_header(record["path"])
+                facts = {
+                    "sample_rate": header["sample_rate"],
+                    "channels": header["channels"],
+                    "samples": header["samples"],
+                    "duration_seconds": header["duration_seconds"],
                 }
             else:
                 width, height = png.header(head)[:2]

@@ -28,8 +28,9 @@ class OwnedPipelineBackend(TorchBackend):
         ("transformers", "transformers"),
         ("safetensors", "safetensors"),
     )
-    # svd is reference-only for now: an owned video loop waits until the reference path is
-    # validated on hardware. An svd bundle is `unsupported`, field `family`, on this backend.
+    # svd and stable-audio-open are reference-only for now: owned video and audio loops wait
+    # until the reference paths are validated on hardware. Either bundle is `unsupported`, field
+    # `family`, on this backend.
     families = ("sdxl-base", "esrgan")
 
     def __init__(self, device="cuda:0", memory_budget_mb=None):
