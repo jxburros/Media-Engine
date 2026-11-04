@@ -1,0 +1,46 @@
+name: GPU conformance and benchmarks
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Also measure optimization candidates (never auto-advertise them)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: media-reference-gpu
+  cancel-in-progress: false
+jobs:
+  reference-hardware:
+    if: github.ref == 'refs/heads/main'
+    environment: gpu-validation
+    runs-on: [self-hosted, linux, x64, media-gpu]
+    timeout-minutes: 360
+    env:
+      MEDIA_GPU_CONFIG: ${{ vars.MEDIA_GPU_CONFIG }}
+      MEDIA_GPU_PYTHON: ${{ vars.MEDIA_GPU_PYTHON }}
+      RUN_BENCHMARK: ${{ inputs.benchmark }}
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - name: Build native CUDA for the reference RTX 4090
+        env:
+          CUDA_COMPUTE_CAP: '89'
+        run: cargo build --release --locked --manifest-path native/Cargo.toml --features cuda
+      - name: Run configured real-weight conformance and optional benchmarks
+        run: |
+          test -n "$MEDIA_GPU_PYTHON" && test -x "$MEDIA_GPU_PYTHON"
+          "$MEDIA_GPU_PYTHON" packaging/gpu-validation.py --config "$MEDIA_GPU_CONFIG" --output gpu-results --native native/target/release/media-engine-native
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-hardware-results
+          path: gpu-results
+          if-no-files-found: error

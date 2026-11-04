@@ -1,0 +1,91 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - name: Protocol, fixture conformance and mutual TLS
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+  inference-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: engine-native-${{ runner.os }}-1.99.1-${{ hashFiles('native/Cargo.lock') }}
+      - name: Install pinned inference extras with CPU torch
+        run: |
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[inference,inference-audio,inference-optimize,inference-video]'
+      - run: cargo test --workspace --locked --manifest-path native/Cargo.toml
+      - run: cargo build --release --locked --manifest-path native/Cargo.toml
+      - name: Real CPU inference, native conformance and Python oracle
+        env:
+          MEDIA_ENGINE_NATIVE: ${{ github.workspace }}/native/target/release/media-engine-native
+        run: python -m unittest discover -s tests -v
+      - name: Prepare Runtime acceptance bundles offline
+        run: python tests/prepare_runtime.py "$RUNNER_TEMP/runtime-bundles"
+      - name: Smoke-test CPU release packaging
+        run: |
+          python packaging/check-linked-libraries.py native/target/release/media-engine-native
+          bash packaging/package-native.sh native/target/release/media-engine-native cpu dist
+          python -m pip install build==1.2.2.post1
+          bash packaging/package-python.sh dist
+  cuda-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compile native CUDA and check dynamic dependencies (no GPU required)
+        run: docker buildx build --file packaging/Dockerfile.native --target native-build .
+  owned-dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - name: Install only the owned inference dependency set
+        run: |
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[inference-owned]'
+      - run: python -m unittest discover -s tests -p test_inference.py -v

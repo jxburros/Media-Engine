@@ -10,12 +10,12 @@ mod http;
 mod json;
 mod sha256;
 mod sys;
+mod tls;
 mod worker;
 
 use contracts::{fail, WorkerError};
 use json::Value;
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -26,11 +26,10 @@ use worker::{error_body, Worker};
 const HELP: &str = "usage: media-engine-native [--version] [--probe] [--port PORT] [--directory DIR] --catalog FILE
                            [--device cpu|cuda:N] [--backend native-sdxl] [--memory-budget-mb MB]
                            [--max-retained N] [--max-storage-mb MB] [--max-input-mb MB]
-                           [--bind 127.0.0.1|::1] [--no-parent-watch]
+                           [--bind IP] [--no-parent-watch]\n                           [--tls-cert FILE --tls-key FILE --tls-client-ca FILE]
 
 Owned native media-worker engine (native-sdxl). The credential is read from MEDIA_ENGINE_TOKEN
-(at least 32 characters). Network mode (--tls-*) is not implemented by this engine yet: it binds
-loopback only.";
+(at least 32 characters). Non-loopback serving requires TLS 1.3 and client certificates.";
 
 fn usage_error(message: &str) -> ! {
     eprintln!("{}\nmedia-engine-native: error: {}", HELP.lines().next().unwrap(), message);
@@ -49,6 +48,9 @@ struct Args {
     max_input_mb: u64,
     bind: String,
     no_parent_watch: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +66,9 @@ fn parse_args() -> Args {
         max_input_mb: 32,
         bind: "127.0.0.1".into(),
         no_parent_watch: false,
+        tls_cert: None,
+        tls_key: None,
+        tls_client_ca: None,
     };
     let mut it = std::env::args().skip(1);
     fn number<T: std::str::FromStr>(flag: &str, value: Option<String>) -> T {
@@ -101,9 +106,9 @@ fn parse_args() -> Args {
             "--max-input-mb" => args.max_input_mb = number("--max-input-mb", value()),
             "--bind" => args.bind = value().unwrap_or_else(|| usage_error("argument --bind: expected one argument")),
             "--no-parent-watch" => args.no_parent_watch = true,
-            "--tls-cert" | "--tls-key" | "--tls-client-ca" => {
-                usage_error("network mode (mutual TLS) is not implemented by the native engine; bind loopback")
-            }
+            "--tls-cert" => args.tls_cert = Some(PathBuf::from(value().unwrap_or_else(|| usage_error("--tls-cert requires a file")))),
+            "--tls-key" => args.tls_key = Some(PathBuf::from(value().unwrap_or_else(|| usage_error("--tls-key requires a file")))),
+            "--tls-client-ca" => args.tls_client_ca = Some(PathBuf::from(value().unwrap_or_else(|| usage_error("--tls-client-ca requires a file")))),
             other => usage_error(&format!("unrecognized arguments: {}", other)),
         }
     }
@@ -127,7 +132,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn body_json(request: &mut http::Request) -> Result<Value, WorkerError> {
-    let data = request.body(4 * 1024 * 1024).map_err(|status| fail(status, "invalid_request", None))?;
+    let data = request.body(http::MAX_JSON_BYTES).map_err(|status| fail(status, "invalid_request", None))?;
     json::parse(&data).map_err(|_| fail(400, "invalid_request", None))
 }
 
@@ -172,6 +177,14 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
     if request.header("origin").is_some() {
         return Err(fail(403, "browser_origin_denied", None));
     }
+    let loopback = worker.transport["bind"].as_str().and_then(|s| s.parse::<std::net::IpAddr>().ok()).is_some_and(|ip| ip.is_loopback());
+    if loopback && !http::loopback_host(request.header("host").unwrap_or("")) {
+        return Err(fail(403, "host_denied", None));
+    }
+    if let Some(length) = request.header("content-length") {
+        let limit = if method == "POST" && path == "/v1/inputs" { worker.max_input_mb.saturating_mul(1024 * 1024) } else { http::MAX_JSON_BYTES as u64 };
+        if length.parse::<u64>().map_err(|_| fail(400, "invalid_request", None))? > limit { return Err(fail(413, "invalid_request", None)); }
+    }
     if path == "/health" && method == "GET" {
         let error = worker.is_error();
         respond(response, if error { 503 } else { 200 }, &obj! {"status" => if error { "error" } else { "ok" }});
@@ -180,6 +193,10 @@ fn route(worker: &Arc<Worker>, token: &str, mut request: http::Request, response
     let expected = format!("Bearer {}", token);
     if !constant_time_eq(request.header("authorization").unwrap_or("").as_bytes(), expected.as_bytes()) {
         return Err(fail(401, "unauthorized", None));
+    }
+    if method == "GET" && path == "/metrics" {
+        let _ = response.send(200, "text/plain; version=0.0.4; charset=utf-8", worker.metrics_text().as_bytes());
+        return Ok(());
     }
     match (method.as_str(), path.as_str()) {
         ("GET", "/v1/info") => return {
@@ -340,9 +357,14 @@ fn main() {
         return;
     }
     let bind: std::net::IpAddr = args.bind.parse().unwrap_or_else(|_| usage_error("--bind must be an IP address literal"));
-    if !bind.is_loopback() {
-        usage_error("a non-loopback address is only served over mutual TLS, which the native engine does not implement yet");
-    }
+    let (tls, fingerprint) = match (&args.tls_cert, &args.tls_key, &args.tls_client_ca) {
+        (None, None, None) if bind.is_loopback() => (None, Value::Null),
+        (Some(cert), Some(key), Some(ca)) => {
+            let (config, fingerprint) = tls::configure(cert, key, ca).unwrap_or_else(|e| usage_error(&e));
+            (Some(config), Value::str(fingerprint))
+        }
+        _ => usage_error("non-loopback serving and TLS require --tls-cert, --tls-key and --tls-client-ca together"),
+    };
     let device_ok = args.device == "cpu" || args.device.strip_prefix("cuda:").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     if !device_ok {
         usage_error("device must be cpu or cuda:N");
@@ -367,18 +389,18 @@ fn main() {
         usage_error("Set MEDIA_ENGINE_TOKEN to at least 32 random characters");
     }
     let transport = obj! {
-        "scheme" => "http",
+        "scheme" => if tls.is_some() { "https" } else { "http" },
         "bind" => bind.to_string(),
-        "certificate_sha256" => Value::Null,
+        "certificate_sha256" => fingerprint,
         "ownership_available" => !args.no_parent_watch,
     };
     let backend = worker::Backend::new(&args.device, args.memory_budget_mb);
     // A private per-session directory prevents another session's outputs being collected.
     let directory = args.directory.join(sys::random_hex());
-    let worker = Arc::new(
-        Worker::new(directory, backend, catalog, args.max_retained, args.max_storage_mb, args.max_input_mb, transport)
-            .unwrap_or_else(|e| usage_error(&format!("cannot create the work directory: {}", e))),
-    );
+    let mut worker = Worker::new(directory, backend, catalog, args.max_retained, args.max_storage_mb, args.max_input_mb, transport)
+        .unwrap_or_else(|e| usage_error(&format!("cannot create the work directory: {}", e)));
+    worker.catalog_path = Some(catalog_path.clone());
+    let worker = Arc::new(worker);
     let listener = TcpListener::bind((bind, args.port)).unwrap_or_else(|e| {
         eprintln!("media-engine-native: cannot bind: {}", e);
         std::process::exit(1);
@@ -389,8 +411,7 @@ fn main() {
     if std::env::var("MEDIA_ENGINE_SUPERVISED").as_deref() == Ok("1") && !args.no_parent_watch {
         // The supervisor owns stdin; EOF means its process exited (including a crash).
         std::thread::spawn(|| {
-            let mut sink = Vec::new();
-            let _ = std::io::stdin().read_to_end(&mut sink);
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
             sys::STOP.store(true, Ordering::SeqCst);
         });
     }
@@ -427,8 +448,9 @@ fn main() {
     println!("{}", json::to_string(&record));
 
     let token = Arc::new(token);
-    http::serve(listener, move |request, mut response| {
+    http::serve(listener, tls, move |request, mut response| {
         if let Err(e) = route(&worker, &token, request, &mut response) {
+            if e.code == "busy" { worker.record_busy_refusal(); }
             respond_error(&mut response, &e);
         }
     });

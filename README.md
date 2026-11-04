@@ -389,3 +389,36 @@ your model directories, one command, and an HTML report of every feature with it
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
 SDXL base weights carry CreativeML Open RAIL++-M terms, and Stable Video Diffusion and Stable Audio
 Open weights carry Stability AI's terms; all are supplied by the operator.
+
+## Offline weight migration
+
+The serving process continues to accept safe tensor artifacts only. Explicit operator conversion
+can migrate Real-ESRGAN `.pth` weights and Kohya SDXL LoRA files before registration:
+
+```sh
+media-engine convert --kind esrgan-pth --input RealESRGAN.pth \
+  --config rrdbnet.json --output converted-upscaler
+media-engine convert --kind lora-kohya --input style.safetensors \
+  --reference-handle sdxl-base --catalog catalog.json --output converted-style
+```
+
+`rrdbnet.json` explicitly declares the architecture, scale, channels and block dimensions used by
+Engine's ESRGAN loader. The `.pth` reader runs in a separate isolated Python process with
+`torch.load(weights_only=True)`, a timeout, CPU placement and no arbitrary pickle allow-list.
+It accepts the published `params_ema`/`params` wrapper or a bare tensor state dict and refuses
+unknown keys or shapes. This step is never invoked by model loading or a generation request.
+
+Kohya conversion supports linear SDXL UNet and dual-CLIP LoRA targets named by the reference
+bundle's local configuration. Down/up matrices become PEFT A/B matrices; alpha is preserved.
+Unsupported convolutional/LyCORIS layouts and unknown keys are errors, never silently discarded.
+The result contains safetensors and conversion provenance; existing output directories are refused.
+
+## Explicit CPU offload
+
+On a ready CUDA reference worker, protocol 1.4 advertises `offload_modes` (`none`, `model`,
+`sequential`) for the `sdxl-base`, `svd` and `stable-audio-open` families. Select a mode in load
+options; `auto` never selects one. `model` transfers whole components as needed; `sequential`
+uses Accelerate's per-submodule hooks and trades transfer overhead for lower GPU residency.
+Owned/native workers and CPU-only workers offer `none`. Offload is not combined with compilation
+or weight quantization, and a CPU fallback cannot silently reinterpret an offload request.
+Memory estimates remain conservative full-residency estimates; no measured savings are claimed.

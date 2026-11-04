@@ -1,6 +1,7 @@
 """Explicit test-only backend. Not packaged and never selected by the production executable."""
 
 import hashlib
+from media_engine.sampling import advertised as sampling_options
 import json
 import os
 import random
@@ -443,6 +444,7 @@ class TestBackend:
             "limits": {k: LIMITS[k] for k in ("width", "height", "steps", "guidance", "strength", "adapter_scale", "size_multiple")},
             "precisions": self.precision_list,
             "tasks": ["text-to-image", "image-to-image"],
+            "sampling": sampling_options(self.level >= 4),
             "task_parameters": {
                 "text-to-image": {"inputs": ["prompt", "negative_prompt"]},
                 "image-to-image": {
@@ -465,7 +467,7 @@ class TestBackend:
         # Pinned to 1.2: exactly the 0.5.0 fixture's surface (no svd or stable-audio-open, no
         # video or audio limits or tasks).
         families = {n: f for n, f in FAMILIES.items() if f["since"] <= self.level}
-        tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values())]
+        tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values()) and (t not in ("inpaint","image-transform") or self.level >= 4)]
         newer = VIDEO_LIMITS + AUDIO_LIMITS
         limits = {k: v for k, v in LIMITS.items() if self.level >= 3 or k not in newer}
         if self.level >= 3:
@@ -561,6 +563,9 @@ class TestBackend:
         return {"allocated_mb": 0, "reserved_mb": 0}
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
+        if request["task"] == "image-transform":
+            from media_engine.image_ops import generate
+            return generate(request,directory,emit,cancelled,image_path)
         self.generations += 1
         if request["task"] == "upscale":
             return self.upscale(request, directory, emit, cancelled, image_path)
@@ -568,6 +573,8 @@ class TestBackend:
             return self.generate_video(request, directory, emit, cancelled, image_path)
         if request["task"] == "text-to-audio":
             return self.generate_audio(request, directory, emit, cancelled)
+        if request["task"] == "inpaint":
+            assert Path(image_path["image"]).is_file() and Path(image_path["mask"]).is_file()
         if request["task"] == "image-to-image":
             # The fixture proves the handle resolves to the uploaded bytes; it does not sample.
             assert Path(image_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
@@ -592,6 +599,8 @@ class TestBackend:
                     "total_steps": total,
                 },
             )
+            if params.get("preview_interval") and (step + 1) % params["preview_interval"] == 0:
+                emit("preview", {"png": make_png(16, 16), "width": 16, "height": 16, "step": step + 1, "kind": "latent_rgb"})
         if cancelled.is_set():
             raise Cancelled()
         emit("stage", {"stage": "decoding"})
@@ -697,6 +706,11 @@ class TestBackend:
             {"output_id": "frames", "path": archive, "mime_type": video.MIME_TYPE, "width": width, "height": height, "frames": frames, "fps": params["fps"]},
             {"output_id": "poster", "path": poster, "mime_type": "image/png", "width": width, "height": height},
         ]
+        if params.get("encode_video"):
+            from media_engine import mp4
+            encoded = Path(directory) / "video.mp4"
+            mp4.write(encoded, pngs, params["fps"], cancelled)
+            records.append({"output_id": "video", "path": encoded, "mime_type": mp4.MIME_TYPE})
         return records, {"test_fixture": True, "effective_steps": params["steps"], "frames": frames, "peak_allocated_mb": 0}
 
     def generate_audio(self, request, directory, emit, cancelled):

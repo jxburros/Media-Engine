@@ -1,6 +1,7 @@
 """Offline Diffusers adapters. No inference dependencies are imported by the API server."""
 
 import hashlib
+from media_engine.sampling import advertised as sampling_options
 import importlib.util
 import importlib.metadata
 import os
@@ -8,7 +9,7 @@ import resource
 import socket
 from pathlib import Path
 
-from . import optimize
+from . import offload, optimize
 from .contracts import (
     ADAPTER_FORMAT,
     ADAPTER_TARGETS,
@@ -182,6 +183,13 @@ def task_parameters(tasks):
             "audio": {"encoding": "pcm_s16le", "container": "wav", "duration": "rounded up to whole latent frames (hop_length samples) and reported"},
         },
     }
+    table["image-transform"] = {"inputs":["image","overlay"],"parameters":["operation","filter","x","y","background","opacity"],"outputs":["image"],"output_formats":{"image":"image/png"},"families":["sdxl-base"],"stages":["transforming","saving"]}
+    table["inpaint"] = {**table["image-to-image"], "inputs": ["prompt", "negative_prompt", "image", "mask"]}
+    from . import mp4
+    if mp4.available():
+        table["image-to-video"]["parameters"].append("encode_video")
+        table["image-to-video"]["optional_outputs"] = ["video"]
+        table["image-to-video"]["output_formats"]["video"] = mp4.MIME_TYPE
     return {task: table[task] for task in tasks}
 
 
@@ -277,6 +285,8 @@ class TorchBackend:
         self.video = None
         self.audio = None
         self.audio_facts = None
+        from .conditioning_cache import TextCache
+        self.text_cache = TextCache()
 
     def missing_dependencies(self, dependencies=None):
         return [
@@ -323,7 +333,7 @@ class TorchBackend:
                 "format": FAMILIES[f]["format"],
                 "families": [f],
                 "roles": list(FAMILIES[f]["roles"]),
-                "tasks": list(FAMILIES[f]["tasks"]),
+                "tasks": [t for t in FAMILIES[f]["tasks"] if t != "inpaint" or self.backend_id == "diffusers-sdxl"],
                 # The upscaler has no library pipeline: its network is engine code on every backend.
                 "ownership": "owned" if f == "esrgan" else self.ownership,
             }
@@ -338,6 +348,7 @@ class TorchBackend:
             "text-to-image",
             "image-to-image",
         ]
+        tasks = [t for t in tasks if t != "inpaint" or self.backend_id == "diffusers-sdxl"]
         return {
             "protocol": PROTOCOL,
             "supported_protocols": list(SUPPORTED_PROTOCOLS),
@@ -370,6 +381,7 @@ class TorchBackend:
             "model_families": families or ["sdxl-base"],
             "loaders": self.loaders(families),
             "tasks": tasks,
+            "sampling": sampling_options(self.backend_id == "diffusers-sdxl"),
             "task_parameters": task_parameters(tasks),
             "adapters": {
                 "formats": [ADAPTER_FORMAT],
@@ -381,6 +393,8 @@ class TorchBackend:
             },
             "defaults": DEFAULTS,
             "task_defaults": TASK_DEFAULTS,
+            **offload.capabilities(
+                self.backend_id, self.device, device_available and not missing),
             "load_defaults": {
                 "precision": "float32" if self.device == "cpu" else "float16",
                 "attention": "sdpa",
@@ -560,6 +574,7 @@ class TorchBackend:
     def load(self, root, options, adapters=(), family="sdxl-base", device=None):
         if family not in self.families:
             raise WorkerError(400, "unsupported", "family")
+        self.text_cache.clear()
         self.run_device = device or self.device
         self.family = family
         self.load_options = dict(options)
@@ -575,6 +590,7 @@ class TorchBackend:
         self.apply_optimizations(options)
 
     def unload(self):
+        self.text_cache.clear()
         self.upscaler = self.upscale_config = self.video = self.audio = None
         self.unload_pipeline()
         optimize.release(self.load_options)
@@ -591,16 +607,25 @@ class TorchBackend:
 
         self.apply_budget()
         config = upscale.read_config(root)
-        weights = next(Path(root).glob("*.safetensors"))
+        weights = Path(root) if Path(root).is_file() else next(Path(root).glob("*.safetensors"))
         self.upscaler = upscale.load(
             root, weights, config, self.run_device, getattr(torch, options["precision"])
         )
         self.upscale_config = config
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
+        if request["task"] == "image-transform":
+            from .image_ops import generate
+            return generate(request,directory,emit,cancelled,image_path)
         """Write every output for the request into `directory`; return (records, measurements)."""
-        with optimize.attention_scope(self.load_options):
-            return self.dispatch(request, directory, emit, cancelled, image_path)
+        from .offload import release
+        try:
+            with optimize.attention_scope(self.load_options):
+                return self.dispatch(request, directory, emit, cancelled, image_path)
+        finally:
+            mode = (self.load_options or {}).get("offload", "none")
+            for pipe in (getattr(self, "pipe", None), self.video, self.audio):
+                release(pipe, mode)
 
     def dispatch(self, request, directory, emit, cancelled, image_path=None):
         if request["task"] == "upscale":
@@ -708,9 +733,11 @@ class DiffusersBackend(TorchBackend):
                 [record["adapter_id"] for record, *_ in adapters],
                 [float(scale) for _r, _a, _w, scale, _l in adapters],
             )
-        pipe.to(self.run_device)
+        from .offload import place
+        place(pipe, options["offload"], self.run_device)
         pipe.set_progress_bar_config(disable=True)
         self.pipe = pipe
+        self.scheduler_config = dict(pipe.scheduler.config)
         self.img2img = None
 
     def unload_pipeline(self):
@@ -734,7 +761,8 @@ class DiffusersBackend(TorchBackend):
         pipe.unet.set_attn_processor(AttnProcessor2_0())
         pipe.vae.set_attn_processor(AttnProcessor2_0())
         uniform_precision(pipe, ("image_encoder",), options["precision"])
-        pipe.to(self.run_device)
+        from .offload import place
+        place(pipe, options["offload"], self.run_device)
         pipe.set_progress_bar_config(disable=True)
         self.video = pipe
 
@@ -857,6 +885,11 @@ class DiffusersBackend(TorchBackend):
                         "height": height,
                     },
                 ]
+                if params.get("encode_video"):
+                    from . import mp4
+                    encoded = Path(directory) / "video.mp4"
+                    mp4.write(encoded, pngs, params["fps"], cancelled)
+                    records.append({"output_id": "video", "path": encoded, "mime_type": mp4.MIME_TYPE})
                 chunks = -(-frames // params["decode_chunk"])
                 return records, {
                     "effective_steps": steps,
@@ -881,7 +914,8 @@ class DiffusersBackend(TorchBackend):
             use_safetensors=True,
             torch_dtype=getattr(torch, options["precision"]),
         )
-        pipe.to(self.run_device)
+        from .offload import place
+        place(pipe, options["offload"], self.run_device)
         pipe.set_progress_bar_config(disable=True)
         self.audio = pipe
         self.audio_facts = audio_facts(root)
@@ -986,6 +1020,12 @@ class DiffusersBackend(TorchBackend):
         pipe = self.pipe
         if pipe is None:
             raise RuntimeError("Model not loaded")
+        from .sampling import create
+        # A scheduler is stateful. Build it fresh for every execution, from the same
+        # verified bundle configuration, so earlier requests cannot affect this run.
+        pipe.scheduler = create(self.scheduler_config, params["sampler"], params["scheduler"])
+        if self.img2img is not None:
+            self.img2img.scheduler = pipe.scheduler
         self.begin(cancelled)
         try:
             pipe.set_progress_bar_config(disable=True)
@@ -993,12 +1033,10 @@ class DiffusersBackend(TorchBackend):
             seeds = self.seeds(params)
             emit("stage", {"stage": "encoding"})
             with torch.inference_mode():
-                embeddings = pipe.encode_prompt(
-                    prompt=request["inputs"]["prompt"],
-                    device=self.run_device,
+                prompt_args = dict(prompt=request["inputs"]["prompt"], device=self.run_device,
                     negative_prompt=request["inputs"].get("negative_prompt"),
-                    do_classifier_free_guidance=params["guidance"] > 1,
-                )
+                    do_classifier_free_guidance=params["guidance"] > 1)
+                embeddings = self.text_cache.get(prompt_args, lambda: pipe.encode_prompt(**prompt_args))
                 if cancelled.is_set():
                     raise Cancelled()
                 emit("stage", {"stage": "sampling"})
@@ -1015,6 +1053,8 @@ class DiffusersBackend(TorchBackend):
                             "scope": "stage",
                         },
                     )
+                    from .previews import emit_latents
+                    emit_latents(values["latents"], emit, params.get("preview_interval"), index + 1)
                     return values
 
                 generators = [
@@ -1033,7 +1073,14 @@ class DiffusersBackend(TorchBackend):
                     callback_on_step_end=step,
                     output_type="latent",
                 )
-                if task == "image-to-image":
+                if task == "inpaint":
+                    from diffusers import StableDiffusionXLInpaintPipeline
+                    inpaint = StableDiffusionXLInpaintPipeline.from_pipe(pipe, requires_aesthetics_score=False)
+                    inpaint.set_progress_bar_config(disable=True)
+                    image = self.load_image(image_path["image"], params["width"], params["height"])
+                    mask = self.load_image(image_path["mask"], params["width"], params["height"]).convert("L")
+                    latents = inpaint(image=image, mask_image=mask, strength=params["strength"], **common).images
+                elif task == "image-to-image":
                     from diffusers import StableDiffusionXLImg2ImgPipeline
 
                     if self.img2img is None:

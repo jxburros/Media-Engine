@@ -802,3 +802,12 @@ contain raw exceptions, prompts, credentials or private paths. Busy returns 409;
 invalid requests 400; oversized uploads 413; missing handles 404; auth 401/403. OOM fails the
 execution and marks the worker error/restart-required. A fresh session never implies an old
 attempt succeeded.
+
+### Explicit offload (1.4)
+
+`capabilities.offload_modes` is the list of accepted `options.offload` values and
+`offload_families` limits them to supported model families. Older minors retain `none` only.
+The reference CUDA implementation offers `model` and `sequential` for SDXL, SVD and Stable Audio
+Open. The chosen value participates in load identity and resolved options. Unsupported modes,
+families, compilation/quantization combinations, or an offload request resolving to CPU return
+`unsupported` with field `options.offload`; no offload mode is chosen through `auto`.

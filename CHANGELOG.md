@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0 — 2026-11-04 (development)
+
+Protocol 1.4 adds explicitly selected sampling, inpainting, deterministic image operations and
+optional MP4 output on the reference/fixture paths. Native remains protocol1.3 and gains mutual
+TLS, authenticated metrics and bounded HTTP/JSON handling. Additional work includes ephemeral
+previews, a load-scoped text cache, file-level artifact handles, offline ESRGAN/Kohya conversion,
+explicit CPU offload and shared release/CI/GPU validation jobs.
+
+Validation so far: baseline100 Python tests (2 native opt-in skips), Rust17, native conformance
+and owned-pipeline oracle2, serving7, previews/cache3, conversions3 and offload2 passed on CPU.
+The broader generation backlog, schema/conformance updates and final integrated validation are
+still in development in this PR. GPU jobs are prepared; real-weight/CUDA results are not claimed.
+
 ## 1.0.0 — 2026-10-31
 
 The owned native engine (phase E6). Protocol unchanged (`media-worker/1.0`–`1.3`); the Python

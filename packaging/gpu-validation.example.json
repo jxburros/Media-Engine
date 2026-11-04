@@ -1,0 +1,5 @@
+{
+  "catalog": "/srv/media-validation/catalog.json",
+  "registration": "/srv/media-validation/conformance.json",
+  "benchmark_registration": "/srv/media-validation/sdxl-bundle.json"
+}

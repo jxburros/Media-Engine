@@ -7,7 +7,7 @@ Skipped unless MEDIA_ENGINE_NATIVE names a built `media-engine-native` binary
   test_inference.py: for the same request the native engine must reproduce its pixels within
   the stated tolerance (same seed → same image), LoRA adapters must change the output the same
   way, and the stage/progress event shapes and cancellation behavior must be identical. These
-  need the inference extra; without it only the conformance test runs.
+  need the inference extra; conformance also needs it to construct executable tiny weights.
 - The conformance suite, which must report the native engine conformant with no skipped section.
 """
 
@@ -26,7 +26,10 @@ from pathlib import Path
 
 from fixture import make_png
 from test_inference import HAVE_OWNED, difference, tiny_lora, tiny_sdxl_bundle, tiny_esrgan_bundle
-from media_engine.contracts import DEFAULTS, PROTOCOL
+from media_engine.contracts import DEFAULTS
+
+# The native SDXL implementation advertises 1.3; Python additions are negotiated separately.
+PROTOCOL = "media-worker/1.3"
 
 NATIVE = os.environ.get("MEDIA_ENGINE_NATIVE")
 HERE = Path(__file__).resolve().parent
@@ -90,7 +93,7 @@ class NativeConformanceTests(unittest.TestCase):
         from tests.conformance.run import run_suite
 
         if not HAVE_OWNED:
-            self.skipTest("the tiny bundle needs torch/diffusers to build")
+            self.fail("MEDIA_ENGINE_NATIVE is set but the inference-owned extra is missing")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             model_dir, bundle = tiny_sdxl_bundle(root)

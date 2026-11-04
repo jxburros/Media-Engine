@@ -44,9 +44,11 @@ class ConversionError(Exception):
 
 
 def add_arguments(parser):
-    parser.add_argument("--input", required=True, help="single-file SDXL .safetensors checkpoint")
-    parser.add_argument("--reference-handle", required=True, help="catalog handle of an approved sdxl-base bundle")
-    parser.add_argument("--catalog", required=True, help="operator catalog mapping handles to absolute directories")
+    parser.add_argument("--kind", choices=["sdxl", "esrgan-pth", "lora-kohya"], default="sdxl")
+    parser.add_argument("--input", required=True, help="checkpoint to convert offline")
+    parser.add_argument("--reference-handle", help="catalog handle of an approved sdxl-base bundle")
+    parser.add_argument("--catalog", help="operator catalog mapping handles to absolute directories")
+    parser.add_argument("--config", help="explicit RRDBNet JSON configuration for esrgan-pth")
     parser.add_argument("--output", required=True, help="new directory for the converted bundle")
     parser.add_argument("--precision", choices=["float16", "float32"], help="cast weights; default preserves them")
 
@@ -239,15 +241,35 @@ def convert(source, catalog, handle, output, precision=None):
 
 
 def run(args):
+    kind = getattr(args, "kind", "sdxl")
+    if kind != "sdxl" and args.precision:
+        print(json.dumps({"error": "precision_not_supported"}), file=sys.stderr)
+        return 2
+    if kind == "esrgan-pth":
+        if not args.config or args.catalog or args.reference_handle:
+            print(json.dumps({"error": "esrgan_requires_config_only"}), file=sys.stderr)
+            return 2
+        catalog = None
+    elif not args.catalog or not args.reference_handle or getattr(args, "config", None):
+        print(json.dumps({"error": "reference_catalog_required"}), file=sys.stderr)
+        return 2
     try:
-        catalog = json.loads(Path(args.catalog).read_text())
-        if not isinstance(catalog, dict):
-            raise ValueError
+        if kind != "esrgan-pth":
+            catalog = json.loads(Path(args.catalog).read_text())
+            if not isinstance(catalog, dict):
+                raise ValueError
     except (OSError, ValueError):
         print(json.dumps({"error": "invalid_catalog"}), file=sys.stderr)
         return 2
     try:
-        record = convert(args.input, catalog, args.reference_handle, args.output, args.precision)
+        if kind == "esrgan-pth":
+            from .convert_weights import esrgan_pth
+            record = esrgan_pth(args.input, args.config, args.output)
+        elif kind == "lora-kohya":
+            from .convert_weights import lora_kohya
+            record = lora_kohya(args.input, catalog, args.reference_handle, args.output)
+        else:
+            record = convert(args.input, catalog, args.reference_handle, args.output, args.precision)
     except ConversionError as exc:
         # Key names are checkpoint structure, not private data; paths and exceptions never print.
         print(json.dumps({"error": exc.code, **({"keys": exc.keys} if exc.keys else {})}), file=sys.stderr)
@@ -257,6 +279,9 @@ def run(args):
         return 2
     except OSError:
         print(json.dumps({"error": "io_error"}), file=sys.stderr)
+        return 2
+    except (ValueError, RuntimeError, KeyError, TypeError):
+        print(json.dumps({"error": "invalid_checkpoint"}), file=sys.stderr)
         return 2
     print(json.dumps(record, sort_keys=True))
     return 0

@@ -8,15 +8,16 @@ import struct
 from fractions import Fraction
 from pathlib import Path
 
-PROTOCOL = "media-worker/1.3"
+PROTOCOL = "media-worker/1.4"
 SUPPORTED_PROTOCOLS = (
     "media-worker/1.0",
     "media-worker/1.1",
     "media-worker/1.2",
     "media-worker/1.3",
+    "media-worker/1.4",
 )
-WORKER_VERSION = "1.0.0"
-TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio")
+WORKER_VERSION = "1.1.0"
+TASKS = ("text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio", "inpaint", "image-transform")
 # The minor that introduced each task; a lower-minor request naming it is `unsupported`.
 TASK_SINCE = {
     "text-to-image": 0,
@@ -24,6 +25,8 @@ TASK_SINCE = {
     "upscale": 2,
     "image-to-video": 3,
     "text-to-audio": 3,
+    "inpaint": 4,
+    "image-transform": 4,
 }
 SDXL_ROLES = (
     "unet",
@@ -49,7 +52,7 @@ FAMILIES = {
             "tokenizer_2": ("transformers", "CLIPTokenizer"),
             "scheduler": ("diffusers", "EulerDiscreteScheduler"),
         },
-        "tasks": ("text-to-image", "image-to-image"),
+        "tasks": ("text-to-image", "image-to-image", "inpaint", "image-transform"),
         "config_file": "model_index.json",
         "pipeline_class": "StableDiffusionXLPipeline",
         "since": 0,
@@ -110,12 +113,14 @@ FORMATS = ("diffusers-safetensors", "single-file-safetensors")
 OUTPUTS = {
     "text-to-image": ["image"],
     "image-to-image": ["image"],
+    "inpaint": ["image"],
+    "image-transform": ["image"],
     "upscale": ["image"],
     "image-to-video": ["frames", "poster"],
     "text-to-audio": ["audio"],
 }
 # Output MIME types and the file suffix each is stored under in the execution directory.
-OUTPUT_SUFFIXES = {"image/png": ".png", "application/zip": ".zip", "audio/wav": ".wav"}
+OUTPUT_SUFFIXES = {"image/png": ".png", "application/zip": ".zip", "audio/wav": ".wav", "video/mp4": ".mp4"}
 DEFAULTS = {
     "width": 1024,
     "height": 1024,
@@ -126,6 +131,7 @@ DEFAULTS = {
 }
 TASK_DEFAULTS = {
     "image-to-image": {"strength": 0.75},
+    "inpaint": {"strength": 0.75},
     "upscale": {"tile": 0, "tile_overlap": 16},
     # `frames` defaults to the bundle's unet `num_frames`; it is resolved once the bundle loads.
     "image-to-video": {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8},
@@ -236,6 +242,16 @@ def role_files(family, role, files):
     return {k: v for k, v in files.items() if k == "config.json"}
 
 
+def approved_snapshot_link(path, root):
+    """Only Hugging Face's immutable snapshot -> sibling blob links are acceptable."""
+    root, path = Path(root), Path(path)
+    if not (re.fullmatch(r"[a-f0-9]{40}", root.name) and root.parent.name == "snapshots" and root.parent.parent.name.startswith("models--")):
+        return False
+    blobs = (root.parent.parent / "blobs").resolve()
+    target = path.resolve()
+    return path.is_symlink() and target.is_file() and target.is_relative_to(blobs) and target != blobs
+
+
 def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
     level = minor(version)
     strict(
@@ -327,11 +343,14 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
             k.endswith(".safetensors") for k in entries
         ):
             raise WorkerError(400, "missing_component", role)
-    if not root.is_dir():
+    single_file = root.is_file() and family["format"] == "single-file-safetensors" and level >= 4
+    if not root.is_dir() and not single_file:
         raise WorkerError(400, "missing_component", "configuration")
-    actual = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
+    actual = {root.name: root, "config.json": Path(str(root) + ".json")} if single_file else {}
+    if single_file and (root.suffix != ".safetensors" or not actual["config.json"].is_file() or actual["config.json"].is_symlink()):
+        raise WorkerError(400, "missing_component", "configuration")
+    for path in ([] if single_file else sorted(root.rglob("*"))):
+        if path.is_symlink() and not approved_snapshot_link(path,root):
             raise WorkerError(400, "unsupported", "symlink")
         if path.is_file():
             relative = str(path.relative_to(root))
@@ -621,7 +640,7 @@ def safetensors_parameters(path):
 
 def weight_files(root, family, role):
     if FAMILIES[family]["format"] == "single-file-safetensors":
-        return sorted(Path(root).glob("*.safetensors"))
+        return [Path(root)] if Path(root).is_file() else sorted(Path(root).glob("*.safetensors"))
     return sorted((Path(root) / role).glob("*.safetensors"))
 
 
@@ -758,11 +777,11 @@ def png_dimensions(data):
 
 
 def effective_steps(parameters, task):
-    if task == "upscale":
+    if task in ("upscale", "image-transform"):
         return None
     if task in ("image-to-video", "text-to-audio"):
         return parameters["steps"]
-    if task != "image-to-image":
+    if task not in ("image-to-image", "inpaint"):
         return parameters["steps"]
     return min(int(parameters["steps"] * parameters["strength"]), parameters["steps"])
 
@@ -770,9 +789,10 @@ def effective_steps(parameters, task):
 def output_ids(task, parameters):
     """Every output ID an execution must finalize: `image, image_2 … image_N` for `count: N`."""
     count = parameters.get("count", 1) if task == "text-to-image" else 1
-    return [
-        name if k == 1 else f"{name}_{k}" for name in OUTPUTS[task] for k in range(1, count + 1)
-    ]
+    names = [name if k == 1 else f"{name}_{k}" for name in OUTPUTS[task] for k in range(1, count + 1)]
+    if task == "image-to-video" and parameters.get("encode_video"):
+        names.append("video")
+    return names
 
 
 def effective_settings(parameters, task, version):
@@ -838,8 +858,10 @@ def validate_video(body):
     strict(
         params,
         ("width", "height", "seed", "steps"),
-        ("frames", "fps", "motion", "noise_augmentation", "decode_chunk"),
+        ("frames", "fps", "motion", "noise_augmentation", "decode_chunk") + (("encode_video",) if minor(body["protocol"]) >= 4 else ()),
     )
+    if "encode_video" in params and type(params["encode_video"]) is not bool:
+        raise WorkerError(400, "invalid_request", "encode_video")
     for field in ("width", "height"):
         value = params[field]
         low, high = LIMITS[field]
@@ -916,16 +938,26 @@ def validate_parameters(body):
         r"attempt_[A-Za-z0-9_-]{1,80}", body["attempt_id"]
     ):
         raise WorkerError(400, "invalid_request", "attempt_id")
+    if task == "image-transform":
+        from .image_ops import validate
+        strict(body["inputs"], ("image",), ("overlay",))
+        for value in body["inputs"].values():
+            if not isinstance(value,str) or not re.fullmatch(r"input_[a-f0-9]{32}",value):
+                raise WorkerError(400,"invalid_request","image")
+        validate(body["parameters"])
+        if (body["parameters"]["operation"] == "composite") != ("overlay" in body["inputs"]):
+            raise WorkerError(400,"invalid_request","overlay")
+        return task
     if task == "upscale":
         return validate_upscale(body)
     if task == "image-to-video":
         return validate_video(body)
     if task == "text-to-audio":
         return validate_audio(body)
-    image_required = ("image",) if task == "image-to-image" else ()
+    image_required = ("image", "mask") if task == "inpaint" else (("image",) if task == "image-to-image" else ())
     strict(body["inputs"], ("prompt",) + image_required, ("negative_prompt",))
     for key, value in body["inputs"].items():
-        if key == "image":
+        if key in ("image", "mask"):
             if not isinstance(value, str) or not re.fullmatch(r"input_[a-f0-9]{32}", value):
                 raise WorkerError(400, "invalid_request", key)
             continue
@@ -943,13 +975,15 @@ def validate_parameters(body):
         low, high = LIMITS["count"]
         if type(params["count"]) is not int or not low <= params["count"] <= high:
             raise WorkerError(400, "invalid_request", "count")
-    strength_required = ("strength",) if task == "image-to-image" else ()
+    strength_required = ("strength",) if task in ("image-to-image", "inpaint") else ()
     strict(
         params,
         ("width", "height", "steps", "guidance", "seed", "sampler", "scheduler")
         + strength_required,
-        ("count",) if task == "text-to-image" and level >= 2 else (),
+        (("count",) if task == "text-to-image" and level >= 2 else ()) + (("preview_interval",) if level >= 4 else ()),
     )
+    if "preview_interval" in params and (type(params["preview_interval"]) is not int or not 1 <= params["preview_interval"] <= 50):
+        raise WorkerError(400,"invalid_request","preview_interval")
     for field, low, high, multiple in (
         ("width", 64, 2048, 8),
         ("height", 64, 2048, 8),
@@ -967,14 +1001,16 @@ def validate_parameters(body):
         or not 0 <= params["guidance"] <= 30
     ):
         raise WorkerError(400, "invalid_request", "guidance")
-    if task == "image-to-image":
+    if task in ("image-to-image", "inpaint"):
         strength = params["strength"]
         if type(strength) not in (int, float) or not 0 < strength <= 1:
             raise WorkerError(400, "invalid_request", "strength")
         if effective_steps(params, task) < 1:
             # strength × steps would denoise for zero steps; that is not generation.
             raise WorkerError(400, "invalid_request", "strength")
-    if params["sampler"] != "euler" or params["scheduler"] != "euler":
+    from .sampling import SAMPLING
+    pair = (params["sampler"], params["scheduler"])
+    if pair not in (SAMPLING if level >= 4 else SAMPLING[:1]):
         raise WorkerError(400, "unsupported", "scheduler")
     return task
 
@@ -1001,11 +1037,14 @@ def adapter_path(adapter, catalog, verify=True):
         raise WorkerError(400, "missing_component", "adapter")
     root = Path(catalog[handle]).resolve()
     files = adapter["files"]
-    if not isinstance(files, dict) or not files or not root.is_dir():
+    single_file = root.is_file()
+    if not isinstance(files, dict) or not files or not (root.is_dir() or single_file):
         raise WorkerError(400, "missing_component", "adapter")
-    actual = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
+    if single_file and root.suffix != ".safetensors":
+        raise WorkerError(400, "unsupported", "adapter")
+    actual = {root.name: root} if single_file else {}
+    for path in ([] if single_file else sorted(root.rglob("*"))):
+        if path.is_symlink() and not approved_snapshot_link(path,root):
             raise WorkerError(400, "unsupported", "symlink")
         if path.is_file():
             if path.suffix in {".py", ".pkl", ".pickle", ".bin", ".pt", ".pth"}:
@@ -1023,7 +1062,7 @@ def adapter_path(adapter, catalog, verify=True):
             with actual[relative].open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
                     raise WorkerError(400, "artifact_changed", "adapter")
-    return root, actual[weights[0]]
+    return root.parent if single_file else root, actual[weights[0]]
 
 
 def lora_layout(path):
@@ -1084,9 +1123,23 @@ def validate_adapters(adapters, catalog, version, verify=True):
         low, high = LIMITS["adapter_scale"]
         if type(scale) not in (int, float) or not low <= scale <= high:
             raise WorkerError(400, "invalid_request", "scale")
+        if minor(version) < 4 and Path(catalog.get(entry["adapter"].get("artifact_handle"), "")).is_file():
+            raise WorkerError(400, "unsupported", "artifact_handle")
         root, weights = adapter_path(entry["adapter"], catalog, verify)
         if entry["adapter"]["adapter_id"] in seen:
             raise WorkerError(400, "invalid_request", "adapter_id")
         seen.add(entry["adapter"]["adapter_id"])
         resolved.append((entry["adapter"], root, weights, scale, lora_layout(weights)))
     return resolved
+
+
+def validate_sampling(body, caps):
+    """A valid protocol value still requires explicit backend support."""
+    if body.get("task") not in caps.get("tasks", []):
+        raise WorkerError(400, "unsupported", "task")
+    if body.get("task") not in ("text-to-image", "image-to-image", "inpaint"):
+        return
+    params = body["parameters"]
+    offered = caps.get("sampling", [{"sampler": "euler", "scheduler": "euler"}])
+    if {"sampler": params["sampler"], "scheduler": params["scheduler"]} not in offered:
+        raise WorkerError(400, "unsupported", "scheduler")

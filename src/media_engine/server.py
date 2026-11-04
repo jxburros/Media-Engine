@@ -21,8 +21,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
-from . import audio, optimize, png, video
+from . import audio, mp4, optimize, png, previews, video
 from .backend import Cancelled, backend_class
+from .metrics import Metrics
 from .contracts import (
     FAMILIES,
     LIMITS,
@@ -43,15 +44,55 @@ from .contracts import (
     bundle_path,
     validate_adapters,
     validate_parameters,
+    validate_sampling,
 )
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
 PRIVATE = {"cancel", "request", "image_path", "expected_outputs"}
 OUTPUT_ID = r"[a-z][a-z0-9_]{0,31}"
 DEFAULT_BIND = "127.0.0.1"
+MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_JSON_DEPTH = 64
+MAX_HEADER_BYTES = 64 * 1024
+MAX_HEADER_COUNT = 64
+MAX_REQUEST_LINE_BYTES = 8192
 PEM_CERTIFICATE = re.compile(
     rb"-----BEGIN CERTIFICATE-----\r?\n.+?\r?\n-----END CERTIFICATE-----", re.DOTALL
 )
+
+
+def loopback_host(value):
+    """Validate the literal Host authority without DNS lookups (DNS rebinding defense)."""
+    try:
+        parsed = urlsplit("//" + value)
+        if parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+            return False
+        _ = parsed.port
+        host = parsed.hostname
+        return host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except (ValueError, TypeError):
+        return False
+
+
+def check_json_depth(data):
+    # Scan before json.loads, so overdeep input cannot exhaust the parser's stack.
+    depth, quoted, escaped = 0, False, False
+    for byte in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 92:
+                escaped = True
+            elif byte == 34:
+                quoted = False
+        elif byte == 34:
+            quoted = True
+        elif byte in (91, 123):
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise WorkerError(400, "invalid_request")
+        elif byte in (93, 125):
+            depth -= 1
 
 
 def error(code, field=None):
@@ -78,16 +119,20 @@ class Worker:
         max_storage_mb=1024,
         max_input_mb=32,
         protocols=SUPPORTED_PROTOCOLS,
+        catalog_path=None,
     ):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.directory / "inputs").mkdir(exist_ok=True, mode=0o700)
         self.backend, self.catalog = backend, catalog
+        self.catalog_path = Path(catalog_path) if catalog_path else None
         self.protocols = tuple(protocols)
         self.session_id = str(uuid.uuid4())
         self.lock = threading.RLock()
         self.executions, self.attempts, self.operations, self.inputs = {}, {}, {}, {}
         self.active = None
+        self.previews = {}
+        self.metrics = Metrics()
         self.state = "ready"
         self.loaded = None
         self.loaded_family = None
@@ -96,6 +141,22 @@ class Worker:
         self.max_input_mb = max_input_mb
         # Replaced by create_server with the transport actually served.
         self.transport = transport_fields(DEFAULT_BIND)
+
+    def current_catalog(self):
+        if self.catalog_path is None:
+            return self.catalog
+        try:
+            with self.catalog_path.open("rb") as stream:
+                data = stream.read(MAX_JSON_BYTES + 1)
+            if len(data) > MAX_JSON_BYTES:
+                raise ValueError("catalog is too large")
+            check_json_depth(data)
+            value = json.loads(data)
+            if not isinstance(value, dict) or any(not isinstance(path, str) or not Path(path).is_absolute() for path in value.values()):
+                raise ValueError("invalid catalog")
+            return value
+        except (OSError, ValueError, WorkerError):
+            raise WorkerError(503, "catalog_unavailable") from None
 
     @property
     def speaks_1_2(self):
@@ -110,6 +171,12 @@ class Worker:
 
     def capabilities(self):
         backend = self.backend.capabilities()
+        if "media-worker/1.4" in self.protocols:
+            backend["previews"] = {"kind": "latent_rgb", "max_side": 128, "max_bytes": previews.MAX_BYTES, "retention": "active-execution", "interval": [1, 50]}
+            for task in ("text-to-image", "image-to-image", "inpaint"):
+                entry = backend.get("task_parameters", {}).get(task)
+                if entry is not None:
+                    entry["parameters"] = list(dict.fromkeys([*entry.get("parameters", []), "preview_interval"]))
         if self.loaded_family == "svd" and "video_sizes" in backend.get("limits", {}):
             # Sizes are a bundle fact: with an svd bundle loaded, advertise the sizes it serves.
             backend["limits"] = {**backend["limits"], "video_sizes": self.loaded_facts["video_sizes"]}
@@ -190,6 +257,8 @@ class Worker:
         strict(body["options"], ("precision", "attention", "offload"), new_options)
         options = body["options"]
         caps = self.capabilities()
+        from . import offload
+        offload.validate(options, level, caps, name)
         precisions = list(caps["precisions"])
         if level >= 2 and "precision" in caps.get("auto_options", []):
             precisions.append("auto")
@@ -201,7 +270,6 @@ class Worker:
         if (
             (options["precision"] not in precisions and ("precision", options["precision"]) not in offered)
             or (options["attention"] != "sdpa" and ("attention", options["attention"]) not in offered)
-            or options["offload"] != "none"
             or any(
                 options[name] != off and (name, options[name]) not in offered
                 for name, off in optimize.NEW_OPTIONS.items()
@@ -216,13 +284,16 @@ class Worker:
             or len(set(authorized)) != len(authorized)
         ):
             raise WorkerError(400, "invalid_request", "authorized_fallbacks")
-        root = bundle_path(body["bundle"], self.catalog, verify, version)
+        catalog = self.current_catalog()
+        root = bundle_path(body["bundle"], catalog, verify, version)
         family = body["bundle"]["family"]
-        adapters = validate_adapters(body.get("adapters", []), self.catalog, version, verify)
+        adapters = validate_adapters(body.get("adapters", []), catalog, version, verify)
         if adapters and family != "sdxl-base":
             raise WorkerError(400, "unsupported", "adapters")
         optimize.check_load(options, version, caps, family, adapters, authorized)
         plan = self.backend.plan(root, options, adapters, family, authorized)
+        if options["offload"] != "none" and not plan["device"].startswith("cuda:"):
+            raise WorkerError(400, "unsupported", "options.offload")
         return root, adapters, family, plan
 
     def estimate(self, root, plan, adapters, family, level):
@@ -294,6 +365,7 @@ class Worker:
             self.state = "loading" if action == "load" else "unloading"
 
             def run():
+                started = time.monotonic()
                 try:
                     measurements = self.backend.unload()
                     with self.lock:
@@ -358,6 +430,9 @@ class Worker:
                         self.state = "ready" if usable else "error"
                         if not usable:
                             operation["error"]["restart_required"] = True
+                finally:
+                    if action == "load":
+                        self.metrics.load(time.monotonic() - started)
 
             threading.Thread(target=run, daemon=True).start()
             return copy.deepcopy(operation)
@@ -365,6 +440,22 @@ class Worker:
     def emit(self, execution_id, kind, data):
         with self.lock:
             entry = self.executions[execution_id]
+            if kind == "preview":
+                if not entry["request"]["parameters"].get("preview_interval"):
+                    return
+                image = data.get("png")
+                if not isinstance(image, bytes) or len(image) > previews.MAX_BYTES:
+                    return
+                width, height = png.header(image)[:2]
+                if max(width, height) > 128:
+                    return
+                preview_id = "preview_" + uuid.uuid4().hex
+                data = {"preview_id": preview_id, "mime_type": "image/png", "width": width, "height": height,
+                        "size": len(image), "sha256": hashlib.sha256(image).hexdigest(),
+                        "step": data["step"], "kind": "latent_rgb"}
+                while len(self.previews) >= previews.MAX_RETAINED:
+                    del self.previews[next(iter(self.previews))]
+                self.previews[preview_id] = (execution_id, image)
             event = {
                 "session_id": self.session_id,
                 "execution_id": execution_id,
@@ -376,6 +467,7 @@ class Worker:
             entry["events"].append(event)
             entry["last_sequence"] = event["sequence"]
             if kind == "stage":
+                self.metrics.stage(entry["task"], data["stage"])
                 entry["stage"] = data["stage"]
             if kind == "progress":
                 entry["progress"] = data
@@ -395,7 +487,7 @@ class Worker:
     def storage_used(self):
         return sum(
             p.stat().st_size
-            for pattern in ("exec_*/*.png", "exec_*/*.zip", "exec_*/*.wav", "inputs/*.png")
+            for pattern in ("exec_*/*.png", "exec_*/*.zip", "exec_*/*.wav", "exec_*/*.mp4", "inputs/*.png")
             for p in self.directory.glob(pattern)
         )
 
@@ -440,7 +532,7 @@ class Worker:
         with self.lock:
             self.input_record(input_id)
             if any(
-                e["request"]["inputs"].get("image") == input_id
+                any(e["request"]["inputs"].get(name) == input_id for name in ("image", "mask", "control_image", "overlay"))
                 and e["state"] not in TERMINAL
                 for e in self.executions.values()
             ):
@@ -485,13 +577,39 @@ class Worker:
             "output_height": params["height"] * scale,
         }
 
+    def check_image_geometry(self, body, task):
+        from . import image_ops
+        source = self.inputs.get(body["inputs"]["image"])
+        if source is None:
+            raise WorkerError(404, "input_not_found", "image")
+        if task == "inpaint":
+            mask = self.inputs.get(body["inputs"]["mask"])
+            if mask is None:
+                raise WorkerError(404, "input_not_found", "mask")
+            if (source["width"], source["height"]) != (mask["width"], mask["height"]):
+                raise WorkerError(400, "invalid_request", "mask")
+        if task == "image-transform":
+            overlay = self.inputs.get(body["inputs"].get("overlay"))
+            if body["parameters"]["operation"] == "composite" and overlay is None:
+                raise WorkerError(404, "input_not_found", "overlay")
+            image_ops.check_dimensions(body["parameters"], (source["width"], source["height"]),
+                (overlay["width"], overlay["height"]) if overlay else None)
+
     def validate_execution(self, body):
         """The /v1/validate response for an execution body."""
         self.check(body)
         task = validate_parameters(body)
+        caps = self.capabilities()
+        validate_sampling(body, caps)
+        if "preview_interval" in body["parameters"] and not caps.get("previews"):
+            raise WorkerError(400, "unsupported", "preview_interval")
+        if body["parameters"].get("encode_video") and "video" not in caps.get("task_parameters", {}).get("image-to-video", {}).get("optional_outputs", []):
+            raise WorkerError(400, "unsupported", "encode_video")
         level = minor(body["protocol"])
         with self.lock:
             facts = self.loaded_checks(body, task)
+            if task in ("inpaint", "image-transform"):
+                self.check_image_geometry(body, task)
         result = {"valid": True, "task": task}
         if task != "upscale":
             result["effective_steps"] = effective_steps(body["parameters"], task)
@@ -506,6 +624,12 @@ class Worker:
     def submit(self, body):
         self.check(body)
         task = validate_parameters(body)
+        caps = self.capabilities()
+        validate_sampling(body, caps)
+        if "preview_interval" in body["parameters"] and not caps.get("previews"):
+            raise WorkerError(400, "unsupported", "preview_interval")
+        if body["parameters"].get("encode_video") and "video" not in caps.get("task_parameters", {}).get("image-to-video", {}).get("optional_outputs", []):
+            raise WorkerError(400, "unsupported", "encode_video")
         attempt = body["attempt_id"]
         level = minor(body["protocol"])
         with self.lock:
@@ -519,18 +643,34 @@ class Worker:
                 raise WorkerError(409, "busy")
             if not self.loaded or self.loaded["bundle_digest"] != body["bundle_digest"]:
                 raise WorkerError(409, "model_not_ready")
+            if task in ("inpaint", "image-transform"):
+                self.check_image_geometry(body, task)
             image_path = None
-            if task in ("image-to-image", "upscale", "image-to-video"):
+            if task in ("image-to-image", "upscale", "image-to-video", "inpaint", "image-transform"):
                 record = self.inputs.get(body["inputs"]["image"])
                 if not record:
                     raise WorkerError(404, "input_not_found")
-                if (record["width"], record["height"]) != (
+                if task != "image-transform" and (record["width"], record["height"]) != (
                     body["parameters"]["width"],
                     body["parameters"]["height"],
                 ):
                     # The request must state the image's real size; nothing is resized silently.
                     raise WorkerError(400, "invalid_request", "width")
                 image_path = self.directory / "inputs" / (record["input_id"] + ".png")
+                if task == "image-transform" and body["parameters"].get("operation") == "composite":
+                    overlay = self.inputs.get(body["inputs"]["overlay"])
+                    if overlay is None:
+                        raise WorkerError(404, "input_not_found", "overlay")
+                    image_path = {"image": image_path, "overlay": self.directory / "inputs" / (overlay["input_id"] + ".png")}
+
+                if task == "inpaint":
+                    mask = self.inputs.get(body["inputs"]["mask"])
+                    if mask is None:
+                        raise WorkerError(404, "input_not_found", "mask")
+                    if (mask["width"], mask["height"]) != (record["width"], record["height"]):
+                        raise WorkerError(400, "invalid_request", "mask")
+                    image_path = {"image": image_path, "mask": self.directory / "inputs" / (mask["input_id"] + ".png")}
+
             expected = output_ids(task, body["parameters"])
             if task == "text-to-audio":
                 # The WAV's exact size is known from the bundle's facts before sampling; a clip
@@ -617,6 +757,8 @@ class Worker:
                     "fps": manifest["fps"],
                     "duration_seconds": video.duration_seconds(manifest["frames"], manifest["fps"]),
                 }
+            elif record["mime_type"] == "video/mp4":
+                facts = mp4.read_metadata(record["path"])
             elif record["mime_type"] == audio.MIME_TYPE:
                 header = audio.read_header(record["path"])
                 facts = {
@@ -682,6 +824,8 @@ class Worker:
                     self.emit(execution_id, "error", failure)
                     if failure["code"] == "out_of_memory":
                         self.state = "error"
+                self.previews = {key: value for key, value in self.previews.items() if value[0] != execution_id}
+                self.metrics.finish(entry["task"], state, measurements)
                 entry["state"] = state
                 self.emit(execution_id, "state", {"state": state})
                 self.active = None
@@ -696,6 +840,13 @@ class Worker:
                 entry["cancel_requested"] = True
                 entry["cancel"].set()
             return self.snapshot(execution_id)
+
+    def preview(self, preview_id):
+        with self.lock:
+            value = self.previews.get(preview_id)
+            if value is None:
+                raise WorkerError(410, "preview_expired")
+            return value[1]
 
     def output_path(self, execution_id, output_id):
         with self.lock:
@@ -872,14 +1023,42 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
             self.end_headers()
             self.wfile.write(data)
 
+        def check_headers(self):
+            if len(self.raw_requestline) > MAX_REQUEST_LINE_BYTES:
+                raise WorkerError(414, "invalid_request")
+            if len(self.headers) > MAX_HEADER_COUNT or sum(len(k) + len(v) + 4 for k, v in self.headers.items()) > MAX_HEADER_BYTES:
+                raise WorkerError(431, "invalid_request")
+            for name in ("Host", "Content-Length", "Authorization", "Content-Type", "Origin"):
+                if len(self.headers.get_all(name, [])) > 1:
+                    raise WorkerError(400, "invalid_request")
+            if self.headers.get("Transfer-Encoding") is not None:
+                raise WorkerError(400, "invalid_request")
+            if address.is_loopback and not loopback_host(self.headers.get("Host", "")):
+                raise WorkerError(403, "host_denied")
+            length = self.headers.get("Content-Length")
+            if length is not None:
+                if not length.isascii() or not length.isdecimal():
+                    raise WorkerError(400, "invalid_request")
+                limit = worker.max_input_mb * 1024**2 if self.command == "POST" and urlsplit(self.path).path == "/v1/inputs" else MAX_JSON_BYTES
+                if int(length) > limit:
+                    raise WorkerError(413, "invalid_request")
+
         def raw(self, limit):
-            size = int(self.headers.get("Content-Length", "0"))
+            raw_size = self.headers.get("Content-Length", "0")
+            if not raw_size.isascii() or not raw_size.isdecimal():
+                raise WorkerError(400, "invalid_request")
+            size = int(raw_size)
             if not 0 < size <= limit:
                 raise WorkerError(400 if size <= limit else 413, "invalid_request")
-            return self.rfile.read(size)
+            data = self.rfile.read(size)
+            if len(data) != size:
+                raise WorkerError(400, "invalid_request")
+            return data
 
         def body(self):
-            return json.loads(self.raw(4 * 1024 * 1024))
+            data = self.raw(MAX_JSON_BYTES)
+            check_json_depth(data)
+            return json.loads(data)
 
         def events(self, execution_id):
             snap = worker.snapshot(execution_id)
@@ -908,6 +1087,7 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
             try:
                 url = urlsplit(self.path)
                 path = url.path
+                self.check_headers()
                 if self.headers.get("Origin") is not None:
                     raise WorkerError(403, "browser_origin_denied")
                 if path == "/health" and self.command == "GET":
@@ -919,10 +1099,29 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
                     self.headers.get("Authorization", ""), "Bearer " + token
                 ):
                     raise WorkerError(401, "unauthorized")
+                if self.command == "GET" and path == "/metrics":
+                    with worker.lock:
+                        data = worker.metrics.render(worker.state in {"busy", "loading", "unloading"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if self.command == "GET" and path == "/v1/info":
                     return self.respond(200, worker.info())
                 if self.command == "GET" and path == "/v1/capabilities":
                     return self.respond(200, worker.capabilities())
+                if self.command == "GET" and re.fullmatch(r"/v1/previews/preview_[a-f0-9]{32}", path):
+                    data = worker.preview(path.rsplit("/", 1)[1])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if self.command == "POST" and path == "/v1/validate":
                     body = self.body()
                     if "bundle" in body:
@@ -932,7 +1131,7 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
                         strict(body, ("protocol", "adapters"))
                         version = protocol(body)
                         adapters = validate_adapters(
-                            body["adapters"], worker.catalog, version
+                            body["adapters"], worker.current_catalog(), version
                         )
                         return self.respond(
                             200,
@@ -1025,6 +1224,8 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
                     return
                 raise WorkerError(404, "not_found")
             except WorkerError as exc:
+                if exc.code == "busy":
+                    worker.metrics.refused()
                 self.respond(exc.status, {"error": error(exc.code, exc.field)})
             except (ValueError, KeyError, TypeError):
                 self.respond(400, {"error": error("invalid_request")})
@@ -1135,6 +1336,7 @@ def main(argv=None):
         args.max_retained,
         args.max_storage_mb,
         args.max_input_mb,
+        catalog_path=args.catalog,
     )
     server = create_server(
         worker, token, args.port, bind, tls, ownership_available=not args.no_parent_watch

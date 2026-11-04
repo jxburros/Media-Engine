@@ -161,6 +161,8 @@ pub fn strings<S: AsRef<str>>(items: &[S]) -> Value {
     Value::Array(items.iter().map(|s| Value::str(s.as_ref())).collect())
 }
 
+pub const MAX_JSON_DEPTH: usize = 64;
+
 // ----- parsing ---------------------------------------------------------------------------------
 
 pub fn parse(text: &[u8]) -> Result<Value, ()> {
@@ -200,7 +202,7 @@ impl<'a> Parser<'a> {
     }
     fn value(&mut self) -> Result<Value, ()> {
         self.depth += 1;
-        if self.depth > 512 {
+        if self.depth > MAX_JSON_DEPTH + 1 || (self.depth > MAX_JSON_DEPTH && matches!(self.peek(), Some(b'{' | b'['))) {
             return Err(());
         }
         let v = match self.peek().ok_or(())? {

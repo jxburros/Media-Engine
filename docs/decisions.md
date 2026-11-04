@@ -381,7 +381,7 @@ Optional and not yet accepted: one pinned MP4 encoder wheel for the `video` outp
 lossless frame archive is the baseline (shipped in 0.6.0) and this entry is added only on
 evidence of need.
 
-## Ledger — native engine (1.0.0)
+## Ledger — native engine (1.1.0)
 
 | Crate        | Version | Why it is not owned code                                                            | Brings (transitively)                                   |
 | ------------ | ------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------- |
@@ -389,7 +389,66 @@ evidence of need.
 | png          | 0.18.1  | Deflate-backed PNG encoding and decoding                                            | fdeflate, flate2, miniz_oxide, crc32fast, bitflags       |
 
 Not yet added, each with the increment that needs it: cudarc (the first custom CUDA kernel),
-rustls (network mode), a `tokenizers` crate (the T5 tokenizer, only when stable-audio-open
+a `tokenizers` crate (the T5 tokenizer, only when stable-audio-open
 reaches the native engine). Owned: the HTTP/1.1 and SSE server, JSON, SHA-256, the CLIP BPE
 tokenizer, seeded noise, the SDXL models and scheduler, LoRA merging, validation, bundle
 verification; WAV and ZIP writers arrive with the families that need them.
+
+## Review decisions — 2026-11-04
+
+The maintainer approved explicit pixel operations in Engine, optional pinned MP4 encoding,
+retaining existing backend IDs, Linux x64 as the initial artifact target, and delivering new
+families through the reference backend before adding native video/audio loops or custom kernels.
+The paired Runtime may offer explicit pinned model acquisition and signed operator-allowlisted
+completion webhooks; the Engine serving process remains offline and does neither.
+
+An offline ComfyUI subset translator produces normal validated Runtime recipes; it does not
+execute ComfyUI nodes or arbitrary Python. Existing spec/protocol/decisions documents remain the
+source of truth, with a concise AGENTS.md recording contributor constraints. Shared release
+infrastructure establishes version consistency and manual dry-run-first publication.
+
+GPU access was not supplied: the maintainer requested prepared GPU validation jobs. A checked-in
+workflow is not hardware evidence. No optimization is advertised on the basis of an unrun job.
+
+
+## 1.1.0 serving boundaries and native TLS
+
+Both servers expose bearer-authenticated Prometheus text at `/metrics`. Execution counters
+survive record release for the lifetime of the worker process. Labels are validated task,
+terminal state and a fixed phase set; prompts, model paths, identifiers and credentials never
+become labels. Phase/load durations use monotonic clocks. The peak device memory gauge is
+omitted when the backend cannot measure it (including the current native backend).
+
+The loopback HTTP trust boundary rejects browser Origin headers and Host authorities other
+than `localhost` or a loopback IP literal; it never resolves arbitrary DNS names. JSON bodies
+are capped at 4 MiB and 64 nested containers before parsing. HTTP headers are bounded to 64
+fields/64 KiB and request lines to 8 KiB; duplicate framing/authentication headers and all
+Transfer-Encoding requests are refused. PNG bodies retain the configured upload limit.
+
+Native remote workers use TLS 1.3 with mandatory client-certificate verification, in addition
+to bearer authentication. Certificate/key/CA material is read once at startup, the server leaf
+fingerprint is reported, and partial TLS configurations or plaintext non-loopback binds fail
+before listening. No custom cryptographic code is introduced. Catalog snapshots are reread
+before validation/loading, allowing an operator to atomically replace approved handles; a bad
+replacement fails closed with `catalog_unavailable` rather than retaining stale authorization.
+
+| Crate | Version | Native use and justification |
+| --- | --- | --- |
+| rustls | 0.23.35 | TLS 1.3, peer authentication and encrypted records; security-critical TLS is not owned code. `ring` supplies cryptographic primitives; exact transitive versions/checksums are in Cargo.lock. Default AWS-LC and TLS1.2 features are disabled. |
+| rustls-pemfile | 2.2.0 | Parses operator PEM certificates/private keys into rustls types; isolated in `native/src/tls.rs`. |
+
+## Explicit conversions and CPU offload — 1.1.0
+
+- Real-ESRGAN `.pth` migration is an operator-only subprocess using PyTorch's restricted
+  `weights_only=True` loader. No pickle allow-list, serving-time conversion or new dependency
+  is introduced. The operator supplies the exact RRDBNet configuration; every tensor name and
+  shape must match. Kohya conversion uses the approved reference's actual linear module names,
+  preserves alpha, and refuses unsupported layouts rather than guessing underscore mappings.
+- Explicit reference-backend CPU offload uses the already pinned Accelerate 1.4.0 and Diffusers
+  0.32.2 APIs. This does not add Accelerate to the owned or native dependency sets. Hook setup
+  occurs before whole-pipeline GPU placement. Offload is a protocol 1.4 load identity, never an
+  automatic fallback. Compilation/quantization combinations are refused pending validation.
+- CPU tests compare actual Accelerate-hook output with the non-offloaded tiny pipeline. The
+  sequential CPU oracle uses Accelerate's unindexed CPU device because Diffusers constructs
+  `cpu:0`, which cannot round-trip a parameter under these pins. Product offload is advertised
+  only for CUDA; GPU residency/savings and end-to-end CUDA execution remain hardware gates.
