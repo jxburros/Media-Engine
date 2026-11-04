@@ -250,3 +250,46 @@ class NativeOracleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+@unittest.skipUnless(NATIVE and HAVE_OWNED and os.name == 'posix', 'native binary, inference-owned extra and symlink support needed')
+class NativeCatalogTests(unittest.TestCase):
+    def test_snapshot_and_file_adapter_load_then_reject_mutation_and_escape(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);model,bundle=tiny_sdxl_bundle(root)
+            adapter=tiny_lora(root/'lora',model)
+            weights=root/'lora/adapter.safetensors'
+            (root/'lora/unrelated.pth').write_bytes(b'not authorized by file handle')
+            repository=root/'models--approved--tiny'
+            snapshot=repository/'snapshots'/('a'*40);snapshot.mkdir(parents=True)
+            blobs=repository/'blobs';blobs.mkdir()
+            links=[]
+            for source in model.rglob('*'):
+                if not source.is_file():continue
+                data=source.read_bytes();blob=blobs/hashlib.sha256(data).hexdigest()
+                blob.write_bytes(data)
+                path=snapshot/source.relative_to(model);path.parent.mkdir(parents=True,exist_ok=True)
+                path.symlink_to(blob);links.append(path)
+            catalog=root/'catalog.json'
+            catalog.write_text(json.dumps({'tiny':str(snapshot),'tiny-lora':str(weights)}))
+            native=Native(catalog,root/'work')
+            try:
+                body={'protocol':PROTOCOL,'bundle':bundle,'options':{'precision':'float32','attention':'sdpa','offload':'none'},'adapters':[{'adapter':adapter,'scale':.5}]}
+                native.json('POST','/v1/validate',body)
+                op=native.json('POST','/v1/model/load',body,expect=202)
+                result=native.wait('/v1/operations/'+op['operation_id'])
+                self.assertEqual(result['state'],'succeeded',result)
+                request={'protocol':PROTOCOL,'attempt_id':'attempt_catalog','bundle_digest':bundle['bundle_digest'],'task':'text-to-image','inputs':{'prompt':'test'},'parameters':{**DEFAULTS,'width':64,'height':64,'steps':2,'seed':4}}
+                execution=native.json('POST','/v1/executions',request,expect=202)
+                result=native.wait('/v1/executions/'+execution['execution_id'])
+                self.assertEqual(result['state'],'succeeded',result)
+                original=weights.read_bytes();weights.write_bytes(original+b'changed')
+                status,error=native.call('POST','/v1/validate',body)
+                self.assertEqual(status,400);self.assertEqual(error['error']['code'],'artifact_changed')
+                weights.write_bytes(original)
+                path=links[0];original=path.read_bytes();path.unlink()
+                outside=root/'outside-file';outside.write_bytes(original);path.symlink_to(outside)
+                status,error=native.call('POST','/v1/validate',body)
+                self.assertEqual(status,400);self.assertEqual(error['error']['code'],'unsupported')
+                self.assertEqual(native.json('GET','/health')['status'],'ok')
+            finally:native.stop()

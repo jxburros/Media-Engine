@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import struct
 from pathlib import Path
 from .contracts import WorkerError, digest, minor, strict, approved_snapshot_link, safetensors_header
 
@@ -17,7 +18,7 @@ def validate(entries,catalog,version,verify=True):
         strict(entry,('controlnet','scale'))
         record=entry['controlnet'];strict(record,('schema_version','controlnet_id','artifact_handle','family','files','source','digest'))
         if not isinstance(record['controlnet_id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',record['controlnet_id']):raise WorkerError(400,'invalid_request','controlnet_id')
-        if record['schema_version']!=1 or record['family']!='sdxl-base':raise WorkerError(400,'unsupported','controlnet')
+        if type(record['schema_version']) is not int or record['schema_version']!=1 or record['family']!='sdxl-base':raise WorkerError(400,'unsupported','controlnet')
         if digest({k:v for k,v in record.items() if k!='digest'})!=record['digest']:raise WorkerError(400,'artifact_changed','controlnet')
         strict(record['source'],(),('repository','revision','license'))
         if any(not isinstance(v,str) for v in record['source'].values()):raise WorkerError(400,'invalid_request','source')
@@ -36,8 +37,10 @@ def validate(entries,catalog,version,verify=True):
                 if actual_hash!=record['files'][name]:raise WorkerError(400,'artifact_changed','controlnet')
         try:config=json.loads((root/'config.json').read_text())
         except (OSError,ValueError):raise WorkerError(400,'invalid_request','controlnet.config') from None
+        if not isinstance(config,dict):raise WorkerError(400,'invalid_request','controlnet.config')
         if config.get('_class_name')!='ControlNetModel' or config.get('addition_embed_type')!='text_time':raise WorkerError(400,'unsupported','controlnet.config')
-        safetensors_header(root/'diffusion_pytorch_model.safetensors')
+        try:safetensors_header(root/'diffusion_pytorch_model.safetensors')
+        except (OSError,ValueError,TypeError,struct.error):raise WorkerError(400,'unsupported','controlnet.files') from None
         scale=entry['scale']
         if type(scale) not in (int,float) or not 0<=scale<=2:raise WorkerError(400,'invalid_request','controlnet.scale')
         result.append((record,root,scale))

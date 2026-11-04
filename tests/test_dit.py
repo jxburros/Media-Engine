@@ -71,3 +71,43 @@ class DiTTests(unittest.TestCase):
                 request['parameters']['sampler']='euler';request['parameters']['scheduler']='euler'
                 with self.assertRaises(WorkerError):validate_sampling(request,backend.capabilities(),family)
                 backend.unload()
+
+
+class DiTContractTests(unittest.TestCase):
+    def test_family_specific_settings_never_silently_disappear(self):
+        from media_engine.contracts import DEFAULTS,PROTOCOL,WorkerError,validate_sampling
+        from media_engine.sampling import advertised
+        request={'protocol':PROTOCOL,'task':'text-to-image','inputs':{'prompt':'test'},
+            'parameters':{**DEFAULTS,'seed':1,'guidance':0,'sampler':'flow-euler','scheduler':'flow-match'}}
+        caps={'tasks':['text-to-image'],'sampling':advertised(True)}
+        validate_sampling(request,caps,'flux-schnell')
+        for field,value in [('clip_skip',1),('preview_interval',2),('guidance',6)]:
+            prior=request['parameters'].get(field)
+            request['parameters'][field]=value
+            with self.assertRaises(WorkerError):validate_sampling(request,caps,'flux-schnell')
+            if prior is None:del request['parameters'][field]
+            else:request['parameters'][field]=prior
+        with self.assertRaises(WorkerError):validate_sampling(request,caps,'sdxl-base')
+
+
+class DiTGeometryTests(unittest.TestCase):
+    def test_bundle_geometry_is_checked_before_execution(self):
+        from media_engine.contracts import DEFAULTS,PROTOCOL,WorkerError,family_facts
+        from media_engine.dit import check_dimensions
+        from media_engine.server import Worker
+        from fixture import TestBackend,make_dit_bundle
+        for family in ('flux-schnell','sd35'):
+            with self.subTest(family=family),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);bundle=make_dit_bundle(root/'model',family)
+                facts=family_facts(root/'model',family)
+                self.assertEqual(facts['size_multiple'],16)
+                worker=Worker(root/'worker',TestBackend(),{family:str(root/'model')})
+                worker.loaded={'bundle_digest':bundle['bundle_digest']};worker.loaded_family=family;worker.loaded_facts=facts
+                body={'protocol':PROTOCOL,'attempt_id':'attempt_dimensions','bundle_digest':bundle['bundle_digest'],'task':'text-to-image','inputs':{'prompt':'test'},
+                    'parameters':{**DEFAULTS,'seed':1,'guidance':0,'sampler':'flow-euler','scheduler':'flow-match','width':72,'height':72}}
+                with self.assertRaises(WorkerError) as caught:worker.validate_execution(body)
+                self.assertEqual(caught.exception.status,400)
+                with self.assertRaises(WorkerError):worker.submit(body)
+                self.assertIsNone(worker.active)
+                check_dimensions({'width':64,'height':64},16)
+                with self.assertRaises(WorkerError):check_dimensions({'width':72,'height':64},16)

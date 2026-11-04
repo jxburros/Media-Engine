@@ -24,3 +24,8 @@ class ImageOperationTests(unittest.TestCase):
             with self.assertRaises(WorkerError):image_ops.transform(image,params)
         cancel=threading.Event();cancel.set()
         with self.assertRaises(Cancelled):image_ops.transform(image,{'operation':'resize','width':64,'height':64,'filter':'nearest'},cancelled=cancel)
+
+    def test_non_object_parameters_are_clean_client_errors(self):
+        for params in (None, [], 3, 'resize'):
+            with self.assertRaises(WorkerError) as caught:image_ops.validate(params)
+            self.assertEqual(caught.exception.status,400)

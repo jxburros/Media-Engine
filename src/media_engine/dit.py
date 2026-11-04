@@ -1,8 +1,30 @@
 """Local reference DiT pipelines; no custom code, downloads or scheduler substitution."""
 from pathlib import Path
+import json
 
 FAMILIES = ('flux-schnell', 'sd35')
 PAIR = {'sampler': 'flow-euler', 'scheduler': 'flow-match'}
+
+
+def facts(root,family):
+    from .contracts import WorkerError
+    try:
+        vae=json.loads((Path(root)/'vae/config.json').read_text())
+        transformer=json.loads((Path(root)/'transformer/config.json').read_text())
+        blocks=vae['block_out_channels']
+        patch=2 if family=='flux-schnell' else transformer['patch_size']
+        if not isinstance(blocks,list) or not 1 <= len(blocks) <= 8 or type(patch) is not int or not 1 <= patch <= 16:
+            raise ValueError('invalid geometry')
+        return {'size_multiple':2**(len(blocks)-1)*patch}
+    except (OSError,ValueError,KeyError,TypeError):
+        raise WorkerError(400,'invalid_request','size_multiple') from None
+
+
+def check_dimensions(params,multiple):
+    from .contracts import WorkerError
+    for field in ('width','height'):
+        if params[field] % multiple:
+            raise WorkerError(400,'invalid_request',field)
 
 
 def load(backend, root, options):
@@ -27,13 +49,16 @@ def generate(backend, request, directory, emit, cancelled, image_path=None):
     import torch
     from diffusers import FlowMatchEulerDiscreteScheduler
     from .backend import Cancelled
-    from .contracts import output_ids, WorkerError
+    from .contracts import output_ids, effective_steps, WorkerError
     params, inputs = request['parameters'], request['inputs']
+    total = effective_steps(params, request['task'])
     if {k: params[k] for k in PAIR} != PAIR:
         raise WorkerError(400, 'unsupported', 'scheduler')
     if backend.family == 'flux-schnell' and (params['guidance'] != 0 or inputs.get('negative_prompt')):
         raise WorkerError(400, 'unsupported', 'guidance')
     pipe = backend.pipe
+    multiple=pipe.vae_scale_factor*(2 if backend.family=='flux-schnell' else pipe.transformer.config.patch_size)
+    check_dimensions(params,multiple)
     if request['task'] in ('image-to-image','inpaint'):
         from diffusers import FluxImg2ImgPipeline, FluxInpaintPipeline, StableDiffusion3Img2ImgPipeline, StableDiffusion3InpaintPipeline
         classes={'flux-schnell':(FluxImg2ImgPipeline,FluxInpaintPipeline),'sd35':(StableDiffusion3Img2ImgPipeline,StableDiffusion3InpaintPipeline)}
@@ -44,7 +69,7 @@ def generate(backend, request, directory, emit, cancelled, image_path=None):
     try:
         def step(_pipe, index, timestep, values):
             if cancelled.is_set(): raise Cancelled()
-            emit('progress', {'stage':'sampling','completed_steps':index+1,'total_steps':params['steps'],'scope':'stage'})
+            emit('progress', {'stage':'sampling','completed_steps':index+1,'total_steps':total,'scope':'stage'})
             return values
         emit('stage', {'stage':'encoding'})
         seeds = backend.seeds(params)
@@ -71,5 +96,5 @@ def generate(backend, request, directory, emit, cancelled, image_path=None):
             if cancelled.is_set(): raise Cancelled()
             path=Path(directory)/(output_id+'.png'); image.save(path,format='PNG')
             records.append(dict(output_id=output_id,path=path,mime_type='image/png',width=image.width,height=image.height))
-        return records, {'effective_steps':params['steps'], **backend.measurements()}
+        return records, {'effective_steps':total, **backend.measurements()}
     finally: backend.finish()

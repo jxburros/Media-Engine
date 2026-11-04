@@ -6,7 +6,7 @@ from .contracts import WorkerError
 
 def validate(params):
     allowed = {"width", "height", "operation", "filter", "x", "y", "background", "opacity", "threshold_low", "threshold_high"}
-    if set(params) - allowed or not {"width", "height", "operation"} <= params.keys():
+    if not isinstance(params,dict) or set(params) - allowed or not {"width", "height", "operation"} <= params.keys():
         raise WorkerError(400, "invalid_request", "parameters")
     op = params["operation"]
     if op not in ("resize", "crop", "pad", "composite", "canny"):

@@ -500,7 +500,7 @@ class TestBackend:
             task_defaults={k: v for k, v in TASK_DEFAULTS.items() if k in tasks},
             limits=limits,
             tasks=tasks,
-            task_parameters=task_parameters(tasks),
+            task_parameters=task_parameters(tasks, list(families)),
             model_families=list(families),
             loaders=[
                 {
@@ -559,7 +559,10 @@ class TestBackend:
         self.loaded_estimate = self.compute_estimate(root, options, adapters, family, device)
         return self.loaded_estimate
 
-    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=()):
+    def budget_mb(self):
+        return self.memory_budget_mb
+
+    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=(), estimate_mb=None):
         if options["precision"] != "auto" and not authorized:
             return {"options": dict(options), "resolutions": [], "applied_fallbacks": [], "device": self.device}
         return plan_load(
@@ -569,9 +572,9 @@ class TestBackend:
             not self.device_unavailable,
             self.precision_list,
             self.memory_budget_mb,
-            lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
+            estimate_mb or (lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
                 "value_mb"
-            ],
+            ]),
         )
 
     def attach_controlnets(self, resolved):
@@ -816,7 +819,8 @@ def make_dit_bundle(root,family):
     (root/'model_index.json').write_text(json.dumps({'_class_name':spec['pipeline_class'],**{r:list(c) for r,c in spec['approved_classes'].items()}}))
     for role in spec['roles']:
         folder=root/role;folder.mkdir(exist_ok=True)
-        (folder/'config.json').write_text('{}')
+        config={'block_out_channels':[32,64,64,64]} if role=='vae' else ({'patch_size':2} if role=='transformer' else {})
+        (folder/'config.json').write_text(json.dumps(config))
         if role in spec['weight_roles']:(folder/'test.safetensors').write_bytes(zero_safetensors({'test.weight':[4,4]}))
         if role.startswith('tokenizer'):(folder/'tokenizer.json').write_text('{}')
     (root/'scheduler/scheduler_config.json').write_text(json.dumps({'_class_name':spec['scheduler_class']}))

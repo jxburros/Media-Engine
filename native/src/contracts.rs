@@ -129,18 +129,41 @@ fn role_files(role: &str, files: &Map) -> Map {
     files.iter().filter(|(k, _)| k.starts_with(&format!("{}/", role))).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
+/// HF snapshots may refer only to regular files inside that same repository's blobs directory.
+/// The immutable revision directory and blob boundary are both checked, never a general
+/// symlink escape hatch. Directory links and links into another cached repository are refused.
+fn approved_snapshot_link(path: &Path, root: &Path) -> bool {
+    let Some(revision) = root.file_name().and_then(|s| s.to_str()) else { return false };
+    if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return false;
+    }
+    let Some(snapshots) = root.parent() else { return false };
+    let Some(repository) = snapshots.parent() else { return false };
+    if snapshots.file_name().and_then(|s| s.to_str()) != Some("snapshots")
+        || !repository.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("models--")) {
+        return false;
+    }
+    let (Ok(blobs), Ok(target)) = (repository.join("blobs").canonicalize(), path.canonicalize()) else { return false };
+    path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink())
+        && target.is_file() && target != blobs && target.starts_with(blobs)
+}
+
 fn walk(root: &Path, base: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(root).map_err(|_| bad("missing_component", "configuration"))?.flatten().collect();
+    let mut entries = std::fs::read_dir(root)
+        .map_err(|_| bad("missing_component", "configuration"))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|_| bad("missing_component", "configuration"))?;
     entries.sort_by_key(|e| e.path());
     for entry in entries {
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path).map_err(|_| bad("missing_component", "configuration"))?;
-        if meta.file_type().is_symlink() {
+        let linked = meta.file_type().is_symlink();
+        if linked && !approved_snapshot_link(&path, base) {
             return Err(bad("unsupported", "symlink"));
         }
         if meta.is_dir() {
             walk(&path, base, out)?;
-        } else if meta.is_file() {
+        } else if meta.is_file() || linked {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if FORBIDDEN_SUFFIXES.contains(&ext) {
                     return Err(bad("unsupported", "tensor_format"));
@@ -148,6 +171,8 @@ fn walk(root: &Path, base: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result
             }
             let relative = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
             out.insert(relative, path);
+        } else {
+            return Err(bad("unsupported", "configuration"));
         }
     }
     Ok(())
@@ -438,14 +463,23 @@ fn adapter_path(adapter: &Value, catalog: &BTreeMap<String, String>, verify: boo
     let Some(handle) = map["artifact_handle"].as_str().filter(|h| catalog.contains_key(*h)) else {
         return Err(bad("missing_component", "adapter"));
     };
-    let root = PathBuf::from(&catalog[handle]);
-    let root = root.canonicalize().unwrap_or(root);
+    let registered = PathBuf::from(&catalog[handle]);
+    let root = registered.canonicalize().unwrap_or_else(|_| registered.clone());
     let files = match map["files"].as_object() {
-        Some(f) if !f.is_empty() && root.is_dir() => f,
+        Some(f) if !f.is_empty() && (root.is_dir() || root.is_file()) => f,
         _ => return Err(bad("missing_component", "adapter")),
     };
     let mut actual = BTreeMap::new();
-    walk(&root, &root, &mut actual)?;
+    if root.is_file() {
+        // A catalog file handle authorizes this file only. Its neighbors never enter
+        // the descriptor or loader, even if they contain unsupported checkpoint formats.
+        let filename = registered.file_name().and_then(|s| s.to_str())
+            .filter(|s| s.ends_with(".safetensors"))
+            .ok_or_else(|| bad("unsupported", "adapter"))?;
+        actual.insert(filename.to_string(), root.clone());
+    } else {
+        walk(&root, &root, &mut actual)?;
+    }
     if actual.keys().ne(files.keys()) {
         return Err(bad("artifact_changed", "adapter"));
     }
@@ -658,4 +692,88 @@ pub fn png_dimensions(data: &[u8]) -> Result<(u32, u32)> {
         }
     }
     Ok((width, height))
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    struct Temporary(PathBuf);
+    impl Temporary {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("media-engine-catalog-{}-{}", std::process::id(), nonce));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temporary {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn record(path: &Path) -> Value {
+        let mut record = obj! {
+            "schema_version" => 1i64,
+            "adapter_id" => "test",
+            "artifact_handle" => "test",
+            "files" => obj! { "weights.safetensors" => crate::sha256::file_digest(path).unwrap() },
+            "source" => obj! { "license" => "test-only" },
+        };
+        let hash = digest(&record);
+        if let Value::Object(ref mut map) = record { map.insert("digest".to_string(), Value::str(hash)); }
+        record
+    }
+
+    #[test]
+    fn file_adapter_never_scans_neighbors_and_verifies_exact_bytes() {
+        let temp = Temporary::new();
+        let path = temp.0.join("weights.safetensors");
+        std::fs::write(&path, b"approved bytes").unwrap();
+        std::fs::write(temp.0.join("unrelated.pth"), b"unrelated checkpoint").unwrap();
+        let descriptor = record(&path);
+        let catalog = BTreeMap::from([("test".to_string(), path.to_string_lossy().to_string())]);
+        assert_eq!(adapter_path(&descriptor, &catalog, true).unwrap(), path);
+        std::fs::write(&path, b"changed bytes").unwrap();
+        assert_eq!(adapter_path(&descriptor, &catalog, true).unwrap_err().code, "artifact_changed");
+        let directory = BTreeMap::from([("test".to_string(), temp.0.to_string_lossy().to_string())]);
+        assert!(adapter_path(&descriptor, &directory, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hf_links_are_confined_to_the_same_repository_blobs() {
+        use std::os::unix::fs::symlink;
+        let temp = Temporary::new();
+        let repository = temp.0.join("models--approved--model");
+        let root = repository.join("snapshots").join("a".repeat(40));
+        let blobs = repository.join("blobs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        let blob = blobs.join("verified-weight-blob");
+        std::fs::write(&blob, b"approved bytes").unwrap();
+        let path = root.join("weights.safetensors");
+        symlink(&blob, &path).unwrap();
+        let mut actual = BTreeMap::new();
+        walk(&root, &root, &mut actual).unwrap();
+        assert_eq!(actual.len(), 1);
+        let descriptor = record(&path);
+        let catalog = BTreeMap::from([("test".to_string(), root.to_string_lossy().to_string())]);
+        assert_eq!(adapter_path(&descriptor, &catalog, true).unwrap(), path);
+        std::fs::write(&blob, b"changed bytes").unwrap();
+        assert_eq!(adapter_path(&descriptor, &catalog, true).unwrap_err().code, "artifact_changed");
+        std::fs::remove_file(&path).unwrap();
+        let other = temp.0.join("outside.safetensors");
+        std::fs::write(&other, b"outside").unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(!approved_snapshot_link(&path, &root));
+        assert!(walk(&root, &root, &mut BTreeMap::new()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        symlink(&blobs, &path).unwrap();
+        assert!(!approved_snapshot_link(&path, &root));
+        assert!(walk(&root, &root, &mut BTreeMap::new()).is_err());
+        let arbitrary = temp.0.join("plain-directory");
+        std::fs::create_dir_all(&arbitrary).unwrap();
+        symlink(&blob, arbitrary.join("weights.safetensors")).unwrap();
+        assert!(walk(&arbitrary, &arbitrary, &mut BTreeMap::new()).is_err());
+    }
 }

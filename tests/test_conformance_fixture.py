@@ -114,7 +114,8 @@ class ConformanceFixtureTests(unittest.TestCase):
         identity = record["device_identity"]
         self.assertEqual(identity["index"], 3)
         catalog = json.loads((root / "catalog.json").read_text())
-        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video", "audio"})
+        self.assertEqual(set(catalog), {"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video", "audio",
+                         "flux-schnell", "sd35", "fixture-controlnet", "conditioning-ti", "conditioning-ip", "conditioning-vae"})
         self.assertEqual(
             [p.name for p in (root / "checkpoint").iterdir()], ["checkpoint.safetensors"]
         )

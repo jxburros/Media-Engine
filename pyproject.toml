@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
 version = "1.1.0"
-description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video, Stable Audio Open text-to-audio) for Media Runtime"
+description = "Local, single-flight image, video and audio inference worker for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
 readme = "README.md"
 dependencies = []
 [project.optional-dependencies]
+# Test-only schema verification; neither serving nor release images install this extra.
+validation = ["jsonschema==4.25.1"]
 # The owned pipeline (owned-sdxl) and the esrgan upscaler: model classes, tensors, safetensors.
 inference-owned = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "safetensors==0.5.3", "numpy==2.2.3"]
 # The full reference set (diffusers-sdxl), a superset of inference-owned.

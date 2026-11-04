@@ -2506,6 +2506,210 @@
                   "width",
                   "height",
                   "operation"
+                ],
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "operation": {
+                          "const": "resize"
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "background"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "opacity"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_high"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_low"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "x"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "y"
+                            ]
+                          }
+                        ]
+                      },
+                      "required": [
+                        "filter"
+                      ]
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "operation": {
+                          "const": "crop"
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "background"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "filter"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "opacity"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_high"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_low"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "operation": {
+                          "const": "pad"
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "filter"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "opacity"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_high"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_low"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "operation": {
+                          "const": "composite"
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "background"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "filter"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_high"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "threshold_low"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "operation": {
+                          "const": "canny"
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "background"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "filter"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "opacity"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "x"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "y"
+                            ]
+                          }
+                        ]
+                      },
+                      "required": [
+                        "threshold_low",
+                        "threshold_high"
+                      ]
+                    }
+                  }
                 ]
               }
             }
@@ -2618,8 +2822,7 @@
                   "steps": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 200,
-                    "description": "text-to-image and image-to-image 1\u2013150; image-to-video 1\u201350; text-to-audio 1\u2013200"
+                    "maximum": 50
                   },
                   "seed": {
                     "type": "integer",
@@ -2818,6 +3021,42 @@
                     }
                   }
                 ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "task": {
+                "const": "image-transform"
+              },
+              "parameters": {
+                "properties": {
+                  "operation": {
+                    "const": "composite"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "required": [
+                  "overlay"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "inputs": {
+                "not": {
+                  "required": [
+                    "overlay"
+                  ]
+                }
               }
             }
           }
@@ -3632,6 +3871,56 @@
               }
             ]
           }
+        }
+      }
+    },
+    "generation_capabilities_v14": {
+      "type": "object",
+      "description": "Additive advertised fields; absent optional capability means unsupported.",
+      "properties": {
+        "sampling": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sampler",
+              "scheduler"
+            ],
+            "properties": {
+              "sampler": {
+                "type": "string"
+              },
+              "scheduler": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "offload_modes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "none",
+              "model",
+              "sequential"
+            ]
+          }
+        },
+        "offload_families": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "controlnets": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "previews": {
+          "type": "object"
         }
       }
     }

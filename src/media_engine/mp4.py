@@ -21,7 +21,6 @@ def write(path, pngs, fps, cancelled):
     import av
     from . import png
     from .backend import Cancelled
-    import numpy as np
 
     path = Path(path)
     try:
@@ -36,7 +35,12 @@ def write(path, pngs, fps, cancelled):
                 width, height, pixels = png.read_rgb(encoded)
                 if (width, height) != (w, h):
                     raise ValueError("inconsistent frame dimensions")
-                frame = av.VideoFrame.from_ndarray(np.frombuffer(pixels, dtype=np.uint8).reshape(h, w, 3), format="rgb24")
+                frame = av.VideoFrame(w, h, format="rgb24")
+                # Fill PyAV's RGB plane directly; the encoder extra does not depend on numpy.
+                plane = frame.planes[0]
+                stride = w * 3
+                padding = bytes(plane.line_size - stride)
+                plane.update(b"".join(pixels[row*stride:(row+1)*stride] + padding for row in range(h)))
                 frame.pts = index
                 frame.time_base = Fraction(1, fps)
                 for packet in stream.encode(frame):
@@ -58,13 +62,18 @@ def read_metadata(path):
         stream = container.streams.video[0]
         if stream.codec_context.name != "h264" or stream.pix_fmt != "yuv420p":
             raise ValueError("unsupported video encoding")
-        frames = list(container.decode(stream))
         rate = stream.average_rate
-        if not frames or rate is None or rate.denominator != 1:
+        if rate is None or rate.denominator != 1:
             raise ValueError("invalid frame rate")
         fps = int(rate)
-        times = [frame.pts * frame.time_base for frame in frames]
-        if any(t != Fraction(i, fps) for i, t in enumerate(times)):
-            raise ValueError("video is not constant frame rate")
-        return {"width": stream.width, "height": stream.height, "frames": len(frames), "fps": fps,
-                "duration_seconds": len(frames) / fps}
+        count = 0
+        for frame in container.decode(stream):
+            if frame.pts is None or frame.pts * frame.time_base != Fraction(count, fps):
+                raise ValueError("video is not constant frame rate")
+            if (frame.width, frame.height) != (stream.width, stream.height):
+                raise ValueError("inconsistent frame dimensions")
+            count += 1
+        if count == 0:
+            raise ValueError("empty video")
+        return {"width": stream.width, "height": stream.height, "frames": count, "fps": fps,
+                "duration_seconds": count / fps}

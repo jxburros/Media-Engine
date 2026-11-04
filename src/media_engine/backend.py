@@ -507,7 +507,7 @@ class TorchBackend:
 
         return torch.cuda.get_device_properties(self.device).total_memory // 1024**2
 
-    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=()):
+    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=(), estimate_mb=None):
         if options["precision"] != "auto" and not authorized:
             # 1.0/1.1 bodies and 1.2 bodies without auto or fallbacks: nothing to resolve.
             return {"options": dict(options), "resolutions": [], "applied_fallbacks": [], "device": self.device}
@@ -519,9 +519,9 @@ class TorchBackend:
             available,
             self.precisions(),
             self.budget_mb() if available else None,
-            lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
+            estimate_mb or (lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
                 "value_mb"
-            ],
+            ]),
         )
 
     def apply_budget(self):

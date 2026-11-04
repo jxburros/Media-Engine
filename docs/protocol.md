@@ -888,8 +888,11 @@ These components require reference SDXL, `offload:none`, `attention:sdpa`,
 `quantization:none`, and `compile:none`. A different kind, family, backend or combination is
 refused. `loaded_bundle.conditioning` records `conditioning_id`, `kind`, `digest` and the
 supplied scale/token/encoder, making any change a load-identity change. Additional component
-weight estimates are conservative (both VAE versions counted); activations and image encoder
-working memory remain unmeasured. Unloading removes all components and cached embeddings.
+weight estimates use resolved precision and replace the original VAE's resident weight count.
+They participate in authorized CPU/lower-precision fallback planning; if no authorized plan
+fits a known accelerator budget, component loads are refused before allocation. `load_peak_mb` also accounts for loading the base before a smaller replacement. The old
+accelerator VAE is released before transferring its replacement and before attaching other
+components. CPU staging, activations and image encoder working memory remain unmeasured. Unloading removes all components and cached embeddings.
 
 `clip_skip` is separately advertised as `[1,2]` for reference SDXL text-to-image,
 image-to-image and inpaint. It is an optional integer parameter in 1.4: default uses the
@@ -898,3 +901,9 @@ the pinned Diffusers convention. The text-encoding cache includes this selection
 on other families/backends. Tiny random-weight CPU tests verify that embedding, VAE, IP-Adapter
 scale and CLIP-layer changes affect output and that reloading restores the original result;
 these tests make no real-weight quality or CUDA claim.
+
+DiT registration and loaded-bundle facts include `size_multiple`, derived from the
+local VAE downsampling scale times the transformer's patch size (Flux uses latent
+packing factor2). Width and height must both be divisible by this value. Runtime
+checks it at admission and Engine checks it before execution; neither silently
+rounds a request to the dimensions accepted by a library pipeline.

@@ -47,6 +47,34 @@ candidate qualifies without review. After examining evidence, cite the exact art
 and workflow URL in `docs/compatibility.md`; inspect generated media for quality before
 approving any optimization. The job definitions are prepared; no GPU result is implied.
 
+### Protocol 1.4 generation cases
+
+`generation_cases` points to an operator-owned case file with the shape in
+`packaging/generation-cases.example.json`. The runner requires all 20 demonstrated
+surfaces: Flux Schnell and SD3.5 text/image/inpaint, SDXL inpaint, ControlNet,
+LoRA, textual inversion, IP-Adapter, VAE swap, CLIP skip, previews, MP4, and the five
+explicit image operations including canny. Depth/pose are not claimed: they
+require additional approved model families and are outside the current canny path.
+
+Each case names a `load` JSON file containing the full protocol load body
+(`bundle`, explicit `options`, optional `controlnets` and `conditioning`) and a
+`request` JSON file containing `task`, `inputs` and `parameters`, as documented in
+`docs/protocol.md`. `input_files` maps image/mask/control_image/reference_image/overlay
+slots to approved local PNGs; the harness uploads them and fills their input IDs.
+The harness sets protocol, bundle digest and unique attempt ID. Use fixed seeds,
+1024-pixel production image sizes and the model's actual sampler/guidance constraints;
+set `preview_interval` for the preview case, `clip_skip` for that case and `encode_video: true`
+in the SVD case. The supplied template paths must be populated by the operator;
+they are not synthetic weights or completed evidence. The explicit real-weight
+attestation requires the operator to distinguish production weights from tiny test bundles.
+
+`packaging/generation-evidence.py` runs the real reference backend on CUDA twice
+per case, verifies output hashes, decodes PNG/MP4 media, records measured memory
+and wall time, and retains media for quality inspection. Repeated output hashes
+must match. Coverage is derived from executed bodies and outputs, not case names;
+missing or failed cases fail the job. It writes `generation/generation-report.json`.
+It does not publish weights, prompts or request bodies, nor edit benchmark citations.
+
 ## Build inputs
 
 Build-only tools are Python 3.12.14, Rust 1.99.1, `build==1.2.2.post1` (PEP 517 wheel
@@ -57,3 +85,8 @@ These tools are isolated to packaging; serving imports no build frontend. Native
 include the Cargo lockfile and collected dependency copyright/license notices. CPU native
 release binaries are built on Ubuntu 24.04; use a compatible glibc host. Go Runtime's binary
 is independently static.
+
+CI installs the test-only `validation` extra (`jsonschema==4.25.1`) from a hashed,
+frozen lockfile export in the protocol job. It validates the published schema
+without installing inference packages. Neither the default worker installation nor
+the Python release image installs this extra; it is not a serving dependency.

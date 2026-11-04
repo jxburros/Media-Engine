@@ -263,9 +263,22 @@ def approved_snapshot_link(path, root):
     root, path = Path(root), Path(path)
     if not (re.fullmatch(r"[a-f0-9]{40}", root.name) and root.parent.name == "snapshots" and root.parent.parent.name.startswith("models--")):
         return False
-    blobs = (root.parent.parent / "blobs").resolve()
+    blobs = root.parent.parent / "blobs"
+    if blobs.resolve() != blobs:
+        return False
     target = path.resolve()
-    return path.is_symlink() and target.is_file() and target.is_relative_to(blobs) and target != blobs
+    return path.parent.resolve() == path.parent and path.is_symlink() and target.is_file() and target.is_relative_to(blobs) and target != blobs
+
+
+def catalog_root(value):
+    """Keep a selected snapshot file's public filename instead of its opaque blob name."""
+    selected = Path(value).absolute()
+    if selected.is_symlink() and selected.is_file():
+        for parent in selected.parents:
+            if approved_snapshot_link(selected, parent):
+                return selected
+        raise WorkerError(400,"unsupported","symlink")
+    return selected.resolve()
 
 
 def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
@@ -321,7 +334,7 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
     handle = configuration["artifact_handle"]
     if not isinstance(handle, str) or handle not in catalog:
         raise WorkerError(400, "missing_component", "artifact_handle")
-    root = Path(catalog[handle]).resolve()
+    root = catalog_root(catalog[handle])
     files = configuration["files"]
     if not isinstance(files, dict) or not files:
         raise WorkerError(400, "missing_component", "configuration")
@@ -363,7 +376,7 @@ def bundle_path(bundle, catalog, verify=True, version=PROTOCOL):
     if not root.is_dir() and not single_file:
         raise WorkerError(400, "missing_component", "configuration")
     actual = {root.name: root, "config.json": Path(str(root) + ".json")} if single_file else {}
-    if single_file and (root.suffix != ".safetensors" or not actual["config.json"].is_file() or actual["config.json"].is_symlink()):
+    if single_file and (root.suffix != ".safetensors" or not actual["config.json"].is_file() or (actual["config.json"].is_symlink() and not any(approved_snapshot_link(actual["config.json"], parent) for parent in root.parents))):
         raise WorkerError(400, "missing_component", "configuration")
     for path in ([] if single_file else sorted(root.rglob("*"))):
         if path.is_symlink() and not approved_snapshot_link(path,root):
@@ -630,6 +643,9 @@ def audio_length(duration, facts):
 
 def family_facts(root, family):
     """Configuration facts a supervisor needs from the loaded family (scale, video sizes)."""
+    if family in ("flux-schnell","sd35"):
+        from .dit import facts
+        return facts(root,family)
     if family == "esrgan":
         from .upscale import read_config
 
@@ -1053,7 +1069,7 @@ def adapter_path(adapter, catalog, verify=True):
     handle = adapter["artifact_handle"]
     if not isinstance(handle, str) or handle not in catalog:
         raise WorkerError(400, "missing_component", "adapter")
-    root = Path(catalog[handle]).resolve()
+    root = catalog_root(catalog[handle])
     files = adapter["files"]
     single_file = root.is_file()
     if not isinstance(files, dict) or not files or not (root.is_dir() or single_file):
@@ -1169,7 +1185,7 @@ def validate_sampling(body, caps, family=None):
     from .dit import FAMILIES as DIT_FAMILIES, PAIR
     pair = {"sampler":params["sampler"], "scheduler":params["scheduler"]}
     if family in DIT_FAMILIES:
-        if pair != PAIR or "preview_interval" in params:
+        if pair != PAIR or "preview_interval" in params or "clip_skip" in params:
             raise WorkerError(400, "unsupported", "scheduler")
         if family == "flux-schnell" and (params["guidance"] != 0 or body["inputs"].get("negative_prompt")):
             raise WorkerError(400, "unsupported", "guidance")

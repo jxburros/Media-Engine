@@ -26,8 +26,8 @@ def main():
     parser.add_argument('--native', required=True, type=Path)
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
-    if not isinstance(config, dict) or set(config) - {'catalog', 'registration', 'benchmark_registration'}:
-        parser.error('config permits only catalog, registration, benchmark_registration')
+    if not isinstance(config, dict) or set(config) - {'catalog', 'registration', 'benchmark_registration', 'generation_cases'}:
+        parser.error('config permits only catalog, registration, benchmark_registration, generation_cases')
     paths = {}
     for key in ('catalog', 'registration'):
         paths[key] = Path(config[key]).resolve(strict=True)
@@ -80,6 +80,7 @@ def main():
             launch += ['--catalog', str(paths['catalog']), '--directory', str(Path(temporary) / backend), '--device', 'cuda:0', '--port', '0', '--max-retained', '10']
             run('conformance-' + backend, [sys.executable, '-m', 'tests.conformance.run', '--registration', str(paths['registration']), '--verbose', '--launch', *launch], 3600)
         run('offload-reference-families', [sys.executable, 'packaging/offload-evidence.py', '--catalog', str(paths['catalog']), '--registration', str(paths['registration']), '--output', str(output)], 10800)
+        run('generation-features', [sys.executable, 'packaging/generation-evidence.py', '--catalog', str(paths['catalog']), '--cases', config.get('generation_cases', ''), '--output', str(output / 'generation')], 10800)
         if os.environ.get('RUN_BENCHMARK') == 'true':
             registration = Path(config['benchmark_registration']).resolve(strict=True)
             for backend in ('diffusers-sdxl', 'owned-sdxl'):

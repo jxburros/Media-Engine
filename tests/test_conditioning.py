@@ -65,6 +65,38 @@ class ConditioningContractTests(unittest.TestCase):
         body['protocol']='media-worker/1.3'
         with self.assertRaises(WorkerError):validate_parameters(body)
 
+    def test_component_weights_participate_in_authorized_fallback_planning(self):
+        from fixture import TestBackend, make_bundle, make_conditioning, make_controlnet
+        from media_engine.server import Worker
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);bundle=make_bundle(root/'model')
+            component=make_conditioning(root/'ip','ip-adapter','ip')
+            control=make_controlnet(root/'control')
+            catalog={'fixture':str(root/'model'),'ip':str(root/'ip'),control['artifact_handle']:str(root/'control')}
+            backend=TestBackend(estimate_mb=100,memory_budget_mb=100,precisions=('float16','float32'))
+            worker=Worker(root/'worker',backend,catalog)
+            options={'precision':'float32','attention':'sdpa','offload':'none'}
+            for extra in ({'conditioning':[{'component':component,'scale':1}]},{'controlnets':[{'controlnet':control,'scale':1}]}):
+                body={'protocol':PROTOCOL,'bundle':bundle,'options':options,**extra}
+                with self.assertRaises(WorkerError) as error:worker.validation(body)
+                self.assertEqual((error.exception.status,error.exception.code),(503,'out_of_memory'))
+                self.assertEqual(backend.loads,0)
+                cpu=worker.validation({**body,'authorized_fallbacks':['cpu']})
+                self.assertEqual(cpu['memory_estimate']['device'],'cpu')
+                self.assertEqual(cpu['memory_estimate']['value_mb'],101)
+                self.assertEqual(cpu['applied_fallbacks'][0]['fallback'],'cpu')
+                lower=worker.validation({**body,'authorized_fallbacks':['lower_precision','cpu']})
+                self.assertEqual(lower['resolved_options']['precision'],'float16')
+                self.assertEqual(lower['memory_estimate']['value_mb'],51)
+                self.assertEqual(lower['applied_fallbacks'][0]['fallback'],'lower_precision')
+            # The component-aware adjustment removes only the old VAE's resident weights.
+            from media_engine.component_memory import include
+            base={'value_mb':100,'roles':{'vae':{'loaded_mb':20}}}
+            replacement={'parameters':5*1024*1024,'replaces_vae':True}
+            self.assertEqual(include(base,replacement,'float32')['value_mb'],100)
+            self.assertEqual(include(base,replacement,'float16')['value_mb'],90)
+            self.assertEqual(include(base,replacement,'float16')['load_peak_mb'],100)
+
     def test_http_registration_load_identity_reference_ownership_and_unload(self):
         import http.client
         import time
@@ -133,10 +165,12 @@ class ConditioningInferenceTests(unittest.TestCase):
             component=descriptor(embeddings,'textual-inversion')
             use={'component':component,'token':'<newtoken>','encoder':'text_encoder'}
             before=len(backend.pipe.tokenizer)
+            body=request();body['inputs']['prompt']='<newtoken>'
+            without_embedding=run('without-embedding',body)
             conditioning.attach(backend,conditioning.validate([use],{'textual-inversion':str(embeddings)},PROTOCOL))
             self.assertEqual(backend.pipe.text_encoder.get_input_embeddings().weight.shape[0],before+1)
             body=request();body['inputs']['prompt']='<newtoken>'
-            self.assertNotEqual(original,run('embedding-result',body))
+            self.assertNotEqual(without_embedding,run('embedding-result',body))
             replacement=root/'replacement';backend.pipe.vae.save_pretrained(replacement,safe_serialization=True)
             from diffusers import AutoencoderKL
             vae=AutoencoderKL.from_pretrained(replacement,local_files_only=True)

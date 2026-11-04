@@ -1,6 +1,8 @@
 """Verified local SDXL load components. No hub identifiers or pickle files are accepted."""
 import hashlib
 import json
+import math
+import struct
 import re
 from pathlib import Path
 
@@ -102,11 +104,33 @@ def validate(entries, catalog, version, verify=True):
                     keys = set(header) - {"__metadata__"}
                     if not keys or any(v.get("dtype") not in ("F16", "BF16", "F32") for k,v in header.items() if k != "__metadata__"):
                         raise ValueError()
+                    with path.open("rb") as stream:
+                        header_size = struct.unpack("<Q", stream.read(8))[0]
+                    payload_size = path.stat().st_size - 8 - header_size
+                    ranges = []
+                    for key in keys:
+                        tensor = header[key]
+                        shape, offsets = tensor["shape"], tensor["data_offsets"]
+                        if not isinstance(shape,list) or not 1 <= len(shape) <= 8 or any(type(d) is not int or d <= 0 for d in shape):
+                            raise ValueError()
+                        if not isinstance(offsets,list) or len(offsets) != 2 or any(type(d) is not int for d in offsets):
+                            raise ValueError()
+                        start,end = offsets
+                        if not 0 <= start <= end <= payload_size or end-start != math.prod(shape) * (4 if tensor["dtype"] == "F32" else 2):
+                            raise ValueError()
+                        ranges.append((start,end))
+                    position = 0
+                    for start,end in sorted(ranges):
+                        if start != position:
+                            raise ValueError()
+                        position = end
+                    if position != payload_size:
+                        raise ValueError()
                     if kind == "textual-inversion" and (keys != {"embedding"} or len(header["embedding"]["shape"]) not in (1,2)):
                         raise ValueError()
                     if name == "ip_adapter.safetensors" and (not any(k.startswith("image_proj.") for k in keys) or not any(k.startswith("ip_adapter.") for k in keys) or any(not k.startswith(("image_proj.","ip_adapter.")) for k in keys)):
                         raise ValueError()
-        except (OSError,ValueError,KeyError,TypeError,AttributeError):
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,struct.error):
             raise WorkerError(400, "unsupported", "conditioning.layout") from None
         result.append((entry, root))
     return result
@@ -121,13 +145,18 @@ def attach(backend, resolved):
     pipe = backend.pipe
     dtype = getattr(torch, backend.load_options["precision"])
     backend.has_ip_adapter = False
-    for entry,root in resolved:
+    # Replace the VAE before allocating other components so peak accelerator weight memory
+    # is max(base load, final resident weights), not original VAE plus all components.
+    for entry,root in sorted(resolved, key=lambda item: item[0]["component"]["kind"] != "vae"):
         kind = entry["component"]["kind"]
         if kind == "vae":
             vae = AutoencoderKL.from_pretrained(str(root), local_files_only=True, use_safetensors=True, torch_dtype=dtype)
             if vae.config.latent_channels != pipe.vae.config.latent_channels or len(vae.config.block_out_channels) != len(pipe.vae.config.block_out_channels):
                 raise WorkerError(400, "unsupported", "conditioning.vae")
-            pipe.register_modules(vae=vae.to(backend.run_device))
+            # Release the original accelerator VAE before placing its replacement. The
+            # temporary CPU load above validates architecture without doubling GPU weights.
+            pipe.register_modules(vae=vae)
+            pipe.vae.to(backend.run_device)
         elif kind == "textual-inversion":
             encoder_name = entry["encoder"]
             encoder = getattr(pipe,encoder_name)

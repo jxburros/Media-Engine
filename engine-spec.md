@@ -271,7 +271,7 @@ Each task below is advertised separately in `capabilities.tasks`, has its own fa
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | Inputs     | `image` (an `input_id`); no prompt                                                                                            |
 | Parameters | `tile` (0 = whole image, or an advertised tile size), `tile_overlap`; width/height MUST equal the input; no seed             |
-| Output     | `image` as PNG at exactly input size × `scale`; `limits.output_side` bounds the result (proposed 8192)                       |
+| Output     | `image` as PNG at exactly input size × `scale`; `limits.output_side` bounds the result (8192 on the current Python implementation)                       |
 | Stages     | `upscaling` with per-tile progress, then `saving`                                                                             |
 | Memory     | Estimate from network parameters plus the largest tile's activations at the load precision; tiling is explicit, never automatic |
 

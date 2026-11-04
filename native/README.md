@@ -51,6 +51,13 @@ JSON bodies are limited to 4 MiB and 64 containers of nesting; PNG upload limits
 configurable. Browser origins, hostile loopback Host headers, duplicate HTTP headers and
 transfer encodings are refused. Catalogs passed with `--catalog` are re-read before
 validation/load, so Runtime can atomically add approved paths without restarting the worker.
+Catalog LoRA handles may name an individual `.safetensors` file: only that file is hashed and
+loaded, regardless of its neighbors. Directory handles remain exact-file-set registrations.
+Hugging Face snapshot directories are supported when the root is
+`models--…/snapshots/<40 lowercase hex revision>` and every file symlink resolves to a regular
+file strictly within that repository's `blobs` directory. Other symlinks, directory links,
+cross-repository links and changed bytes are refused. These catalog resolution rules add no
+new wire fields; native SDXL continues to negotiate protocol 1.3.
 
 ## Not advertised
 - Families other than `sdxl-base` (`esrgan`, `svd`, `stable-audio-open`): `unsupported`, field

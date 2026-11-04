@@ -296,7 +296,7 @@ class Worker:
             raise WorkerError(400, "unsupported", "controlnets")
         if controls and (not caps.get("controlnets") or family != "sdxl-base" or options["offload"] != "none"):
             raise WorkerError(400, "unsupported", "controlnets")
-        controlnet.validate(controls, catalog, version, verify)
+        resolved_controls = controlnet.validate(controls, catalog, version, verify)
         from . import conditioning
         components = body.get("conditioning", [])
         if "conditioning" in body and level < 4:
@@ -308,7 +308,19 @@ class Worker:
         if controls and any(e["component"]["kind"] == "ip-adapter" for e,_ in resolved):
             raise WorkerError(400, "unsupported", "conditioning")
         optimize.check_load(options, version, caps, family, adapters, authorized)
-        plan = self.backend.plan(root, options, adapters, family, authorized)
+        if controls or components:
+            from .component_memory import inventory, include
+            stats = inventory(resolved_controls, resolved)
+            def component_estimate(precision):
+                base = self.backend.compute_estimate(root, {**options, "precision": precision}, adapters, family)
+                return include(base, stats, precision)["load_peak_mb"]
+            plan = self.backend.plan(root, options, adapters, family, authorized, estimate_mb=component_estimate)
+            plan["component_stats"] = stats
+            budget = self.backend.budget_mb() if caps["device_available"] else None
+            if plan["device"] != "cpu" and budget is not None and component_estimate(plan["options"]["precision"]) > budget:
+                raise WorkerError(503, "out_of_memory", "conditioning" if components else "controlnets")
+        else:
+            plan = self.backend.plan(root, options, adapters, family, authorized)
         if options["offload"] != "none" and not plan["device"].startswith("cuda:"):
             raise WorkerError(400, "unsupported", "options.offload")
         return root, adapters, family, plan
@@ -317,23 +329,9 @@ class Worker:
         estimate = self.backend.estimate(
             root, plan["options"], adapters, family, plan["device"]
         )
-        if body and (body.get("controlnets") or body.get("conditioning")):
-            from .contracts import safetensors_header
-            from .backend import PRECISION_BYTES
-            import math
-            extra_parameters = 0
-            catalog = self.current_catalog()
-            records = [e["controlnet"] for e in body.get("controlnets", [])] + [e["component"] for e in body.get("conditioning", [])]
-            for record in records:
-                component_root = Path(catalog[record["artifact_handle"]])
-                for name in record["files"]:
-                    if name.endswith(".safetensors"):
-                        header = safetensors_header(component_root / name)
-                        extra_parameters += sum(math.prod(v["shape"]) for k,v in header.items() if k != "__metadata__")
-            extra_mb = math.ceil(extra_parameters * PRECISION_BYTES[plan["options"]["precision"]] / 1024**2)
-            estimate = {**estimate, "value_mb": estimate["value_mb"] + extra_mb,
-                "additional_components_mb": extra_mb,
-                "uncertainty": str(estimate.get("uncertainty", "")) + "; additional component weights included conservatively (VAE counts both versions); activation and image-encoder working memory excluded"}
+        if "component_stats" in plan:
+            from .component_memory import include
+            estimate = include(estimate, plan["component_stats"], plan["options"]["precision"])
         notes = optimize.estimate_note(plan["options"])
         if notes:
             estimate = {**estimate, "optimizations": notes}
@@ -345,6 +343,7 @@ class Worker:
                     "scaling": "activation working memory grows linearly with count; activations are excluded from value_mb",
                 },
             }
+        self.backend.loaded_estimate = estimate
         return estimate
 
     def validation(self, body):
@@ -410,12 +409,12 @@ class Worker:
                         root, adapters, family, plan = self.validate_load(body)
                         estimate = self.estimate(root, plan, adapters, family, level, body)
                         self.backend.load(root, plan["options"], adapters, family, plan["device"])
-                        if body.get("controlnets"):
-                            from . import controlnet
-                            self.backend.attach_controlnets(controlnet.validate(body["controlnets"], self.current_catalog(), body["protocol"]))
                         if body.get("conditioning"):
                             from . import conditioning
                             self.backend.attach_conditioning(conditioning.validate(body["conditioning"], self.current_catalog(), body["protocol"]))
+                        if body.get("controlnets"):
+                            from . import controlnet
+                            self.backend.attach_controlnets(controlnet.validate(body["controlnets"], self.current_catalog(), body["protocol"]))
                         self.backend.applied_fallbacks = plan["applied_fallbacks"]
                         facts = family_facts(root, family)
                         with self.lock:
@@ -593,6 +592,9 @@ class Worker:
         if task not in FAMILIES[self.loaded_family]["tasks"]:
             raise WorkerError(400, "unsupported", "task")
         params = body["parameters"]
+        if self.loaded_family in ("flux-schnell","sd35"):
+            from .dit import check_dimensions
+            check_dimensions(params,self.loaded_facts["size_multiple"])
         has_reference = "reference_image" in body["inputs"]
         has_ip = any(e["kind"] == "ip-adapter" for e in self.loaded.get("conditioning", []))
         if has_ip != has_reference or has_reference and task != "text-to-image":

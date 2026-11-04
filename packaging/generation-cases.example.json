@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "flux-schnell-text-to-image",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/flux-schnell.json",
+      "request": "/srv/media-validation/requests/flux-schnell-text-to-image.json",
+      "input_files": {}
+    },
+    {
+      "name": "flux-schnell-image-to-image",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/flux-schnell.json",
+      "request": "/srv/media-validation/requests/flux-schnell-image-to-image.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "flux-schnell-inpaint",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/flux-schnell.json",
+      "request": "/srv/media-validation/requests/flux-schnell-inpaint.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png",
+        "mask": "/srv/media-validation/inputs/mask.png"
+      }
+    },
+    {
+      "name": "sd35-text-to-image",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sd35.json",
+      "request": "/srv/media-validation/requests/sd35-text-to-image.json",
+      "input_files": {}
+    },
+    {
+      "name": "sd35-image-to-image",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sd35.json",
+      "request": "/srv/media-validation/requests/sd35-image-to-image.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "sd35-inpaint",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sd35.json",
+      "request": "/srv/media-validation/requests/sd35-inpaint.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png",
+        "mask": "/srv/media-validation/inputs/mask.png"
+      }
+    },
+    {
+      "name": "sdxl-inpaint",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/sdxl-inpaint.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png",
+        "mask": "/srv/media-validation/inputs/mask.png"
+      }
+    },
+    {
+      "name": "sdxl-controlnet",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl-controlnet.json",
+      "request": "/srv/media-validation/requests/sdxl-controlnet.json",
+      "input_files": {
+        "control_image": "/srv/media-validation/inputs/canny.png"
+      }
+    },
+    {
+      "name": "sdxl-textual-inversion",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl-textual-inversion.json",
+      "request": "/srv/media-validation/requests/sdxl-textual-inversion.json",
+      "input_files": {}
+    },
+    {
+      "name": "sdxl-ip-adapter",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl-ip-adapter.json",
+      "request": "/srv/media-validation/requests/sdxl-ip-adapter.json",
+      "input_files": {
+        "reference_image": "/srv/media-validation/inputs/reference.png"
+      }
+    },
+    {
+      "name": "sdxl-vae",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl-vae.json",
+      "request": "/srv/media-validation/requests/sdxl-text-to-image.json",
+      "input_files": {}
+    },
+    {
+      "name": "sdxl-clip-skip",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/sdxl-clip-skip.json",
+      "input_files": {}
+    },
+    {
+      "name": "sdxl-previews",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/sdxl-previews.json",
+      "input_files": {}
+    },
+    {
+      "name": "svd-mp4",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/svd.json",
+      "request": "/srv/media-validation/requests/svd-mp4.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/video-source.png"
+      }
+    },
+    {
+      "name": "image-resize",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/image-resize.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "image-crop",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/image-crop.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "image-pad",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/image-pad.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "image-composite",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/image-composite.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png",
+        "overlay": "/srv/media-validation/inputs/overlay.png"
+      }
+    },
+    {
+      "name": "image-canny",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl.json",
+      "request": "/srv/media-validation/requests/image-canny.json",
+      "input_files": {
+        "image": "/srv/media-validation/inputs/source.png"
+      }
+    },
+    {
+      "name": "sdxl-lora",
+      "weight_evidence": "operator-approved-real-weights",
+      "load": "/srv/media-validation/loads/sdxl-lora.json",
+      "request": "/srv/media-validation/requests/sdxl-text-to-image.json",
+      "input_files": {}
+    }
+  ]
+}

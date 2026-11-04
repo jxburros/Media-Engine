@@ -32,6 +32,18 @@ class FileCatalogTests(unittest.TestCase):
             self.assertEqual(bundle_path(bundle, {'upscaler':str(file)}), file)
             with self.assertRaises(WorkerError): bundle_path(bundle, {'upscaler':str(file)}, version='media-worker/1.3')
 
+    def test_selected_snapshot_adapter_retains_logical_filename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo=Path(temp)/'models--approved--adapter'
+            snapshot=repo/'snapshots'/('a'*40);snapshot.mkdir(parents=True)
+            blobs=repo/'blobs';blobs.mkdir()
+            record=make_adapter(snapshot)
+            selected=next(snapshot.glob('*.safetensors'))
+            record['files']={selected.name:record['files'][selected.name]}
+            record['digest']=digest({k:v for k,v in record.items() if k!='digest'})
+            blob=blobs/'opaquehash';selected.replace(blob);selected.symlink_to(blob)
+            self.assertEqual(adapter_path(record,{'fixture-lora':str(selected)})[1],selected)
+
     def test_hugging_face_snapshot_links_are_confined_to_its_blob_store(self):
         from media_engine.contracts import approved_snapshot_link
         with tempfile.TemporaryDirectory() as temp:
@@ -45,6 +57,10 @@ class FileCatalogTests(unittest.TestCase):
             link.unlink();link.symlink_to(outside)
             self.assertFalse(approved_snapshot_link(link,snapshot))
             link.unlink();link.symlink_to(blobs,target_is_directory=True)
+            self.assertFalse(approved_snapshot_link(link,snapshot))
+            link.unlink();blob.unlink();blobs.rmdir()
+            external=Path(temp)/'external-blobs';external.mkdir();(external/'hash').write_bytes(b'weights')
+            blobs.symlink_to(external,target_is_directory=True);link.symlink_to(blobs/'hash')
             self.assertFalse(approved_snapshot_link(link,snapshot))
 
 

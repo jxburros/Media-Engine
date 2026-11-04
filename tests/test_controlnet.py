@@ -58,3 +58,17 @@ class ControlNetTests(unittest.TestCase):
             (path/'config.json').write_text('{}')
             with self.assertRaises(WorkerError):controlnet.validate([{'controlnet':record,'scale':1}],{'control':str(path)},PROTOCOL)
             backend.unload();self.assertIsNone(backend.controlnet)
+
+
+class ControlNetArtifactTests(unittest.TestCase):
+    def test_malformed_local_artifacts_fail_with_client_errors(self):
+        from fixture import make_controlnet,file_digests
+        from media_engine.controlnet import validate
+        from media_engine.contracts import digest,PROTOCOL,WorkerError
+        for name,data in [('config.json',b'[]'),('config.json',b'null'),('diffusion_pytorch_model.safetensors',b'bad')]:
+            with self.subTest(name=name,data=data),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);record=make_controlnet(root)
+                (root/name).write_bytes(data);record['files']=file_digests(root)
+                record['digest']=digest({k:v for k,v in record.items() if k!='digest'})
+                with self.assertRaises(WorkerError) as caught:validate([{'controlnet':record,'scale':1}],{'fixture-controlnet':str(root)},PROTOCOL)
+                self.assertEqual(caught.exception.status,400)

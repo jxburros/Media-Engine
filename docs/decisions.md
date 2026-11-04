@@ -476,13 +476,23 @@ cancellation removes incomplete output. `mp4.available()` gates advertisement.
 
 ### Explicit pixel operations and conditioning preprocessing
 
-Protocol1.4 image-transform executes owned RGB resize (explicit nearest/bilinear),
-crop, pad, composite, and Canny edge extraction. Canny uses a fixed Gaussian5 filter,
+Protocol 1.4 image-transform executes owned RGB resize (explicit nearest/bilinear),
+crop, pad, composite, and Canny edge extraction. Canny uses a fixed Gaussian 5 filter,
 Sobel gradients, four-direction nonmaximum suppression and hysteresis. Thresholds
-are explicit fractions of1020 (the Sobel axis maximum), with0<=low<high<=1.
+are explicit fractions of 1020 (the Sobel axis maximum), with 0 <= low < high <= 1.
 There are no depth/pose guesses or model downloads. Depth/pose preprocessors remain
 unavailable until an approved local model implementation is selected. The first
 ControlNet path accepts SDXL ControlNetModel directories and one explicit scale;
 its execution requires a same-size durable control_image. Utility recipes currently
 route through a registered sdxl-base model; the scheduler may load that model even
 though the pixel operation does not run its weights.
+
+### Schema validation dependency
+
+`jsonschema==4.25.1` is a test-only `validation` extra for Draft 2020-12 behavioral
+checks of the shared worker schema. Serving and release images do not install it.
+Its supporting packages are frozen in `uv.lock`: attrs 26.1.0 (validated attribute
+classes), jsonschema-specifications 2025.9.1 (standard metaschemas), referencing
+0.37.0 (reference resolution), and rpds-py 2026.9.1 (persistent data structures).
+CI installs the locked graph with hashes and runs schema tests without inference
+extras; it does not merely skip validation when the validator is unavailable.
