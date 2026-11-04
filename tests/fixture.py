@@ -371,6 +371,27 @@ def make_converted(
     return make_bundle(root, handle, bundle_id, conversion=record, source=source)
 
 
+def make_conditioning(root, kind, handle):
+    """Protocol-only approved shape; these zero tensors are not model weights."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if kind == "vae":
+        (root/"config.json").write_text(json.dumps({"_class_name":"AutoencoderKL", "latent_channels":4, "block_out_channels":[32,64]}))
+        (root/"diffusion_pytorch_model.safetensors").write_bytes(zero_safetensors({"decoder.weight":[4,4]}))
+    elif kind == "textual-inversion":
+        (root/"embedding.safetensors").write_bytes(zero_safetensors({"embedding":[32]}))
+    else:
+        (root/"image_encoder").mkdir(exist_ok=True)
+        (root/"image_encoder/config.json").write_text(json.dumps({"model_type":"clip_vision_model"}))
+        (root/"image_encoder/model.safetensors").write_bytes(zero_safetensors({"vision.weight":[4,4]}))
+        (root/"preprocessor_config.json").write_text(json.dumps({"size":{"shortest_edge":32},"crop_size":{"height":32,"width":32}}))
+        (root/"ip_adapter.safetensors").write_bytes(zero_safetensors({"image_proj.proj.weight":[16,4],"ip_adapter.1.to_k_ip.weight":[4,4]}))
+    record = {"schema_version":1,"conditioning_id":handle,"kind":kind,"artifact_handle":handle,
+        "files":file_digests(root),"source":{"license":"test-only"}}
+    record["digest"] = digest(record)
+    return record
+
+
 class TestBackend:
     backend_id = (
         "diffusers-sdxl"  # Exercises reference protocol semantics, not inference.
@@ -409,6 +430,7 @@ class TestBackend:
         self.audio_facts = None
         self.loaded_options = None
         self.optimizations = tuple(optimizations)
+        self.conditioning = []
 
     @property
     def level(self):
@@ -500,6 +522,14 @@ class TestBackend:
             advertised, unadvertised = fixture_optimizations(self.optimizations)
             caps["optimizations"] = advertised
             caps["unadvertised_optimizations"] = unadvertised
+        if self.level >= 4:
+            from media_engine.conditioning import CAPABILITIES
+            caps["controlnets"] = {"families":["sdxl-base"],"tasks":["text-to-image"],"max_controlnets":1,"scale":[0,2]}
+            caps["conditioning"] = CAPABILITIES
+            caps["clip_skip"] = [1,2]
+            for task in ("text-to-image", "image-to-image", "inpaint"):
+                if task in caps.get("task_parameters", {}):
+                    caps["task_parameters"][task]["parameters"].append("clip_skip")
         return caps
 
     def device_identity(self):
@@ -544,6 +574,9 @@ class TestBackend:
             ],
         )
 
+    def attach_controlnets(self, resolved):
+        self.controlnet = bool(resolved)
+
     def load(self, root, options, adapters=(), family="sdxl-base", device=None):
         self.loads += 1
         self.adapters = [(r["adapter_id"], scale) for r, _a, _w, scale, _l in adapters]
@@ -557,7 +590,12 @@ class TestBackend:
         self.audio_facts = audio_facts(root) if family == "stable-audio-open" else None
         time.sleep(0.02)
 
+    def attach_conditioning(self, resolved):
+        from media_engine.conditioning import summaries
+        self.conditioning = summaries([entry for entry,_ in resolved])
+
     def unload(self):
+        self.conditioning = []
         self.family, self.scale, self.run_device, self.applied_fallbacks = None, None, self.device, []
         self.default_frames = self.audio_facts = None
         return {"allocated_mb": 0, "reserved_mb": 0}
@@ -578,6 +616,8 @@ class TestBackend:
         if request["task"] == "image-to-image":
             # The fixture proves the handle resolves to the uploaded bytes; it does not sample.
             assert Path(image_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        if "reference_image" in request["inputs"]:
+            assert Path(image_path["reference_image"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
         params = request["parameters"]
         total = effective_steps(params, request["task"])
         if request["inputs"]["prompt"] == "uncancellable":
@@ -758,3 +798,26 @@ class TestBackend:
             "samples": length["samples"],
             "peak_allocated_mb": 0,
         }
+
+
+def make_controlnet(root,handle="fixture-controlnet"):
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    (root/"config.json").write_text(json.dumps({"_class_name":"ControlNetModel","addition_embed_type":"text_time"}))
+    (root/"diffusion_pytorch_model.safetensors").write_bytes(zero_safetensors({"controlnet.weight":[4,4]}))
+    record={"schema_version":1,"controlnet_id":handle,"artifact_handle":handle,"family":"sdxl-base","files":file_digests(root),"source":{"license":"test-only stand-in weights"}}
+    record["digest"]=digest(record)
+    return record
+
+
+def make_dit_bundle(root,family):
+    """Protocol fixture only: validated standard DiT layout with stand-in safe tensor headers."""
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    spec=FAMILIES[family]
+    (root/'model_index.json').write_text(json.dumps({'_class_name':spec['pipeline_class'],**{r:list(c) for r,c in spec['approved_classes'].items()}}))
+    for role in spec['roles']:
+        folder=root/role;folder.mkdir(exist_ok=True)
+        (folder/'config.json').write_text('{}')
+        if role in spec['weight_roles']:(folder/'test.safetensors').write_bytes(zero_safetensors({'test.weight':[4,4]}))
+        if role.startswith('tokenizer'):(folder/'tokenizer.json').write_text('{}')
+    (root/'scheduler/scheduler_config.json').write_text(json.dumps({'_class_name':spec['scheduler_class']}))
+    return describe_bundle(root,family,'fixture-'+family,family,{'license':'test-only stand-in weights'})

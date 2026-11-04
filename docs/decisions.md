@@ -452,3 +452,37 @@ replacement fails closed with `catalog_unavailable` rather than retaining stale 
   sequential CPU oracle uses Accelerate's unindexed CPU device because Diffusers constructs
   `cpu:0`, which cannot round-trip a parameter under these pins. Product offload is advertised
   only for CUDA; GPU residency/savings and end-to-end CUDA execution remain hardware gates.
+
+## 2026-11-04 — reference DiT families
+
+Implement FLUX.1-schnell first (`flux-schnell`, reference weights
+`black-forest-labs/FLUX.1-schnell`, Apache-2.0), followed by SD3.5 Medium (`sd35`,
+`stabilityai/stable-diffusion-3.5-medium`, Stability AI Community License).
+The latter license has eligibility and commercial conditions; operators must obtain and
+approve the weights under those terms. Neither family downloads weights while serving.
+Both use approved local Diffusers safetensors bundles, the existing `diffusers-sdxl`
+backend ID, and the explicit `flow-euler` / `flow-match` sampler pair. Schnell uses
+no classifier-free guidance or negative prompt. Native/owned implementations are deferred.
+Tiny randomly initialized CPU models establish executable integration only; production
+weight quality, memory, and RTX 4090 acceptance require the prepared hardware jobs.
+
+### Optional video dependency
+
+`av==14.2.0` is pinned in the `inference-video` extra and lockfile. It owns the
+in-process H.264/yuv420p encoder and decoder used to validate optional MP4 outputs.
+It is never found via PATH and is not required for PNG-frame ZIP output. Encoding
+uses a single libx264 thread, medium preset, CRF18 and exact frame-rate timestamps;
+cancellation removes incomplete output. `mp4.available()` gates advertisement.
+
+### Explicit pixel operations and conditioning preprocessing
+
+Protocol1.4 image-transform executes owned RGB resize (explicit nearest/bilinear),
+crop, pad, composite, and Canny edge extraction. Canny uses a fixed Gaussian5 filter,
+Sobel gradients, four-direction nonmaximum suppression and hysteresis. Thresholds
+are explicit fractions of1020 (the Sobel axis maximum), with0<=low<high<=1.
+There are no depth/pose guesses or model downloads. Depth/pose preprocessors remain
+unavailable until an approved local model implementation is selected. The first
+ControlNet path accepts SDXL ControlNetModel directories and one explicit scale;
+its execution requires a same-size durable control_image. Utility recipes currently
+route through a registered sdxl-base model; the scheduler may load that model even
+though the pixel operation does not run its weights.

@@ -811,3 +811,90 @@ The reference CUDA implementation offers `model` and `sequential` for SDXL, SVD 
 Open. The chosen value participates in load identity and resolved options. Unsupported modes,
 families, compilation/quantization combinations, or an offload request resolving to CPU return
 `unsupported` with field `options.offload`; no offload mode is chosen through `auto`.
+
+## Protocol1.4 generation additions
+
+Existing1.0–1.3 requests keep their feature gates. New capabilities are explicit:
+
+- Reference SDXL accepts sampler/scheduler pairs `euler/euler`,
+  `euler-ancestral/euler`, `dpmpp-2m/karras`, `ddim/ddim`, and `unipc/unipc`.
+  Owned/native SDXL retain Euler. Each execution constructs a fresh scheduler from
+  the verified configuration; no caller's choice changes a later request.
+- Reference `flux-schnell` and `sd35` loaders support text-to-image, image-to-image
+  and inpaint with `flow-euler/flow-match`. Schnell requires guidance0 and no
+  negative prompt. Both use local safetensors components; no remote code executes.
+- `inpaint` requires prompt, durable image and durable mask with identical dimensions,
+  plus image parameters and strength. White masks repaint; black masks preserve.
+  This implementation supports reference SDXL and the two reference DiT families.
+- `image-transform` requires an image and width/height/operation. Resize requires
+  filter nearest or bilinear. Crop/pad use nonnegative x/y, pad optionally RGB
+  background. Composite requires overlay, unchanged base dimensions and optional
+  opacity0..1; clipping is refused. Canny requires unchanged dimensions and explicit
+  threshold_low/high0..1 with low<high. All pixel operations run owned CPU code.
+- `encode_video:true` on image-to-video additionally publishes `video` as video/mp4
+  only when optional_outputs advertises it. The PNG frame ZIP and poster remain.
+- `preview_interval:1..50` opts SDXL into approximate latent RGB progress previews.
+  `previews` advertises the feature. Preview events carry preview_id, MIME type,
+  dimensions, byte size, SHA256, step and kind. Bearer-authenticated
+  GET/v1/previews/preview_<32hex> returns at most128px/1MiB, with at most four
+  retained while executing. Evicted, terminal and previous-session handles are410;
+  previews never become final outputs or reproducibility evidence.
+
+`controlnets:[{controlnet:<descriptor>,scale:0..2}]` is part of load identity,
+reference SDXL only, maximum one, offload none. The descriptor has schema_version1,
+controlnet_id, artifact_handle, family sdxl-base, source metadata, exact files
+config.json and diffusion_pytorch_model.safetensors with raw SHA256s, and digest
+(the canonical descriptor excluding digest). POST/v1/validate accepts protocol plus
+controlnets for registration. A controlled text-to-image execution requires
+inputs.control_image and matching output dimensions; an uncontrolled load refuses it.
+
+File-level ESRGAN handles point to one .safetensors and its .safetensors.json sidecar
+(virtual config.json). LoRA handles may point to one .safetensors. Neighbours are
+excluded. Directory handles still hash their complete approved contents. Hugging Face
+snapshot file symlinks are accepted only for a full40hex snapshots revision when the
+resolved file is inside that same repository's blobs directory; directory links and
+links escaping that boundary remain unsupported.
+
+The bounded text-encoding cache is private to a loaded identity and cleared on reload
+or unload. It is limited to64 entries/32MiB, clones returned tensors, and persists
+neither prompts nor tensors. It is not a benchmark-advertised optimization.
+
+### SDXL conditioning components (1.4)
+
+The reference backend advertises `conditioning` with `max_components:4`, kinds `vae`,
+`textual-inversion`, `ip-adapter`, family `sdxl-base`, and `identity:"load"`. A load may carry
+`conditioning:[{component:{schema_version:1,conditioning_id,kind,artifact_handle,files,source,digest},…}]`.
+`digest` is SHA-256 of the canonical component without its digest, as with adapters; source
+contains optional repository, revision and license strings. The approved catalog directory must
+contain exactly the declared, SHA-256 verified files. Paths, hub names, pickle weights and remote
+code are never accepted from requests. Standalone `POST /v1/validate` with `protocol` and
+`conditioning` verifies components before registration. Earlier minors reject this field.
+
+- `vae`: exactly `config.json` and `diffusion_pytorch_model.safetensors`, describing
+  `AutoencoderKL`. The loaded VAE must have the base model's latent channel count and spatial
+  scale. One replacement per load; no use options.
+- `textual-inversion`: exactly `embedding.safetensors`, containing a finite floating tensor
+  named `embedding` with one vector or at most 16 vectors matching the selected text encoder.
+  The use requires `token` (1–80 non-whitespace characters, absent from that tokenizer) and
+  `encoder` (`text_encoder` or `text_encoder_2`). At most one component per encoder.
+- `ip-adapter`: exactly `ip_adapter.safetensors`, `image_encoder/config.json`,
+  `image_encoder/model.safetensors` and `preprocessor_config.json`. The use requires explicit
+  `scale` in 0–2. The pinned CLIP vision model and processor resize/crop the reference according
+  to that processor configuration. One component per load. Executions are `text-to-image` and
+  must include an uploaded `inputs.reference_image`; it is required iff IP-Adapter is loaded.
+  ControlNet and IP-Adapter cannot share a load in this version.
+
+These components require reference SDXL, `offload:none`, `attention:sdpa`,
+`quantization:none`, and `compile:none`. A different kind, family, backend or combination is
+refused. `loaded_bundle.conditioning` records `conditioning_id`, `kind`, `digest` and the
+supplied scale/token/encoder, making any change a load-identity change. Additional component
+weight estimates are conservative (both VAE versions counted); activations and image encoder
+working memory remain unmeasured. Unloading removes all components and cached embeddings.
+
+`clip_skip` is separately advertised as `[1,2]` for reference SDXL text-to-image,
+image-to-image and inpaint. It is an optional integer parameter in 1.4: default uses the
+penultimate CLIP hidden layer, 1 uses the third-from-last, and 2 the fourth-from-last, matching
+the pinned Diffusers convention. The text-encoding cache includes this selection. It is refused
+on other families/backends. Tiny random-weight CPU tests verify that embedding, VAE, IP-Adapter
+scale and CLIP-layer changes affect output and that reloading restores the original result;
+these tests make no real-weight quality or CUDA claim.

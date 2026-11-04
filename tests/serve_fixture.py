@@ -41,6 +41,9 @@ from fixture import (
     FIXTURE_OPTIMIZATIONS,
     TestBackend,
     make_adapter,
+    make_conditioning,
+    make_controlnet,
+    make_dit_bundle,
     make_audio_bundle,
     make_bundle,
     make_checkpoint,
@@ -141,6 +144,7 @@ handles = {
     "checkpoint": root / "checkpoint",
     "video": root / "video",
     "audio": root / "audio",
+    "fixture-controlnet":root/"controlnet",
 }
 registrations = {
     "fixture": make_bundle(handles["fixture"]),
@@ -148,7 +152,14 @@ registrations = {
     "upscaler": make_esrgan_bundle(handles["upscaler"]),
     "video": make_svd_bundle(handles["video"]),
     "audio": make_audio_bundle(handles["audio"]),
+    "fixture-controlnet":make_controlnet(handles["fixture-controlnet"]),
 }
+for handle,kind in (("conditioning-vae","vae"),("conditioning-ti","textual-inversion"),("conditioning-ip","ip-adapter")):
+    handles[handle] = root / handle
+    registrations[handle] = make_conditioning(handles[handle],kind,handle)
+for family in ("flux-schnell","sd35"):
+    handles[family]=root/family
+    registrations[family]=make_dit_bundle(handles[family],family)
 registrations["converted"] = make_converted(handles["converted"], reference=handles["fixture"])
 make_checkpoint(handles["checkpoint"])
 catalog = {handle: str(path) for handle, path in handles.items()}

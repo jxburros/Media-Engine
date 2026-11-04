@@ -5,11 +5,11 @@ from .contracts import WorkerError
 
 
 def validate(params):
-    allowed = {"width", "height", "operation", "filter", "x", "y", "background", "opacity"}
+    allowed = {"width", "height", "operation", "filter", "x", "y", "background", "opacity", "threshold_low", "threshold_high"}
     if set(params) - allowed or not {"width", "height", "operation"} <= params.keys():
         raise WorkerError(400, "invalid_request", "parameters")
     op = params["operation"]
-    if op not in ("resize", "crop", "pad", "composite"):
+    if op not in ("resize", "crop", "pad", "composite", "canny"):
         raise WorkerError(400, "unsupported", "operation")
     for key in ("width", "height"):
         if type(params[key]) is not int or not 64 <= params[key] <= 2048 or params[key] % 8:
@@ -17,6 +17,12 @@ def validate(params):
     for key in ("x", "y"):
         if key in params and (type(params[key]) is not int or not 0 <= params[key] <= 2048):
             raise WorkerError(400, "invalid_request", key)
+    if op == "canny":
+        low,high=params.get("threshold_low"),params.get("threshold_high")
+        if type(low) not in (int,float) or type(high) not in (int,float) or not 0 <= low < high <= 1 or any(k in params for k in ("filter","x","y","background","opacity")):
+            raise WorkerError(400,"invalid_request","threshold_low")
+    elif "threshold_low" in params or "threshold_high" in params:
+        raise WorkerError(400,"invalid_request","threshold_low")
     if op == "resize":
         if params.get("filter") not in ("nearest", "bilinear") or any(k in params for k in ("x", "y", "background", "opacity")):
             raise WorkerError(400, "invalid_request", "filter")
@@ -34,6 +40,7 @@ def check_dimensions(params, image, overlay=None):
     ow,oh=params["width"],params["height"]
     x,y=params.get("x",0),params.get("y",0)
     op=params["operation"]
+    if op=="canny" and (ow,oh)!=(iw,ih):raise WorkerError(400,"invalid_request","width")
     if op=="crop" and (x+ow>iw or y+oh>ih):raise WorkerError(400,"invalid_request","crop")
     if op=="pad" and (x+iw>ow or y+ih>oh):raise WorkerError(400,"invalid_request","pad")
     if op=="composite" and (overlay is None or (ow,oh)!=(iw,ih) or x+overlay[0]>iw or y+overlay[1]>ih):raise WorkerError(400,"invalid_request","overlay")
@@ -46,6 +53,10 @@ def transform(image, params, overlay=None, cancelled=None):
     ow, oh = params["width"], params["height"]
     op = params["operation"]
     x, y = params.get("x", 0), params.get("y", 0)
+    if op == "canny":
+        check_dimensions(params,(iw,ih))
+        from .canny import generate
+        return generate(image,params["threshold_low"],params["threshold_high"],cancelled)
     if op == "crop" and (x + ow > iw or y + oh > ih):
         raise WorkerError(400, "invalid_request", "crop")
     if op == "pad" and (x + iw > ow or y + ih > oh):

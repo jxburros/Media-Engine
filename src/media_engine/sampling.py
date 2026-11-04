@@ -6,6 +6,7 @@ SAMPLING = (
     ("dpmpp-2m", "karras"),
     ("ddim", "ddim"),
     ("unipc", "unipc"),
+    ("flow-euler", "flow-match"),
 )
 
 

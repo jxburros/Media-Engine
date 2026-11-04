@@ -42,7 +42,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SUITE_VERSION = "media-worker-conformance/1.3"
+SUITE_VERSION = "media-worker-conformance/1.4"
 SECRET = "conformance-secret-prompt-7f3a"
 TERMINAL = {"succeeded", "failed", "cancelled"}
 # The optimization candidates of minor 1.3 and the reasons a worker may give for not offering one.
@@ -383,12 +383,26 @@ class Validation(Section):
                 if not (self.registration or {}).get("audio"):
                     self.skipTest("text-to-audio is advertised but no audio registration was supplied")
                 body = audio_request(self.version, "attempt_v", self.registration["audio"]["bundle_digest"])
+            elif task == "image-transform":
+                status, uploaded, _ = self.client.call("POST", "/v1/inputs", data=make_png(64, 64), headers={"Content-Type": "image/png"})
+                self.assertEqual(status, 201)
+                self.addCleanup(self.client.call, "DELETE", "/v1/inputs/" + uploaded["input_id"])
+                body = {"protocol": self.version, "attempt_id": "attempt_v",
+                        "bundle_digest": self.bundle["bundle_digest"], "task": task,
+                        "inputs": {"image": uploaded["input_id"]},
+                        "parameters": {"width": 64, "height": 64, "operation": "resize", "filter": "nearest"}}
             else:
                 body = self.request("attempt_v")
                 body["task"] = task
-                if task == "image-to-image":
+                if task in ("image-to-image", "inpaint"):
                     body["inputs"]["image"] = "input_" + "0" * 32
                     body["parameters"]["strength"] = 0.5
+                    if task == "inpaint":
+                        for name in ("image", "mask"):
+                            status, uploaded, _ = self.client.call("POST", "/v1/inputs", data=make_png(64, 64), headers={"Content-Type": "image/png"})
+                            self.assertEqual(status, 201)
+                            body["inputs"][name] = uploaded["input_id"]
+                            self.addCleanup(self.client.call, "DELETE", "/v1/inputs/" + uploaded["input_id"])
             value = self.client.json("POST", "/v1/validate", body)
             self.assertEqual(value["task"], task)
             if self.minor() >= 2:

@@ -21,12 +21,12 @@ class SamplingContractTests(unittest.TestCase):
         for pair in SAMPLING:
             body = request(pair)
             self.assertEqual(validate_parameters(body), "text-to-image")
-            validate_sampling(body, {"sampling": advertised(True)})
+            validate_sampling(body, {"tasks": ["text-to-image"], "sampling": advertised(True)})
             if pair != SAMPLING[0]:
                 with self.assertRaises(WorkerError):
                     validate_parameters(request(pair, "media-worker/1.3"))
                 with self.assertRaises(WorkerError):
-                    validate_sampling(body, {"sampling": advertised(False)})
+                    validate_sampling(body, {"tasks": ["text-to-image"], "sampling": advertised(False)})
         with self.assertRaises(WorkerError):
             validate_parameters(request(("euler", "karras")))
 
@@ -41,7 +41,7 @@ class SamplingInferenceTests(unittest.TestCase):
             backend = DiffusersBackend("cpu")
             backend.load(model, {"precision": "float32", "attention": "sdpa", "offload": "none"})
             images = []
-            for i, pair in enumerate((*SAMPLING, SAMPLING[0])):
+            for i, pair in enumerate((*SAMPLING[:-1], SAMPLING[0])):
                 output = root / str(i); output.mkdir()
                 records, _ = backend.generate(request(pair), output, lambda *_: None, threading.Event())
                 self.assertEqual(len(records), 1)

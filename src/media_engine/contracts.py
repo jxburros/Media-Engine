@@ -105,6 +105,22 @@ FAMILIES = {
         "since": 3,
     },
 }
+# Only installed library classes in the two local reference DiT layouts.
+for _name, _pipeline, _transformer in (("flux-schnell", "FluxPipeline", "FluxTransformer2DModel"), ("sd35", "StableDiffusion3Pipeline", "SD3Transformer2DModel")):
+    _classes = {
+        "transformer": ("diffusers", _transformer), "vae": ("diffusers", "AutoencoderKL"),
+        "text_encoder": ("transformers", "CLIPTextModel" if _name == "flux-schnell" else "CLIPTextModelWithProjection"),
+        "text_encoder_2": ("transformers", "T5EncoderModel" if _name == "flux-schnell" else "CLIPTextModelWithProjection"),
+        "tokenizer": ("transformers", "CLIPTokenizer"),
+        "tokenizer_2": ("transformers", "T5TokenizerFast" if _name == "flux-schnell" else "CLIPTokenizer"),
+        "scheduler": ("diffusers", "FlowMatchEulerDiscreteScheduler"),
+    }
+    if _name == "sd35":
+        _classes.update(text_encoder_3=("transformers", "T5EncoderModel"), tokenizer_3=("transformers", "T5TokenizerFast"))
+    FAMILIES[_name] = dict(format="diffusers-safetensors", pipeline="text-to-image", roles=tuple(_classes),
+        weight_roles=tuple(k for k in _classes if k in ("transformer", "vae") or k.startswith("text_encoder")),
+        approved_classes=_classes, tasks=("text-to-image", "image-to-image", "inpaint"), config_file="model_index.json",
+        pipeline_class=_pipeline, scheduler_class="FlowMatchEulerDiscreteScheduler", since=4)
 # 1.0/1.1 names, kept for importers; they describe the sdxl-base family.
 ROLES = FAMILIES["sdxl-base"]["roles"]
 WEIGHT_ROLES = FAMILIES["sdxl-base"]["weight_roles"]
@@ -955,9 +971,9 @@ def validate_parameters(body):
     if task == "text-to-audio":
         return validate_audio(body)
     image_required = ("image", "mask") if task == "inpaint" else (("image",) if task == "image-to-image" else ())
-    strict(body["inputs"], ("prompt",) + image_required, ("negative_prompt",))
+    strict(body["inputs"], ("prompt",) + image_required, ("negative_prompt",) + (("control_image", "reference_image") if level >= 4 and task == "text-to-image" else ()))
     for key, value in body["inputs"].items():
-        if key in ("image", "mask"):
+        if key in ("image", "mask", "control_image", "reference_image"):
             if not isinstance(value, str) or not re.fullmatch(r"input_[a-f0-9]{32}", value):
                 raise WorkerError(400, "invalid_request", key)
             continue
@@ -980,8 +996,10 @@ def validate_parameters(body):
         params,
         ("width", "height", "steps", "guidance", "seed", "sampler", "scheduler")
         + strength_required,
-        (("count",) if task == "text-to-image" and level >= 2 else ()) + (("preview_interval",) if level >= 4 else ()),
+        (("count",) if task == "text-to-image" and level >= 2 else ()) + (("preview_interval", "clip_skip") if level >= 4 else ()),
     )
+    if "clip_skip" in params and (type(params["clip_skip"]) is not int or not 1 <= params["clip_skip"] <= 2):
+        raise WorkerError(400, "invalid_request", "clip_skip")
     if "preview_interval" in params and (type(params["preview_interval"]) is not int or not 1 <= params["preview_interval"] <= 50):
         raise WorkerError(400,"invalid_request","preview_interval")
     for field, low, high, multiple in (
@@ -1133,13 +1151,27 @@ def validate_adapters(adapters, catalog, version, verify=True):
     return resolved
 
 
-def validate_sampling(body, caps):
+def validate_sampling(body, caps, family=None):
     """A valid protocol value still requires explicit backend support."""
     if body.get("task") not in caps.get("tasks", []):
         raise WorkerError(400, "unsupported", "task")
     if body.get("task") not in ("text-to-image", "image-to-image", "inpaint"):
         return
     params = body["parameters"]
+    if "clip_skip" in params and (not caps.get("clip_skip") or family not in (None,"sdxl-base")):
+        raise WorkerError(400, "unsupported", "clip_skip")
+    if "reference_image" in body["inputs"] and (not caps.get("conditioning") or family not in (None,"sdxl-base")):
+        raise WorkerError(400, "unsupported", "reference_image")
     offered = caps.get("sampling", [{"sampler": "euler", "scheduler": "euler"}])
     if {"sampler": params["sampler"], "scheduler": params["scheduler"]} not in offered:
+        raise WorkerError(400, "unsupported", "scheduler")
+
+    from .dit import FAMILIES as DIT_FAMILIES, PAIR
+    pair = {"sampler":params["sampler"], "scheduler":params["scheduler"]}
+    if family in DIT_FAMILIES:
+        if pair != PAIR or "preview_interval" in params:
+            raise WorkerError(400, "unsupported", "scheduler")
+        if family == "flux-schnell" and (params["guidance"] != 0 or body["inputs"].get("negative_prompt")):
+            raise WorkerError(400, "unsupported", "guidance")
+    elif family is not None and pair == PAIR:
         raise WorkerError(400, "unsupported", "scheduler")

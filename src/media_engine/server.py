@@ -234,7 +234,7 @@ class Worker:
 
     def validate_load(self, body, verify=True):
         self.check(body)
-        strict(body, ("protocol", "bundle", "options"), ("adapters", "authorized_fallbacks"))
+        strict(body, ("protocol", "bundle", "options"), ("adapters", "authorized_fallbacks", "controlnets", "conditioning"))
         version = protocol(body)
         level = minor(version)
         bundle = body["bundle"]
@@ -290,16 +290,50 @@ class Worker:
         adapters = validate_adapters(body.get("adapters", []), catalog, version, verify)
         if adapters and family != "sdxl-base":
             raise WorkerError(400, "unsupported", "adapters")
+        from . import controlnet
+        controls = body.get("controlnets", [])
+        if "controlnets" in body and level < 4:
+            raise WorkerError(400, "unsupported", "controlnets")
+        if controls and (not caps.get("controlnets") or family != "sdxl-base" or options["offload"] != "none"):
+            raise WorkerError(400, "unsupported", "controlnets")
+        controlnet.validate(controls, catalog, version, verify)
+        from . import conditioning
+        components = body.get("conditioning", [])
+        if "conditioning" in body and level < 4:
+            raise WorkerError(400, "unsupported", "conditioning")
+        if components and (not caps.get("conditioning") or family != "sdxl-base" or options["offload"] != "none"
+            or options["attention"] != "sdpa" or any(options.get(k,v) != v for k,v in optimize.NEW_OPTIONS.items())):
+            raise WorkerError(400, "unsupported", "conditioning")
+        resolved = conditioning.validate(components, catalog, version, verify)
+        if controls and any(e["component"]["kind"] == "ip-adapter" for e,_ in resolved):
+            raise WorkerError(400, "unsupported", "conditioning")
         optimize.check_load(options, version, caps, family, adapters, authorized)
         plan = self.backend.plan(root, options, adapters, family, authorized)
         if options["offload"] != "none" and not plan["device"].startswith("cuda:"):
             raise WorkerError(400, "unsupported", "options.offload")
         return root, adapters, family, plan
 
-    def estimate(self, root, plan, adapters, family, level):
+    def estimate(self, root, plan, adapters, family, level, body=None):
         estimate = self.backend.estimate(
             root, plan["options"], adapters, family, plan["device"]
         )
+        if body and (body.get("controlnets") or body.get("conditioning")):
+            from .contracts import safetensors_header
+            from .backend import PRECISION_BYTES
+            import math
+            extra_parameters = 0
+            catalog = self.current_catalog()
+            records = [e["controlnet"] for e in body.get("controlnets", [])] + [e["component"] for e in body.get("conditioning", [])]
+            for record in records:
+                component_root = Path(catalog[record["artifact_handle"]])
+                for name in record["files"]:
+                    if name.endswith(".safetensors"):
+                        header = safetensors_header(component_root / name)
+                        extra_parameters += sum(math.prod(v["shape"]) for k,v in header.items() if k != "__metadata__")
+            extra_mb = math.ceil(extra_parameters * PRECISION_BYTES[plan["options"]["precision"]] / 1024**2)
+            estimate = {**estimate, "value_mb": estimate["value_mb"] + extra_mb,
+                "additional_components_mb": extra_mb,
+                "uncertainty": str(estimate.get("uncertainty", "")) + "; additional component weights included conservatively (VAE counts both versions); activation and image-encoder working memory excluded"}
         notes = optimize.estimate_note(plan["options"])
         if notes:
             estimate = {**estimate, "optimizations": notes}
@@ -319,7 +353,7 @@ class Worker:
         level = minor(body["protocol"])
         result = {
             "valid": True,
-            "memory_estimate": self.estimate(root, plan, adapters, family, level),
+            "memory_estimate": self.estimate(root, plan, adapters, family, level, body),
             "adapters": [
                 {"adapter_id": r["adapter_id"], "layout": layout}
                 for r, _a, _w, _s, layout in adapters
@@ -374,8 +408,14 @@ class Worker:
                     if action == "load":
                         level = minor(body["protocol"])
                         root, adapters, family, plan = self.validate_load(body)
-                        estimate = self.estimate(root, plan, adapters, family, level)
+                        estimate = self.estimate(root, plan, adapters, family, level, body)
                         self.backend.load(root, plan["options"], adapters, family, plan["device"])
+                        if body.get("controlnets"):
+                            from . import controlnet
+                            self.backend.attach_controlnets(controlnet.validate(body["controlnets"], self.current_catalog(), body["protocol"]))
+                        if body.get("conditioning"):
+                            from . import conditioning
+                            self.backend.attach_conditioning(conditioning.validate(body["conditioning"], self.current_catalog(), body["protocol"]))
                         self.backend.applied_fallbacks = plan["applied_fallbacks"]
                         facts = family_facts(root, family)
                         with self.lock:
@@ -394,6 +434,12 @@ class Worker:
                                 ],
                                 "memory_estimate": estimate,
                             }
+                            if body.get("conditioning"):
+                                from .conditioning import summaries
+                                self.loaded["conditioning"] = summaries(body["conditioning"])
+                            if body.get("controlnets"):
+                                self.loaded["controlnets"] = [{"controlnet_id": e["controlnet"]["controlnet_id"],
+                                    "digest": e["controlnet"]["digest"], "scale": e["scale"]} for e in body["controlnets"]]
                             if self.speaks_1_2:
                                 self.loaded.update(
                                     family=family,
@@ -532,7 +578,7 @@ class Worker:
         with self.lock:
             self.input_record(input_id)
             if any(
-                any(e["request"]["inputs"].get(name) == input_id for name in ("image", "mask", "control_image", "overlay"))
+                any(e["request"]["inputs"].get(name) == input_id for name in ("image", "mask", "control_image", "reference_image", "overlay"))
                 and e["state"] not in TERMINAL
                 for e in self.executions.values()
             ):
@@ -547,6 +593,21 @@ class Worker:
         if task not in FAMILIES[self.loaded_family]["tasks"]:
             raise WorkerError(400, "unsupported", "task")
         params = body["parameters"]
+        has_reference = "reference_image" in body["inputs"]
+        has_ip = any(e["kind"] == "ip-adapter" for e in self.loaded.get("conditioning", []))
+        if has_ip != has_reference or has_reference and task != "text-to-image":
+            raise WorkerError(400, "invalid_request", "reference_image")
+        if has_reference and body["inputs"]["reference_image"] not in self.inputs:
+            raise WorkerError(404, "input_not_found", "reference_image")
+        has_control = "control_image" in body["inputs"]
+        if bool(self.loaded.get("controlnets")) != has_control or has_control and task != "text-to-image":
+            raise WorkerError(400, "invalid_request", "control_image")
+        if has_control:
+            record = self.inputs.get(body["inputs"]["control_image"])
+            if record is None:
+                raise WorkerError(404, "input_not_found", "control_image")
+            if (record["width"], record["height"]) != (params["width"], params["height"]):
+                raise WorkerError(400, "invalid_request", "control_image")
         if task == "image-to-video":
             if [params["width"], params["height"]] not in self.loaded_facts["video_sizes"]:
                 # Only sizes the bundle advertises; the input is never resized to fit one.
@@ -600,7 +661,7 @@ class Worker:
         self.check(body)
         task = validate_parameters(body)
         caps = self.capabilities()
-        validate_sampling(body, caps)
+        validate_sampling(body, caps, self.loaded_family)
         if "preview_interval" in body["parameters"] and not caps.get("previews"):
             raise WorkerError(400, "unsupported", "preview_interval")
         if body["parameters"].get("encode_video") and "video" not in caps.get("task_parameters", {}).get("image-to-video", {}).get("optional_outputs", []):
@@ -625,7 +686,7 @@ class Worker:
         self.check(body)
         task = validate_parameters(body)
         caps = self.capabilities()
-        validate_sampling(body, caps)
+        validate_sampling(body, caps, self.loaded_family)
         if "preview_interval" in body["parameters"] and not caps.get("previews"):
             raise WorkerError(400, "unsupported", "preview_interval")
         if body["parameters"].get("encode_video") and "video" not in caps.get("task_parameters", {}).get("image-to-video", {}).get("optional_outputs", []):
@@ -646,6 +707,10 @@ class Worker:
             if task in ("inpaint", "image-transform"):
                 self.check_image_geometry(body, task)
             image_path = None
+            if "reference_image" in body["inputs"]:
+                image_path = {"reference_image": self.directory / "inputs" / (body["inputs"]["reference_image"] + ".png")}
+            if "control_image" in body["inputs"]:
+                image_path = {"control_image": self.directory / "inputs" / (body["inputs"]["control_image"] + ".png")}
             if task in ("image-to-image", "upscale", "image-to-video", "inpaint", "image-transform"):
                 record = self.inputs.get(body["inputs"]["image"])
                 if not record:
@@ -1126,6 +1191,22 @@ def create_server(worker, token, port=7811, bind=DEFAULT_BIND, tls=None, ownersh
                     body = self.body()
                     if "bundle" in body:
                         return self.respond(200, worker.validation(body))
+                    for field in ("controlnets", "conditioning"):
+                        if field in body:
+                            worker.check(body)
+                            strict(body, ("protocol", field))
+                            version = protocol(body)
+                            if minor(version) < 4 or not worker.capabilities().get(field):
+                                raise WorkerError(400, "unsupported", field)
+                            if field == "controlnets":
+                                from . import controlnet
+                                entries = controlnet.validate(body[field], worker.current_catalog(), version)
+                                summaries = [{"controlnet_id": r["controlnet_id"], "digest": r["digest"], "scale": scale} for r,_,scale in entries]
+                            else:
+                                from . import conditioning
+                                conditioning.validate(body[field], worker.current_catalog(), version)
+                                summaries = conditioning.summaries(body[field])
+                            return self.respond(200, {"valid": True, field: summaries})
                     if "adapters" in body:
                         worker.check(body)
                         strict(body, ("protocol", "adapters"))

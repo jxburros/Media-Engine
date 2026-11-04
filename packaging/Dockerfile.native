@@ -12,6 +12,7 @@ WORKDIR /source
 COPY native native
 COPY release.json release.json
 COPY packaging/check-linked-libraries.py packaging/licenses.py packaging/
+COPY packaging/notices packaging/notices
 RUN --mount=type=secret,id=proxy_ca \
     if [ -f /run/secrets/proxy_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/proxy_ca SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
     cargo build --release --locked --manifest-path native/Cargo.toml --features cuda && \

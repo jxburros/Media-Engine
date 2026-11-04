@@ -32,6 +32,21 @@ class FileCatalogTests(unittest.TestCase):
             self.assertEqual(bundle_path(bundle, {'upscaler':str(file)}), file)
             with self.assertRaises(WorkerError): bundle_path(bundle, {'upscaler':str(file)}, version='media-worker/1.3')
 
+    def test_hugging_face_snapshot_links_are_confined_to_its_blob_store(self):
+        from media_engine.contracts import approved_snapshot_link
+        with tempfile.TemporaryDirectory() as temp:
+            repo=Path(temp)/'models--approved--model'
+            snapshot=repo/'snapshots'/('a'*40);snapshot.mkdir(parents=True)
+            blobs=repo/'blobs';blobs.mkdir()
+            blob=blobs/'hash';blob.write_bytes(b'weights')
+            link=snapshot/'model.safetensors';link.symlink_to(blob)
+            self.assertTrue(approved_snapshot_link(link,snapshot))
+            outside=Path(temp)/'other';outside.write_bytes(b'outside')
+            link.unlink();link.symlink_to(outside)
+            self.assertFalse(approved_snapshot_link(link,snapshot))
+            link.unlink();link.symlink_to(blobs,target_is_directory=True)
+            self.assertFalse(approved_snapshot_link(link,snapshot))
+
 
 @unittest.skipUnless(HAVE_INFERENCE, 'inference extra required')
 class InpaintInferenceTests(unittest.TestCase):
