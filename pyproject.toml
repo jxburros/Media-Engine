@@ -3,13 +3,15 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "media-engine"
-version = "1.0.0"
-description = "Local, single-flight media inference worker (SDXL, ESRGAN upscaling, SVD image-to-video, Stable Audio Open text-to-audio) for Media Runtime"
+version = "1.1.0"
+description = "Local, single-flight image, video and audio inference worker for Media Runtime"
 requires-python = ">=3.11,<3.13"
 license = {file = "LICENSE"}
 readme = "README.md"
 dependencies = []
 [project.optional-dependencies]
+# Test-only schema verification; neither serving nor release images install this extra.
+validation = ["jsonschema==4.25.1"]
 # The owned pipeline (owned-sdxl) and the esrgan upscaler: model classes, tensors, safetensors.
 inference-owned = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "safetensors==0.5.3", "numpy==2.2.3"]
 # The full reference set (diffusers-sdxl), a superset of inference-owned.
@@ -17,6 +19,8 @@ inference = ["torch==2.6.0", "diffusers==0.32.2", "transformers==4.49.0", "accel
 # text-to-audio (stable-audio-open, reference backend): the family's scheduler imports torchsde.
 # Installed alongside `inference`; it adds nothing the other families need.
 inference-audio = ["torchsde==0.2.6"]
+# Optional, in-process H.264 encoder; no encoder executable lookup.
+inference-video = ["av==14.2.0"]
 # Optimization options (phase E5): int8 weight-only quantization (torchao). bfloat16, flash
 # attention (PyTorch's own SDPA kernel) and compile (inductor) need nothing beyond torch.
 # Installed alongside `inference` or `inference-owned`; nothing is advertised without a benchmark.

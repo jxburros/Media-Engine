@@ -78,7 +78,8 @@ def activation_bytes(config, side, bytes_per_element):
 
 def read_config(root):
     try:
-        return validate_config(json.loads((Path(root) / "config.json").read_text()))
+        path = Path(str(root) + ".json") if Path(root).is_file() else Path(root) / "config.json"
+        return validate_config(json.loads(path.read_text()))
     except (OSError, ValueError):
         return None
 

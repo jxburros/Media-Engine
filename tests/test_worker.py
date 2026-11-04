@@ -410,12 +410,13 @@ class ProtocolTwelveTests(unittest.TestCase):
         self.assertEqual(
             {l["families"][0]: l["format"] for l in caps["loaders"]},
             {"sdxl-base": "diffusers-safetensors", "esrgan": "single-file-safetensors", "svd": "diffusers-safetensors",
-             "stable-audio-open": "diffusers-safetensors"},
+             "stable-audio-open": "diffusers-safetensors", "flux-schnell": "diffusers-safetensors",
+             "sd35": "diffusers-safetensors"},
         )
         self.assertEqual(caps["task_parameters"]["text-to-image"]["outputs"], ["image"])
         self.assertEqual(caps["limits"]["count"], [1, 4])
         self.load()
-        self.assertEqual(self.worker.info()["loaded_bundle"]["tasks"], ["text-to-image", "image-to-image"])
+        self.assertEqual(self.worker.info()["loaded_bundle"]["tasks"], ["text-to-image", "image-to-image", "inpaint", "image-transform"])
         record = self.worker.store_input(make_png(64, 64))
         wrong = self.upscale_request(record["input_id"])
         wrong["bundle_digest"] = self.bundle["bundle_digest"]
@@ -619,7 +620,7 @@ class ProtocolTwelveTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 404)
             self.assertEqual(json.load(caught.exception)["error"]["code"], "output_not_found")
             info = json.load(get("/v1/info"))
-            self.assertEqual(info["protocol"], "media-worker/1.3")
+            self.assertEqual(info["protocol"], "media-worker/1.4")
             self.assertIn("device_identity", info)
         finally:
             server.shutdown()
@@ -680,7 +681,11 @@ class ProtocolThirteenTests(unittest.TestCase):
         self.assertIn("image-to-video", caps["tasks"])
         video = caps["task_parameters"]["image-to-video"]
         self.assertEqual(video["outputs"], ["frames", "poster"])
-        self.assertEqual(video["output_formats"], {"frames": "application/zip", "poster": "image/png"})
+        from media_engine.mp4 import available
+        formats = {"frames": "application/zip", "poster": "image/png"}
+        if available():
+            formats["video"] = "video/mp4"
+        self.assertEqual(video["output_formats"], formats)
         self.assertEqual(video["defaults"], {"fps": 7, "motion": 127, "noise_augmentation": 0.02, "decode_chunk": 8})
         self.assertEqual(video["stages"], ["encoding", "sampling", "decoding", "packaging", "saving"])
         # The fixture advertises the sizes its video bundle serves (a real backend, unloaded,

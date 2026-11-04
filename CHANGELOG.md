@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0 — 2026-11-04
+
+Container builds pin pip 25.2 and use bounded resumable downloads for large CUDA
+wheels. Incomplete transfers retry without relaxing the frozen SHA-256 checks.
+
+Protocol 1.4 adds named sampling pairs, FLUX.1-schnell/SD3.5 image generation and
+inpainting, explicit pixel operations/Canny, ControlNet, VAE/textual-inversion/
+IP-Adapter conditioning, CLIP skip, previews and optional pinned H.264 MP4 encoding.
+Verified load identities include components, scales and options; memory admission
+accounts for resident components and authorized fallbacks. Add explicit CUDA
+CPU-offload modes, bounded text-encoding caching and offline ESRGAN/Kohya conversion.
+
+Native remains protocol 1.3 and gains mutual TLS, authenticated metrics, bounded
+HTTP parsing, confined Hugging Face snapshots and individual LoRA files. CI validates
+frozen dependencies, schemas, tiny-weight CPU inference, native conformance/oracles,
+CUDA compilation, packaging and previous-Runtime compatibility. Shared release
+workflows and configurable real-weight GPU evidence jobs are prepared.
+
+CPU/native tests and CUDA compilation pass; see [the compatibility record](docs/compatibility.md)
+for immutable tested commits and job links. No GPU inference or production-weight
+quality/benchmark result is claimed. Production releases remain a manual operation.
+
 ## 1.0.0 — 2026-10-31
 
 The owned native engine (phase E6). Protocol unchanged (`media-worker/1.0`–`1.3`); the Python

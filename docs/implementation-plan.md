@@ -1,5 +1,7 @@
 # Media Engine implementation plan — deferred capabilities
 
+The original phase map below is historical. The 1.1.0 development PR completes the remaining integration work and implements the later review backlog; see [delivery status](delivery-status.md) for current validation and outstanding operator acceptance.
+
 This plan turns [engine-spec.md](../engine-spec.md) revision 0.2.0 into ordered, releasable
 increments of the Python worker. It covers every capability the specification marks "Specified
 below": multiple outputs, upscaling, loader capabilities and single-file conversion, automatic

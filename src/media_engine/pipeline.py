@@ -216,6 +216,9 @@ class OwnedPipelineBackend(TorchBackend):
 
     # ----- conditioning ----------------------------------------------------------------------
     def encode_text(self, text):
+        return self.text_cache.get(["owned", text], lambda: self._encode_text(text))
+
+    def _encode_text(self, text):
         import torch
 
         c = self.components
@@ -375,6 +378,8 @@ class OwnedPipelineBackend(TorchBackend):
                             conditional - unconditional
                         )
                     latents = scheduler.step(prediction, t, latents, return_dict=False)[0]
+                    from .previews import emit_latents
+                    emit_latents(latents, emit, params.get("preview_interval"), index + 1)
                     emit(
                         "progress",
                         {

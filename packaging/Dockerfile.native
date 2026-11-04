@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.99.1-bookworm AS rust-toolchain
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS native-build
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+# RTX 4090 target; compilation does not probe or require a GPU.
+ARG CUDA_COMPUTE_CAP=89
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates build-essential python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /source
+COPY native native
+COPY release.json release.json
+COPY packaging/check-linked-libraries.py packaging/licenses.py packaging/
+COPY packaging/notices packaging/notices
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/proxy_ca SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
+    cargo build --release --locked --manifest-path native/Cargo.toml --features cuda && \
+    python3 packaging/check-linked-libraries.py --cuda native/target/release/media-engine-native && \
+    python3 packaging/licenses.py --kind rust --cuda --output /source/THIRD-PARTY-LICENSES.txt
+# The driver is absent here: execute this binary only in the separate GPU job.
+FROM scratch AS native-artifact
+COPY --from=native-build /source/native/target/release/media-engine-native /media-engine-native
+COPY --from=native-build /source/THIRD-PARTY-LICENSES.txt /THIRD-PARTY-LICENSES.txt

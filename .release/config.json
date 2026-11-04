@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "bumpPolicy": "every-main-change",
+  "apps": {
+    "media-engine": {
+      "tagPrefix": "v",
+      "paths": [
+        "**"
+      ],
+      "versionFiles": [
+        {
+          "path": "pyproject.toml",
+          "format": "text",
+          "pattern": "^version = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "src/media_engine/contracts.py",
+          "format": "text",
+          "pattern": "^WORKER_VERSION = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "native/Cargo.toml",
+          "format": "text",
+          "pattern": "^version = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "native/sdxl/Cargo.toml",
+          "format": "text",
+          "pattern": "^version = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "native/Cargo.lock",
+          "format": "text",
+          "pattern": "^name = \"media-engine-native\"\\nversion = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "native/Cargo.lock",
+          "format": "text",
+          "pattern": "^name = \"media-engine-sdxl\"\\nversion = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "uv.lock",
+          "format": "text",
+          "pattern": "^name = \"media-engine\"\\nversion = \"(?<version>[^\"\\r\\n]+)\"$"
+        }
+      ],
+      "notes": "CHANGELOG.md",
+      "notesSection": true,
+      "assets": [
+        "media-engine-native-v{version}-linux-x64.tar.gz",
+        "media-engine-native-v{version}-linux-x64-cuda.tar.gz",
+        "media_engine-{version}-py3-none-any.whl",
+        "uv.lock",
+        "media-engine-python-v{version}-linux-x64-cuda-image.tar.gz"
+      ],
+      "security": "standard",
+      "checksumFile": "checksums.txt",
+      "legacyLatest": true
+    }
+  }
+}

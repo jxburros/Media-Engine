@@ -1,5 +1,12 @@
 # Implementation decisions and dependency ledger
 
+The container build stage pins `pip==25.2` for Content-Length-aware download
+resumption. Both connection and resume retries are bounded at five, with a 60-second
+socket timeout. This addresses truncated large CUDA-wheel transfers that pip 25.0.1
+reported as hash mismatches. The frozen requirements still require SHA-256 matches;
+genuine content mismatches fail. Pip is build tooling, not an inference dependency,
+and these retry settings do not propagate to the runtime image.
+
 Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 `docs/decisions.md`. This file holds the dependency ledger the dependency policy in
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
@@ -381,7 +388,7 @@ Optional and not yet accepted: one pinned MP4 encoder wheel for the `video` outp
 lossless frame archive is the baseline (shipped in 0.6.0) and this entry is added only on
 evidence of need.
 
-## Ledger — native engine (1.0.0)
+## Ledger — native engine (1.1.0)
 
 | Crate        | Version | Why it is not owned code                                                            | Brings (transitively)                                   |
 | ------------ | ------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------- |
@@ -389,7 +396,110 @@ evidence of need.
 | png          | 0.18.1  | Deflate-backed PNG encoding and decoding                                            | fdeflate, flate2, miniz_oxide, crc32fast, bitflags       |
 
 Not yet added, each with the increment that needs it: cudarc (the first custom CUDA kernel),
-rustls (network mode), a `tokenizers` crate (the T5 tokenizer, only when stable-audio-open
+a `tokenizers` crate (the T5 tokenizer, only when stable-audio-open
 reaches the native engine). Owned: the HTTP/1.1 and SSE server, JSON, SHA-256, the CLIP BPE
 tokenizer, seeded noise, the SDXL models and scheduler, LoRA merging, validation, bundle
 verification; WAV and ZIP writers arrive with the families that need them.
+
+## Review decisions — 2026-11-04
+
+The maintainer approved explicit pixel operations in Engine, optional pinned MP4 encoding,
+retaining existing backend IDs, Linux x64 as the initial artifact target, and delivering new
+families through the reference backend before adding native video/audio loops or custom kernels.
+The paired Runtime may offer explicit pinned model acquisition and signed operator-allowlisted
+completion webhooks; the Engine serving process remains offline and does neither.
+
+An offline ComfyUI subset translator produces normal validated Runtime recipes; it does not
+execute ComfyUI nodes or arbitrary Python. Existing spec/protocol/decisions documents remain the
+source of truth, with a concise AGENTS.md recording contributor constraints. Shared release
+infrastructure establishes version consistency and manual dry-run-first publication.
+
+GPU access was not supplied: the maintainer requested prepared GPU validation jobs. A checked-in
+workflow is not hardware evidence. No optimization is advertised on the basis of an unrun job.
+
+
+## 1.1.0 serving boundaries and native TLS
+
+Both servers expose bearer-authenticated Prometheus text at `/metrics`. Execution counters
+survive record release for the lifetime of the worker process. Labels are validated task,
+terminal state and a fixed phase set; prompts, model paths, identifiers and credentials never
+become labels. Phase/load durations use monotonic clocks. The peak device memory gauge is
+omitted when the backend cannot measure it (including the current native backend).
+
+The loopback HTTP trust boundary rejects browser Origin headers and Host authorities other
+than `localhost` or a loopback IP literal; it never resolves arbitrary DNS names. JSON bodies
+are capped at 4 MiB and 64 nested containers before parsing. HTTP headers are bounded to 64
+fields/64 KiB and request lines to 8 KiB; duplicate framing/authentication headers and all
+Transfer-Encoding requests are refused. PNG bodies retain the configured upload limit.
+
+Native remote workers use TLS 1.3 with mandatory client-certificate verification, in addition
+to bearer authentication. Certificate/key/CA material is read once at startup, the server leaf
+fingerprint is reported, and partial TLS configurations or plaintext non-loopback binds fail
+before listening. No custom cryptographic code is introduced. Catalog snapshots are reread
+before validation/loading, allowing an operator to atomically replace approved handles; a bad
+replacement fails closed with `catalog_unavailable` rather than retaining stale authorization.
+
+| Crate | Version | Native use and justification |
+| --- | --- | --- |
+| rustls | 0.23.35 | TLS 1.3, peer authentication and encrypted records; security-critical TLS is not owned code. `ring` supplies cryptographic primitives; exact transitive versions/checksums are in Cargo.lock. Default AWS-LC and TLS1.2 features are disabled. |
+| rustls-pemfile | 2.2.0 | Parses operator PEM certificates/private keys into rustls types; isolated in `native/src/tls.rs`. |
+
+## Explicit conversions and CPU offload — 1.1.0
+
+- Real-ESRGAN `.pth` migration is an operator-only subprocess using PyTorch's restricted
+  `weights_only=True` loader. No pickle allow-list, serving-time conversion or new dependency
+  is introduced. The operator supplies the exact RRDBNet configuration; every tensor name and
+  shape must match. Kohya conversion uses the approved reference's actual linear module names,
+  preserves alpha, and refuses unsupported layouts rather than guessing underscore mappings.
+- Explicit reference-backend CPU offload uses the already pinned Accelerate 1.4.0 and Diffusers
+  0.32.2 APIs. This does not add Accelerate to the owned or native dependency sets. Hook setup
+  occurs before whole-pipeline GPU placement. Offload is a protocol 1.4 load identity, never an
+  automatic fallback. Compilation/quantization combinations are refused pending validation.
+- CPU tests compare actual Accelerate-hook output with the non-offloaded tiny pipeline. The
+  sequential CPU oracle uses Accelerate's unindexed CPU device because Diffusers constructs
+  `cpu:0`, which cannot round-trip a parameter under these pins. Product offload is advertised
+  only for CUDA; GPU residency/savings and end-to-end CUDA execution remain hardware gates.
+
+## 2026-11-04 — reference DiT families
+
+Implement FLUX.1-schnell first (`flux-schnell`, reference weights
+`black-forest-labs/FLUX.1-schnell`, Apache-2.0), followed by SD3.5 Medium (`sd35`,
+`stabilityai/stable-diffusion-3.5-medium`, Stability AI Community License).
+The latter license has eligibility and commercial conditions; operators must obtain and
+approve the weights under those terms. Neither family downloads weights while serving.
+Both use approved local Diffusers safetensors bundles, the existing `diffusers-sdxl`
+backend ID, and the explicit `flow-euler` / `flow-match` sampler pair. Schnell uses
+no classifier-free guidance or negative prompt. Native/owned implementations are deferred.
+Tiny randomly initialized CPU models establish executable integration only; production
+weight quality, memory, and RTX 4090 acceptance require the prepared hardware jobs.
+
+### Optional video dependency
+
+`av==14.2.0` is pinned in the `inference-video` extra and lockfile. It owns the
+in-process H.264/yuv420p encoder and decoder used to validate optional MP4 outputs.
+It is never found via PATH and is not required for PNG-frame ZIP output. Encoding
+uses a single libx264 thread, medium preset, CRF18 and exact frame-rate timestamps;
+cancellation removes incomplete output. `mp4.available()` gates advertisement.
+
+### Explicit pixel operations and conditioning preprocessing
+
+Protocol 1.4 image-transform executes owned RGB resize (explicit nearest/bilinear),
+crop, pad, composite, and Canny edge extraction. Canny uses a fixed Gaussian 5 filter,
+Sobel gradients, four-direction nonmaximum suppression and hysteresis. Thresholds
+are explicit fractions of 1020 (the Sobel axis maximum), with 0 <= low < high <= 1.
+There are no depth/pose guesses or model downloads. Depth/pose preprocessors remain
+unavailable until an approved local model implementation is selected. The first
+ControlNet path accepts SDXL ControlNetModel directories and one explicit scale;
+its execution requires a same-size durable control_image. Utility recipes currently
+route through a registered sdxl-base model; the scheduler may load that model even
+though the pixel operation does not run its weights.
+
+### Schema validation dependency
+
+`jsonschema==4.25.1` is a test-only `validation` extra for Draft 2020-12 behavioral
+checks of the shared worker schema. Serving and release images do not install it.
+Its supporting packages are frozen in `uv.lock`: attrs 26.1.0 (validated attribute
+classes), jsonschema-specifications 2025.9.1 (standard metaschemas), referencing
+0.37.0 (reference resolution), and rpds-py 2026.9.1 (persistent data structures).
+CI installs the locked graph with hashes and runs schema tests without inference
+extras; it does not merely skip validation when the validator is unavailable.

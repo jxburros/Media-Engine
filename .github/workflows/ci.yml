@@ -1,0 +1,140 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - name: Install frozen schema-validation tools without inference dependencies
+        run: |
+          python -m pip install uv==0.9.5
+          uv export --frozen --no-dev --extra validation --no-emit-project > "$RUNNER_TEMP/validation-requirements.txt"
+          python -m pip install --require-hashes -r "$RUNNER_TEMP/validation-requirements.txt"
+      - name: Protocol, fixture conformance and mutual TLS
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+  previous-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MEDIA_ENGINE_REPO: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jxburros/Media-Runtime
+          # Previous Runtime 0.10.0, before native acceptance and protocol 1.4.
+          ref: ff7f6ef27b6b5b07c5ebaef387005becd741ffd2
+          path: previous-runtime
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.13'
+          cache-dependency-path: previous-runtime/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - name: Record tested revisions
+        run: |
+          printf 'Engine: `%s`\n\nPrevious Runtime: `%s`\n' "$(git rev-parse HEAD)" "$(git -C previous-runtime rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          test -f "$MEDIA_ENGINE_REPO/tests/serve_fixture.py"
+      - name: Previous Runtime accepts current Engine through its negotiated protocol
+        working-directory: previous-runtime
+        run: go test -race ./...
+  inference-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: engine-native-${{ runner.os }}-1.99.1-${{ hashFiles('native/Cargo.lock') }}
+      - name: Install pinned inference extras with CPU torch
+        run: |
+          python -m pip install uv==0.9.5
+          uv export --frozen --no-dev --extra inference --extra inference-audio --extra inference-optimize --extra inference-video --no-hashes --no-emit-project > "$RUNNER_TEMP/engine-constraints.txt"
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -c "$RUNNER_TEMP/engine-constraints.txt" -e '.[inference,inference-audio,inference-optimize,inference-video]'
+      - run: cargo test --workspace --locked --manifest-path native/Cargo.toml
+      - run: cargo build --release --locked --manifest-path native/Cargo.toml
+      - name: Real CPU inference, native conformance and Python oracle
+        env:
+          MEDIA_ENGINE_NATIVE: ${{ github.workspace }}/native/target/release/media-engine-native
+        run: python -m unittest discover -s tests -v
+      - name: Prepare Runtime acceptance bundles offline
+        run: python tests/prepare_runtime.py "$RUNNER_TEMP/runtime-bundles"
+      - name: Smoke-test CPU release packaging
+        run: |
+          python packaging/check-linked-libraries.py native/target/release/media-engine-native
+          bash packaging/package-native.sh native/target/release/media-engine-native cpu dist
+          python -m pip install build==1.2.2.post1
+          bash packaging/package-python.sh dist
+  cuda-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compile native CUDA and check dynamic dependencies (no GPU required)
+        run: docker buildx build --file packaging/Dockerfile.native --target native-build .
+  python-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build locked Python CUDA image and probe as its unprivileged user
+        run: |
+          docker buildx build --load --tag media-engine:ci .
+          test "$(docker image inspect --format '{{.Config.User}}' media-engine:ci)" = '10001:10001'
+          docker run --rm --network none media-engine:ci --probe
+  owned-dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - name: Install only the owned inference dependency set
+        run: |
+          python -m pip install uv==0.9.5
+          uv export --frozen --no-dev --extra inference-owned --no-hashes --no-emit-project > "$RUNNER_TEMP/engine-constraints.txt"
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -c "$RUNNER_TEMP/engine-constraints.txt" -e '.[inference-owned]'
+      - name: Exercise the owned pipeline without reference-only extras
+        run: PYTHONPATH=src:tests python -m unittest test_inference.OwnedInferenceTests -v

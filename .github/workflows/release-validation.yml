@@ -1,0 +1,12 @@
+name: Release validation
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  versions:
+    uses: JX-Holdings-LLC/release-infrastructure/.github/workflows/validate.yml@d7f42f9910c075ef34915fa2b95cf28dd2be534a
+    with:
+      toolkit-ref: d7f42f9910c075ef34915fa2b95cf28dd2be534a

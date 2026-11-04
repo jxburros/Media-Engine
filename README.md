@@ -1,32 +1,31 @@
 # Media Engine
 
 An independently installed, offline media inference worker for [Media Runtime](https://github.com/jxburros/Media-Runtime)
-or another local supervisor. It implements `media-worker/1.3` (and still serves 1.0, 1.1 and 1.2
-callers unchanged) over authenticated loopback HTTP (or, in network mode, mutual TLS for a
-supervisor on another host), with asynchronous load/unload, a warm pipeline, one
-execution slot, SDXL text-to-image (up to four images per execution) and image-to-image, ESRGAN
-upscaling, Stable Video Diffusion image-to-video as a lossless frame archive, Stable Audio Open
-text-to-audio as 16-bit PCM WAV, real sampling/tile/frame callbacks, cooperative cancellation, resumable SSE, opaque
-input/output handles, header-based memory estimates, automatic precision with caller-authorized
-fallbacks, device identity, an offline single-file checkpoint converter, and explicit optimization
-options (bfloat16, FlashAttention, int8 weight-only quantization, inductor compilation) that are
-advertised only once a benchmark on the device class is cited.
+or another supervisor. Engine 1.1.0's Python workers serve `media-worker/1.0`–`1.4`; the
+standalone native worker serves 1.0–1.3. Requests use authenticated loopback HTTP or mutual TLS
+in explicit network mode. Every process has one device, one loaded identity and one execution
+slot, with genuine progress, cooperative cancellation, resumable SSE and temporary verified outputs.
 
-The authoritative product scope is [engine-spec.md](engine-spec.md); the deferred capabilities it
-specifies are sequenced in [docs/implementation-plan.md](docs/implementation-plan.md). This release delivers two of
-its backend stages behind one protocol: the **reference worker** (`diffusers-sdxl`, the complete
-Diffusers pipelines execute) and the **owned pipeline** (`owned-sdxl`, this project assembles the
-components and runs the denoising loop itself). The `esrgan` upscaler network is engine code on
-both. The `svd` image-to-video and `stable-audio-open` text-to-audio families run on the reference
-backend only. Native engines, owned video and audio loops and custom GPU kernels are future
-stages; they are not advertised as capabilities. Engine 0.8.0 advertises no optimization yet: its
-benchmark index is empty until one is recorded on the reference hardware.
+Three backend IDs remain stable:
 
-Engine 1.0.0 adds the third stage, the **owned native engine** (`native-sdxl`, `ownership:
-engine`): a separately built Rust executable in [native/](native/README.md) that implements the
-same protocol for the `sdxl-base` family with its own HTTP server, tokenizer, models and scheduler
-on the candle tensor library, and needs no Python on the host. It is conformant and reproduces the
-owned pipeline within one 8-bit level on CPU; it binds loopback only and serves sdxl-base only.
+- **Reference** (`diffusers-sdxl`): complete Diffusers pipelines, including SDXL, ESRGAN, SVD,
+  Stable Audio Open, FLUX.1-schnell and SD3.5 Medium when their dependencies are available.
+- **Owned Python** (`owned-sdxl`): owned SDXL denoising loop and ESRGAN network; its supported
+  tasks, samplers and conditioning are advertised independently from the reference backend.
+- **Owned native** (`native-sdxl`, `ownership: engine`): a separate Rust/candle executable in
+  [native/](native/README.md), with SDXL text-to-image/image-to-image, batches and LoRA, no Python
+  dependency, and optional mutual TLS. Additional native families are not advertised.
+
+Protocol 1.4 adds capability-gated sampler selection, inpainting, explicit pixel operations,
+conditioning inputs, nonfinal SDXL previews, optional pinned MP4 encoding and explicit reference
+CPU-offload modes. The lossless video frame archive and PCM WAV remain baseline outputs.
+Nothing silently resizes an image, substitutes a model or downloads weights during serving.
+[engine-spec.md](engine-spec.md) describes the current scope; [the protocol](docs/protocol.md)
+defines request shapes and compatibility gates.
+
+CPU random-weight tests and native conformance establish executable behavior, not real-weight
+quality or GPU performance. RTX 4090 acceptance jobs are prepared. The benchmark index remains
+empty, so benchmark-gated optimization candidates are not advertised as measured improvements.
 
 ## Install
 
@@ -54,7 +53,8 @@ the installed package in `tests/` and identify themselves in snapshots/provenanc
 
 Supply a complete local `stabilityai/stable-diffusion-xl-base-1.0` Diffusers-format bundle,
 including UNet, VAE, both CLIP encoders and tokenizers, pipeline config and Euler scheduler config.
-Use safetensors weights only; Python, pickle weights and symlinks are rejected. The service does
+Use safetensors weights only; Python, pickle weights and unsafe symlinks are rejected. Immutable
+Hugging Face snapshot-to-blob links are accepted only inside their own repository cache tree. The service does
 not fetch weights, convert checkpoints during a request (conversion is the separate offline
 `convert` command below) or select a model for callers. Each local deployment is
 identified by SHA-256 of every registered file; optional upstream revision/license metadata belongs
@@ -73,8 +73,8 @@ through a protected service environment file (never a command-line argument). Th
 
 Add `--backend owned-sdxl` to run the owned pipeline instead of the reference Diffusers pipelines.
 The backend is part of the worker's identity; a supervisor's request must name the launched
-backend explicitly, and nothing reinterprets a request when the backend changes. Both backends
-accept the same bundle, options, ranges and events. They do not promise identical image bytes.
+backend explicitly, and nothing reinterprets a request when the backend changes. Both Python backends accept the shared SDXL bundle contract; their capabilities explicitly
+differ for tasks, samplers, conditioning and load options. They do not promise identical image bytes.
 
 `--port 0` chooses a free loopback port. Stdout emits one JSON startup record with protocol,
 version, random session ID, port and PID; the supervisor must still check `/v1/info` and
@@ -98,7 +98,7 @@ worker never reads caller paths or URLs. The request must state the image's real
 The default GPU options are float16, SDPA attention and no offloading. The worker only advertises
 options it applies. The reference hardware target is an RTX 4090 with 24 GiB, Linux x64 and a driver
 compatible with the locked CUDA PyTorch distribution. This target has not been hardware-certified
-in this workspace. No model weights or CUDA device are present here.
+by the automated CPU tests. Real-weight/CUDA acceptance requires the prepared hardware jobs.
 
 `--memory-budget-mb` sets PyTorch's per-process allocator budget for the selected GPU. This does
 not coordinate or terminate other GPU services. Validating or loading a bundle reports a memory
@@ -119,16 +119,9 @@ uploaded PNG and its real size, optionally `tile` (256/512/1024, 0 = whole image
 `tile_overlap`; the output is exactly input × scale, progress counts tiles, and a result over
 `limits.output_side` is refused before any work. Tiling is never chosen for you.
 
-Real-ESRGAN releases are `.pth` pickles, which the worker refuses. Converting one is an operator
-action outside the worker, in a separate throwaway environment, on a file you trust:
-
-```python
-import torch
-from safetensors.torch import save_file
-state = torch.load("RealESRGAN_x4plus.pth", map_location="cpu", weights_only=True)
-state = state.get("params_ema", state.get("params", state))
-save_file({k: v.contiguous() for k, v in state.items()}, "network.safetensors")
-```
+Real-ESRGAN releases are `.pth` pickles, which serving refuses. Use the explicit isolated
+`media-engine convert --kind esrgan-pth` workflow described under
+[offline weight migration](#offline-weight-migration) before cataloguing the safetensors output.
 
 ## Image-to-video
 
@@ -244,7 +237,7 @@ of the load identity, is never chosen by `auto` and cannot be combined with the 
 int8 weight-only needs the `inference-optimize` extra (`torchao`); the others need only torch (and
 a C++ compiler on CPU, or triton on CUDA, for inductor). Details: [protocol](docs/protocol.md#optimizations).
 
-**0.8.0 ships no benchmark**, so nothing is advertised on any device. To produce the evidence:
+**The current benchmark index has no entries**, so these candidates are not advertised on any device. To produce the evidence:
 
 ```sh
 uv sync --frozen --extra inference --extra inference-optimize
@@ -377,7 +370,8 @@ The native engine has its own tests: `cargo test --workspace --manifest-path nat
 `MEDIA_ENGINE_NATIVE=native/target/release/media-engine-native` makes `tests/test_native.py` run the
 conformance suite against the binary and compare it with `owned-sdxl` on the tiny bundle.
 Machine-readable request definitions live in [schemas/worker.schema.json](schemas/worker.schema.json).
-Engine 1.0.0 speaks `media-worker/1.3` and serves `media-worker/1.0`–`1.2` callers such as Runtime 0.1.0–0.8.0 (and 1.3 callers such as Runtime 0.9.0 and 0.10.0);
+Engine 1.1.0 Python workers speak `media-worker/1.4` and retain the 1.0–1.3 surfaces for older callers.
+The native worker's highest minor is 1.3. Runtime 1.1.0 negotiates either;
 its startup record keeps `protocol: "media-worker/1.1"` for those launchers and reports `highest_protocol`.
 `tests/serve_fixture.py --protocol media-worker/1.2` (or `1.1`) pins the fixture to an older surface.
 
@@ -389,3 +383,70 @@ your model directories, one command, and an HTML report of every feature with it
 Source is MIT licensed. Dependency licenses and model-weight license terms are separate;
 SDXL base weights carry CreativeML Open RAIL++-M terms, and Stable Video Diffusion and Stable Audio
 Open weights carry Stability AI's terms; all are supplied by the operator.
+
+## Offline weight migration
+
+The serving process continues to accept safe tensor artifacts only. Explicit operator conversion
+can migrate Real-ESRGAN `.pth` weights and Kohya SDXL LoRA files before registration:
+
+```sh
+media-engine convert --kind esrgan-pth --input RealESRGAN.pth \
+  --config rrdbnet.json --output converted-upscaler
+media-engine convert --kind lora-kohya --input style.safetensors \
+  --reference-handle sdxl-base --catalog catalog.json --output converted-style
+```
+
+`rrdbnet.json` explicitly declares the architecture, scale, channels and block dimensions used by
+Engine's ESRGAN loader. The `.pth` reader runs in a separate isolated Python process with
+`torch.load(weights_only=True)`, a timeout, CPU placement and no arbitrary pickle allow-list.
+It accepts the published `params_ema`/`params` wrapper or a bare tensor state dict and refuses
+unknown keys or shapes. This step is never invoked by model loading or a generation request.
+
+Kohya conversion supports linear SDXL UNet and dual-CLIP LoRA targets named by the reference
+bundle's local configuration. Down/up matrices become PEFT A/B matrices; alpha is preserved.
+Unsupported convolutional/LyCORIS layouts and unknown keys are errors, never silently discarded.
+The result contains safetensors and conversion provenance; existing output directories are refused.
+
+## Explicit CPU offload
+
+On a ready CUDA reference worker, protocol 1.4 advertises `offload_modes` (`none`, `model`,
+`sequential`) for the `sdxl-base`, `svd` and `stable-audio-open` families. Select a mode in load
+options; `auto` never selects one. `model` transfers whole components as needed; `sequential`
+uses Accelerate's per-submodule hooks and trades transfer overhead for lower GPU residency.
+Owned/native workers and CPU-only workers offer `none`. Offload is not combined with compilation
+or weight quantization, and a CPU fallback cannot silently reinterpret an offload request.
+Memory estimates remain conservative full-residency estimates; no measured savings are claimed.
+
+## Generation extensions in protocol 1.4
+
+The reference SDXL backend advertises exact sampler/scheduler pairs: `euler/euler`,
+`euler-ancestral/euler`, `dpmpp-2m/karras`, `ddim/ddim` and `unipc/unipc`. Owned/native SDXL
+remain Euler-only. A requested pair is never substituted. Reference `inpaint` requires an image,
+a same-size mask and prompt; white mask pixels identify the region to regenerate.
+
+`image-transform` explicitly resizes (named nearest/bilinear filter), crops, pads, composites or
+computes Canny edges (explicit ordered thresholds). Python workers execute these pixel operations
+against a registered SDXL identity; the operation does not run inference or silently alter a
+following generation request. Runtime recipes compose these operations into hires-fix or outpaint
+flows, with every geometry change named and recorded.
+
+FLUX.1-schnell (`flux-schnell`) and SD3.5 Medium (`sd35`) are reference families using the explicit
+`flow-euler/flow-match` pair. They support their advertised text/image generation and inpaint paths.
+Schnell requires guidance zero and an empty negative prompt; it is not a substitute for FLUX.1-dev.
+Approve the exact model revision and its license before local registration. Native equivalents
+remain deferred.
+
+SDXL previews are opt-in through `preview_interval` on a worker that advertises them. They are
+bounded nonfinal artifacts; they do not replace completed outputs or certify final image quality.
+For optional MP4, install `uv sync --frozen --extra inference --extra inference-video`
+(`av==14.2.0`) and explicitly select `encode_video: true` on a worker advertising the format.
+The worker keeps the original frame archive/poster and never discovers an encoder on `PATH`.
+
+Reference SDXL conditioning in 1.4 supports a verified local VAE override, textual-inversion
+embeddings for either CLIP encoder, one IP-Adapter with a required uploaded `reference_image`,
+and one ControlNet with a required uploaded `control_image` on text-to-image. Conditioning is
+part of load identity; IP-Adapter and ControlNet cannot be combined. Optional `clip_skip` is 1–2
+with Diffusers semantics (1 selects the third-from-last layer; omission uses the penultimate).
+The conditioning path requires SDPA, no offload and no quantization/compilation. Exact limits,
+files and mutually exclusive combinations are declared in the protocol; no remote model code
+or implicit component replacement is allowed.

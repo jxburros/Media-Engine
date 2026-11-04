@@ -1,6 +1,7 @@
 """Explicit test-only backend. Not packaged and never selected by the production executable."""
 
 import hashlib
+from media_engine.sampling import advertised as sampling_options
 import json
 import os
 import random
@@ -370,6 +371,27 @@ def make_converted(
     return make_bundle(root, handle, bundle_id, conversion=record, source=source)
 
 
+def make_conditioning(root, kind, handle):
+    """Protocol-only approved shape; these zero tensors are not model weights."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if kind == "vae":
+        (root/"config.json").write_text(json.dumps({"_class_name":"AutoencoderKL", "latent_channels":4, "block_out_channels":[32,64]}))
+        (root/"diffusion_pytorch_model.safetensors").write_bytes(zero_safetensors({"decoder.weight":[4,4]}))
+    elif kind == "textual-inversion":
+        (root/"embedding.safetensors").write_bytes(zero_safetensors({"embedding":[32]}))
+    else:
+        (root/"image_encoder").mkdir(exist_ok=True)
+        (root/"image_encoder/config.json").write_text(json.dumps({"model_type":"clip_vision_model"}))
+        (root/"image_encoder/model.safetensors").write_bytes(zero_safetensors({"vision.weight":[4,4]}))
+        (root/"preprocessor_config.json").write_text(json.dumps({"size":{"shortest_edge":32},"crop_size":{"height":32,"width":32}}))
+        (root/"ip_adapter.safetensors").write_bytes(zero_safetensors({"image_proj.proj.weight":[16,4],"ip_adapter.1.to_k_ip.weight":[4,4]}))
+    record = {"schema_version":1,"conditioning_id":handle,"kind":kind,"artifact_handle":handle,
+        "files":file_digests(root),"source":{"license":"test-only"}}
+    record["digest"] = digest(record)
+    return record
+
+
 class TestBackend:
     backend_id = (
         "diffusers-sdxl"  # Exercises reference protocol semantics, not inference.
@@ -408,6 +430,7 @@ class TestBackend:
         self.audio_facts = None
         self.loaded_options = None
         self.optimizations = tuple(optimizations)
+        self.conditioning = []
 
     @property
     def level(self):
@@ -443,6 +466,7 @@ class TestBackend:
             "limits": {k: LIMITS[k] for k in ("width", "height", "steps", "guidance", "strength", "adapter_scale", "size_multiple")},
             "precisions": self.precision_list,
             "tasks": ["text-to-image", "image-to-image"],
+            "sampling": sampling_options(self.level >= 4),
             "task_parameters": {
                 "text-to-image": {"inputs": ["prompt", "negative_prompt"]},
                 "image-to-image": {
@@ -465,7 +489,7 @@ class TestBackend:
         # Pinned to 1.2: exactly the 0.5.0 fixture's surface (no svd or stable-audio-open, no
         # video or audio limits or tasks).
         families = {n: f for n, f in FAMILIES.items() if f["since"] <= self.level}
-        tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values())]
+        tasks = [t for t in TASKS if any(t in f["tasks"] for f in families.values()) and (t not in ("inpaint","image-transform") or self.level >= 4)]
         newer = VIDEO_LIMITS + AUDIO_LIMITS
         limits = {k: v for k, v in LIMITS.items() if self.level >= 3 or k not in newer}
         if self.level >= 3:
@@ -476,7 +500,7 @@ class TestBackend:
             task_defaults={k: v for k, v in TASK_DEFAULTS.items() if k in tasks},
             limits=limits,
             tasks=tasks,
-            task_parameters=task_parameters(tasks),
+            task_parameters=task_parameters(tasks, list(families)),
             model_families=list(families),
             loaders=[
                 {
@@ -498,6 +522,14 @@ class TestBackend:
             advertised, unadvertised = fixture_optimizations(self.optimizations)
             caps["optimizations"] = advertised
             caps["unadvertised_optimizations"] = unadvertised
+        if self.level >= 4:
+            from media_engine.conditioning import CAPABILITIES
+            caps["controlnets"] = {"families":["sdxl-base"],"tasks":["text-to-image"],"max_controlnets":1,"scale":[0,2]}
+            caps["conditioning"] = CAPABILITIES
+            caps["clip_skip"] = [1,2]
+            for task in ("text-to-image", "image-to-image", "inpaint"):
+                if task in caps.get("task_parameters", {}):
+                    caps["task_parameters"][task]["parameters"].append("clip_skip")
         return caps
 
     def device_identity(self):
@@ -527,7 +559,10 @@ class TestBackend:
         self.loaded_estimate = self.compute_estimate(root, options, adapters, family, device)
         return self.loaded_estimate
 
-    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=()):
+    def budget_mb(self):
+        return self.memory_budget_mb
+
+    def plan(self, root, options, adapters=(), family="sdxl-base", authorized=(), estimate_mb=None):
         if options["precision"] != "auto" and not authorized:
             return {"options": dict(options), "resolutions": [], "applied_fallbacks": [], "device": self.device}
         return plan_load(
@@ -537,10 +572,13 @@ class TestBackend:
             not self.device_unavailable,
             self.precision_list,
             self.memory_budget_mb,
-            lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
+            estimate_mb or (lambda p: self.compute_estimate(root, {**options, "precision": p}, adapters, family)[
                 "value_mb"
-            ],
+            ]),
         )
+
+    def attach_controlnets(self, resolved):
+        self.controlnet = bool(resolved)
 
     def load(self, root, options, adapters=(), family="sdxl-base", device=None):
         self.loads += 1
@@ -555,12 +593,20 @@ class TestBackend:
         self.audio_facts = audio_facts(root) if family == "stable-audio-open" else None
         time.sleep(0.02)
 
+    def attach_conditioning(self, resolved):
+        from media_engine.conditioning import summaries
+        self.conditioning = summaries([entry for entry,_ in resolved])
+
     def unload(self):
+        self.conditioning = []
         self.family, self.scale, self.run_device, self.applied_fallbacks = None, None, self.device, []
         self.default_frames = self.audio_facts = None
         return {"allocated_mb": 0, "reserved_mb": 0}
 
     def generate(self, request, directory, emit, cancelled, image_path=None):
+        if request["task"] == "image-transform":
+            from media_engine.image_ops import generate
+            return generate(request,directory,emit,cancelled,image_path)
         self.generations += 1
         if request["task"] == "upscale":
             return self.upscale(request, directory, emit, cancelled, image_path)
@@ -568,9 +614,13 @@ class TestBackend:
             return self.generate_video(request, directory, emit, cancelled, image_path)
         if request["task"] == "text-to-audio":
             return self.generate_audio(request, directory, emit, cancelled)
+        if request["task"] == "inpaint":
+            assert Path(image_path["image"]).is_file() and Path(image_path["mask"]).is_file()
         if request["task"] == "image-to-image":
             # The fixture proves the handle resolves to the uploaded bytes; it does not sample.
             assert Path(image_path).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        if "reference_image" in request["inputs"]:
+            assert Path(image_path["reference_image"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
         params = request["parameters"]
         total = effective_steps(params, request["task"])
         if request["inputs"]["prompt"] == "uncancellable":
@@ -592,6 +642,8 @@ class TestBackend:
                     "total_steps": total,
                 },
             )
+            if params.get("preview_interval") and (step + 1) % params["preview_interval"] == 0:
+                emit("preview", {"png": make_png(16, 16), "width": 16, "height": 16, "step": step + 1, "kind": "latent_rgb"})
         if cancelled.is_set():
             raise Cancelled()
         emit("stage", {"stage": "decoding"})
@@ -697,6 +749,11 @@ class TestBackend:
             {"output_id": "frames", "path": archive, "mime_type": video.MIME_TYPE, "width": width, "height": height, "frames": frames, "fps": params["fps"]},
             {"output_id": "poster", "path": poster, "mime_type": "image/png", "width": width, "height": height},
         ]
+        if params.get("encode_video"):
+            from media_engine import mp4
+            encoded = Path(directory) / "video.mp4"
+            mp4.write(encoded, pngs, params["fps"], cancelled)
+            records.append({"output_id": "video", "path": encoded, "mime_type": mp4.MIME_TYPE})
         return records, {"test_fixture": True, "effective_steps": params["steps"], "frames": frames, "peak_allocated_mb": 0}
 
     def generate_audio(self, request, directory, emit, cancelled):
@@ -744,3 +801,27 @@ class TestBackend:
             "samples": length["samples"],
             "peak_allocated_mb": 0,
         }
+
+
+def make_controlnet(root,handle="fixture-controlnet"):
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    (root/"config.json").write_text(json.dumps({"_class_name":"ControlNetModel","addition_embed_type":"text_time"}))
+    (root/"diffusion_pytorch_model.safetensors").write_bytes(zero_safetensors({"controlnet.weight":[4,4]}))
+    record={"schema_version":1,"controlnet_id":handle,"artifact_handle":handle,"family":"sdxl-base","files":file_digests(root),"source":{"license":"test-only stand-in weights"}}
+    record["digest"]=digest(record)
+    return record
+
+
+def make_dit_bundle(root,family):
+    """Protocol fixture only: validated standard DiT layout with stand-in safe tensor headers."""
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    spec=FAMILIES[family]
+    (root/'model_index.json').write_text(json.dumps({'_class_name':spec['pipeline_class'],**{r:list(c) for r,c in spec['approved_classes'].items()}}))
+    for role in spec['roles']:
+        folder=root/role;folder.mkdir(exist_ok=True)
+        config={'block_out_channels':[32,64,64,64]} if role=='vae' else ({'patch_size':2} if role=='transformer' else {})
+        (folder/'config.json').write_text(json.dumps(config))
+        if role in spec['weight_roles']:(folder/'test.safetensors').write_bytes(zero_safetensors({'test.weight':[4,4]}))
+        if role.startswith('tokenizer'):(folder/'tokenizer.json').write_text('{}')
+    (root/'scheduler/scheduler_config.json').write_text(json.dumps({'_class_name':spec['scheduler_class']}))
+    return describe_bundle(root,family,'fixture-'+family,family,{'license':'test-only stand-in weights'})

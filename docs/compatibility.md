@@ -5,6 +5,41 @@ Engine release speaks which protocol minors, what it was tested against, on whic
 which families and extras, and which conformance suite version it passed. One row per release;
 rows are never edited after release except to add later test evidence.
 
+## 1.1.0 development acceptance — 2026-11-04
+
+Validated Engine code commit `c19e7cfd5158b86031c9c7b02b0b4db74636fbd3`
+and Runtime code commit `822604c1a417ee971857663926ad64c223e8f0f3`.
+Python serves minors 1.0–1.4; native serves 1.0–1.3. Both retain the backward-compatible
+startup record. Linux x64 uses Python 3.12.14, CPU torch 2.6.0 and the frozen dependency
+lock; native uses the committed Cargo lock. Test-only schema tools are separate from
+serving dependencies.
+
+| Evidence | Result |
+| --- | --- |
+| Full CPU Python inference, native conformance/oracle/TLS and packaging | [143 tests pass](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695288); one schema-validator skip in the inference environment is covered by the separate protocol job |
+| Rust workspace | 19 pass in the same CPU job |
+| Protocol, legacy minors and schema behavior | [Pass with the locked validation extra](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695319) |
+| Owned-backend dependency boundary | [Pass](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695507) |
+| CUDA compilation, dynamic dependency checks and license collection | [Pass](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787694758); compilation is not GPU inference |
+| Previous Runtime 0.10.0, commit `ff7f6ef27b6b5b07c5ebaef387005becd741ffd2` | [Full Go race suite passes](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695292) |
+| Current Runtime | [Full fixture/race/client/package checks pass](https://github.com/jxburros/Media-Runtime/actions/runs/41890913399/job/126787750393); [real acceptance passes on all three backends](https://github.com/jxburros/Media-Runtime/actions/runs/41890913399/job/126787749781) |
+| Python CUDA container | [Build and non-root offline probe pass](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695605); no GPU was present |
+
+All six jobs in [Engine CI](https://github.com/jxburros/Media-Engine/actions/runs/41890897530) and [release validation](https://github.com/jxburros/Media-Engine/actions/runs/41890898843) passed.
+
+New tiny-weight tests execute all three image tasks on FLUX.1-schnell and SD3.5,
+SDXL ControlNet and conditioning, pixel operations, optional MP4, component budget
+fallbacks and catalog confinement. They establish executable behavior, not production
+image quality or GPU memory measurements. Native remains SDXL-only; the new Python
+capabilities do not imply native support.
+
+Manual GPU workflows accept operator-approved local weights, exercise the documented
+families and generation cases, and record actual output hashes, media facts, timings
+and memory. No RTX 4090/production-weight acceptance or qualifying optimization
+benchmark was run. Release workflows default to dry-run; no production release was
+published by this development task. See [delivery status](delivery-status.md) for
+intentionally gated future increments.
+
 ## Releases
 
 | Engine | Protocol minors served | Startup record `protocol` | Runtime versions tested         | Platform tested                       | Families           | Extras                         | Conformance suite                |

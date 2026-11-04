@@ -1,9 +1,9 @@
 ---
 document_type: product_specification
-status: draft_proposal
-spec_revision: 0.2.0
+status: implemented_with_validation_gates
+spec_revision: 1.1.0
 created_at: 2026-10-26
-updated_at: 2026-10-26
+updated_at: 2026-11-04
 working_name: Media Engine
 ---
 
@@ -11,15 +11,18 @@ working_name: Media Engine
 
 Media Engine is a separately supervisable inference worker for local media generation. It loads an explicit model bundle, executes a supported pipeline, reports genuine progress and returns outputs through a versioned public protocol. It can serve Media Runtime or another local supervisor.
 
-The first implementation is a reference worker built on Diffusers and PyTorch. A project-owned pipeline and later native engine can implement the same protocol. Owning the engine does not require replacing every tensor library or GPU kernel.
+The reference worker uses Diffusers and PyTorch. A project-owned Python pipeline and a separately built Rust native engine implement the same negotiated protocol. Owning the engine does not require replacing every tensor library or GPU kernel.
 
-This specification describes proposed behavior. `MUST` defines a required behavior within its stated delivery stage. [Media Runtime](runtime-spec.md) owns persistent jobs, scheduling, recipes and application integration; this specification is authoritative for the shared worker protocol.
+This specification describes the implemented contract and its validation gates. `MUST` defines a required behavior within its stated delivery stage. [Media Runtime](https://github.com/jxburros/Media-Runtime/blob/main/runtime-spec.md) owns persistent jobs, scheduling, recipes and application integration; this specification is authoritative for the shared worker protocol.
 
 ## Delivery status
 
-Revision 0.1.0 of this specification described the reference worker. Engine 0.7.0 adds text-to-audio within protocol 1.3 (the `stable-audio-open` family on the reference backend, as 16-bit PCM WAV) to what Engine 0.6.0 delivered: protocol 1.3 with image-to-video (the `svd` family on the reference backend, as a lossless frame archive and poster), on top of what Engine 0.5.0 delivered: network mode over mutual TLS within protocol 1.2, on top of what Engine 0.4.0 delivered: protocol 1.2 (multiple outputs, upscaling, loaders and conversion, automatic settings and fallbacks, device identity and the conformance suite) on top of what Engine 0.3.0 delivered: the owned SDXL pipeline backend, `media-worker/1.1`, image-to-image and LoRA adapters; [docs/protocol.md](docs/protocol.md) is the implementation contract for what ships. Revision 0.2.0 specifies the capabilities the first revision deferred so that each has an explicit stage, protocol version and acceptance rule before implementation. The [implementation plan](docs/implementation-plan.md) orders them.
-
-| Capability                                            | Stage               | Protocol | Status in Engine 0.7.0 |
+Engine 1.1.0 implements the original reference, owned-pipeline, additional-media, optimization
+framework and native-engine stages. Python workers support protocol 1.4; the native SDXL engine
+retains protocol 1.3. The [implementation contract](docs/protocol.md) is authoritative for exact
+wire shapes. The [implementation plan](docs/implementation-plan.md) and compatibility evidence
+separate completed code from real-weight GPU acceptance and benchmark-gated advertising.
+| Capability                                            | Stage               | Protocol | Status in Engine 1.1.0 |
 | ----------------------------------------------------- | ------------------- | -------- | ---------------------- |
 | Reference worker, text-to-image, cancellation, SSE    | Reference worker    | 1.0      | Delivered              |
 | Image-to-image, owned pipeline, memory estimates      | Owned pipeline      | 1.1      | Delivered              |
@@ -33,19 +36,22 @@ Revision 0.1.0 of this specification described the reference worker. Engine 0.7.
 | Image-to-video task and the `svd` family              | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
 | Text-to-audio task and the `stable-audio-open` family | Additional media    | 1.3      | Delivered (reference backend, CPU-tested) |
 | Targeted optimization options                         | Optimization        | 1.3      | Delivered (none advertised until benchmarked on the reference hardware) |
-| Owned native engine and protocol conformance suite    | Owned engine        | 1.x      | Delivered (sdxl-base, loopback, CPU-tested; suite delivered) |
+| Owned native engine and protocol conformance suite    | Owned engine        | 1.3      | Implemented (SDXL, mutual TLS, CPU/native conformance evidence) |
+| Sampler pairs, inpainting, pixel operations, previews and optional MP4 | Generation extensions | 1.4 | Implemented with per-backend capability gates |
+| FLUX.1-schnell and SD3.5 Medium reference families | Generation extensions | 1.4 | Implemented; approved local weights required |
+| Conditioning components and explicit CPU offload | Generation extensions | 1.4 | Implemented; backend/family/device limits apply |
 
 Arbitrary graph import, executable recipe code, plugin marketplaces, in-process multi-device execution and model downloading remain outside this specification. Nothing in a later stage weakens a rule stated for an earlier one.
 
 ## Product sheet
 
-| Property               | Proposed specification                                                                       |
+| Property               | Implemented specification                                                                       |
 | ---------------------- | -------------------------------------------------------------------------------------------- |
 | Primary caller         | A local runtime or process supervisor; a remote supervisor over mutual TLS in network mode   |
-| Delivered operations   | Text-to-image and image-to-image on one supported SDXL base pipeline, with LoRA adapters      |
-| Planned operations     | Upscaling, image-to-video and text-to-audio, each a separately advertised task and family    |
+| Delivered operations   | Advertised image generation/editing, inpaint, pixel operations, upscale, video and audio |
+| Acceptance gates       | Real-weight RTX 4090 validation; measured optimization claims; additional native families |
 | Initial implementation | Python worker with pinned Diffusers, PyTorch and required local components                   |
-| Future implementation  | Owned pipeline/server, potentially native code, using selected compute libraries             |
+| Owned implementations  | Python SDXL loop and ESRGAN; Rust/candle native SDXL server and models |
 | Process scope          | One device and one loaded pipeline bundle, including its component models                    |
 | Concurrency            | One active execution; no pending-job queue; several processes serve several devices          |
 | Protocol               | Versioned loopback HTTP/JSON, SSE events, opaque input/output handles; TLS in network mode   |
@@ -97,9 +103,14 @@ From protocol 1.2 the worker advertises `capabilities.loaders`, a list of `{form
 | `sdxl-base`         | `diffusers-safetensors`  | unet, vae, text_encoder, text_encoder_2, tokenizer, tokenizer_2, scheduler   | text/image→image | Delivered        |
 | `esrgan`            | `single-file-safetensors` | network, configuration                                                       | upscale          | Additional tasks |
 | `svd`               | `diffusers-safetensors`  | unet, vae, image_encoder, feature_extractor, scheduler                       | image-to-video   | Additional media |
-| `stable-audio-open` | `diffusers-safetensors`  | transformer, vae, text_encoder, tokenizer, projection_model, scheduler       | text-to-audio    | Additional media |
+| `stable-audio-open` | `diffusers-safetensors` | transformer, vae, text_encoder, tokenizer, projection_model, scheduler | text-to-audio | Delivered |
+| `flux-schnell` | `diffusers-safetensors` | transformer, vae, CLIP/T5 encoders and tokenizers, scheduler | text/image generation, inpaint | Reference, 1.4 |
+| `sd35` | `diffusers-safetensors` | transformer, vae, dual CLIP and T5 encoders/tokenizers, scheduler | text/image generation, inpaint | Reference, 1.4 |
 
-Every family keeps the existing rules: safetensors weights only, no Python or pickle weights, no symlinks, per-file SHA-256 digests, role-prefixed component digests and a canonical bundle digest. The `single-file-safetensors` format is one weights file plus one configuration file under one catalog handle; it is a layout, not permission to load arbitrary checkpoints. A single-file SDXL checkpoint is not loadable in that format; it is converted first (see [Single-file checkpoint conversion](#single-file-checkpoint-conversion)).
+Every family keeps the existing rules: safetensors weights only, no Python or pickle weights, no unsafe symlinks, per-file SHA-256 digests, role-prefixed component digests and a canonical bundle digest. The `single-file-safetensors` format is one weights file plus one configuration file under one catalog handle; it is a layout, not permission to load arbitrary checkpoints. A single-file SDXL checkpoint is not loadable in that format; it is converted first (see [Single-file checkpoint conversion](#single-file-checkpoint-conversion)).
+
+Immutable Hugging Face cache snapshot links are allowed only when they resolve to regular files
+inside the same repository's blobs directory; other symlinks remain refused.
 
 A bundle's `pipeline` names its primary task. From 1.2 the worker reports `loaded_bundle.tasks`, the tasks the loaded family can serve, and an execution whose task the loaded bundle cannot serve fails with `unsupported` and field `task`.
 
@@ -107,7 +118,7 @@ A bundle's `pipeline` names its primary task. From 1.2 the worker reports `loade
 
 Conversion is an explicit, offline operator action performed by the `media-engine convert` subcommand, never by a load request. It reads one single-file SDXL safetensors checkpoint, takes architecture, scheduler and tokenizer configuration from an approved reference bundle handle in the launch catalog, and writes a complete Diffusers-format bundle directory containing safetensors components only.
 
-- Conversion MUST refuse pickle, Python or unknown-key checkpoints and MUST NOT download configuration, tokenizers or missing components. Keys it cannot map fail the conversion with the key names.
+- SDXL single-file conversion MUST refuse pickle, Python and unknown-key checkpoints and MUST NOT download configuration, tokenizers or missing components. The separate ESRGAN migration command may read approved `.pth` data only in its isolated, restricted `weights_only=True` subprocess before producing safetensors; serving still refuses pickle. Keys or shapes that cannot be mapped fail conversion.
 - The output directory contains `conversion.json`: source file digest, reference bundle digest, converter package versions and the mapped key counts per role. The supervisor's catalog inspection surfaces this provenance.
 - The converted directory is then approved, catalogued and registered like any other bundle; the worker treats it identically and cannot tell it apart except through `conversion.json`.
 - Precision is preserved unless the operator passes an explicit precision; the recorded output digests make the result identity-stable.
@@ -149,9 +160,10 @@ Each minor is additive. A worker lists every minor it serves in `supported_proto
 | 1.0   | Text-to-image, load/unload operations, single-flight executions, SSE resume, cancellation, one `image` output                                                                                   |
 | 1.1   | `supported_protocols`, image-to-image, `POST /v1/inputs`, `memory_estimate`, `effective_steps`, `owned-sdxl`, LoRA `adapters` on the load body                                                  |
 | 1.2   | Multiple outputs and `count`, `upscale`, `loaders`/`families`, `auto` options with `resolutions`, `authorized_fallbacks`, `device_identity`, network mode fields, `loaded_bundle.tasks`           |
-| 1.3   | `image-to-video` with `video`/`poster` outputs, `text-to-audio` with `audio` output, per-task `output_formats`, optimization options advertised under `capabilities.optimizations`               |
+| 1.3 | `image-to-video` with `frames`/`poster` outputs, `text-to-audio` with `audio` output, per-task `output_formats`, benchmark-gated optimization options |
+| 1.4 | Advertised sampler pairs, inpaint, explicit pixel operations, conditioning, previews, optional MP4, reference flow-model families and explicit offload |
 
-A 1.1 caller against a 1.3 worker sees 1.1 behavior exactly: one `image` output, no new tasks, no new options. The supervisor's compatibility record lists which minor each runtime release negotiates.
+A 1.1 caller against a newer worker sees 1.1 behavior exactly: one `image` output, no new tasks, no new options. The supervisor's compatibility record lists which minor each runtime release negotiates.
 
 ### Process launch and discovery
 
@@ -259,7 +271,7 @@ Each task below is advertised separately in `capabilities.tasks`, has its own fa
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | Inputs     | `image` (an `input_id`); no prompt                                                                                            |
 | Parameters | `tile` (0 = whole image, or an advertised tile size), `tile_overlap`; width/height MUST equal the input; no seed             |
-| Output     | `image` as PNG at exactly input size × `scale`; `limits.output_side` bounds the result (proposed 8192)                       |
+| Output     | `image` as PNG at exactly input size × `scale`; `limits.output_side` bounds the result (8192 on the current Python implementation)                       |
 | Stages     | `upscaling` with per-tile progress, then `saving`                                                                             |
 | Memory     | Estimate from network parameters plus the largest tile's activations at the load precision; tiling is explicit, never automatic |
 
@@ -293,6 +305,26 @@ Frame count and frame rate are explicit parameters recorded in the output record
 
 The output record carries sample rate, channel count and actual duration. Requested duration is honored exactly up to the model's latent granularity; the effective duration is reported, never silently trimmed to a limit.
 
+### Protocol 1.4 generation extensions
+
+Each extension is advertised per backend/task. Inpaint uses an image and same-size mask, with
+white selecting the regenerated region; it never silently resizes either. `image-transform`
+performs explicit resize, crop, pad, composite or Canny preprocessing with validated geometry,
+filters and thresholds. Runtime, not Engine, chains these into hires-fix and outpaint recipes.
+
+Reference SDXL accepts the advertised Euler, Euler ancestral, DPM++ 2M/Karras, DDIM and UniPC
+pairs; owned/native SDXL remain Euler-only. FLUX.1-schnell and SD3.5 Medium use their explicit
+flow-Euler/flow-match contract. Reference SDXL supports verified local VAE overrides, textual inversion, IP-Adapter and ControlNet
+conditioning, plus explicit CLIP skip. Components are pinned load identities, not executable model
+code. IP-Adapter requires a reference image; ControlNet requires a control image, and those two
+paths cannot be combined. Conditioning uses SDPA without offload, quantization or compilation. Unsupported families, targets or combinations fail validation.
+
+Previews are opt-in bounded nonfinal outputs. MP4 uses the optional pinned `inference-video`
+extra and explicit `encode_video`; lossless frames/poster remain available. Explicit reference
+CPU offload is advertised only for supported CUDA family/device combinations and is never
+selected by `auto` or silently changed by fallback. Exact fields and limits live in the
+[wire contract](docs/protocol.md).
+
 ## Reference implementation
 
 The first worker wraps the supported Diffusers pipeline in an isolated, pinned Python environment. It owns the HTTP lifecycle and adapts library callbacks into the public execution events. Blocking GPU work must not block health, status or cancellation handling. The first implementation supports one active inference thread/process path and serializes access to its pipeline.
@@ -318,11 +350,11 @@ Preserve request semantics across implementations. Backend-specific features are
 
 ### Protocol conformance suite
 
-Before any backend beyond the two delivered ones is advertised, the engine repository MUST provide a conformance suite that runs against any worker URL and credential: discovery, negotiation of every listed minor, validation, load/unload, single-flight and idempotent attempts, SSE resume, cancellation at each checkpoint, output finalization and digest, retention limits and error privacy. A backend or native engine is "conformant" when the suite passes with no skipped section; the compatibility record cites the suite version.
+Every advertised backend MUST be validated by a conformance suite that runs against any worker URL and credential: discovery, negotiation of every listed minor, validation, load/unload, single-flight and idempotent attempts, SSE resume, cancellation at each checkpoint, output finalization and digest, retention limits and error privacy. A backend or native engine is "conformant" when the suite passes with no skipped section; the compatibility record cites the suite version.
 
 ### Owned native engine
 
-The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. Its dependency ledger is short by design: tensor execution and GPU kernels (candle and cudarc), TLS (rustls) and deflate for PNG. The HTTP/1.1 and SSE server, the CLIP tokenizer, the WAV and ZIP writers and all validation are owned code, as they are in the Python worker's standard-library server. The recommended implementation is Rust on the candle tensor library with custom CUDA kernels through cudarc where the optimization stage needs them; the decision is recorded when work starts. Go is not a candidate for the engine because GPU kernels cannot be written in it, and the control plane that suits Go is Media Runtime. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
+The owned engine is a separately built executable implementing `media-worker` directly. It MUST pass the conformance suite, expose the same launch contract (`--probe`, startup record, catalog, private directory, inherited credential) and advertise `backend_id: native-sdxl` with `ownership: engine`. It need not reproduce the Python package's internals; it keeps bundle identity, digests and family rules unchanged so the same registration serves both. Its dependency ledger is short by design: tensor execution and GPU kernels (candle and cudarc), TLS (rustls) and deflate for PNG. The HTTP/1.1 and SSE server, the CLIP tokenizer, the WAV and ZIP writers and all validation are owned code, as they are in the Python worker's standard-library server. The implemented native engine uses Rust and candle. GPU kernel optimization remains evidence-gated; Runtime owns the separate Go control plane. The Python reference backend remains supported and is the behavioral oracle for the semantics tests.
 
 ### Targeted optimization
 
@@ -334,8 +366,16 @@ Publish worker/API versions independently from Media Runtime. A protocol-major m
 
 The supervisor interacts through public startup, discovery and HTTP behavior. It does not import worker internals or depend on private Diffusers classes. The runtime translates engine events into its durable job model; Studio sees the runtime contract and requires no direct worker credentials or tensor access.
 
-## Decisions and next steps
+## Recorded decisions and acceptance gates
 
-The delivered reference target is one SDXL base bundle on Linux x64/NVIDIA; the recorded pins are in the repository's implementation decisions. Open decisions for the deferred stages, to be recorded when each starts: the exact upscaler, video and audio reference weights and their licenses; whether an optional MP4 encoder extra is worth shipping at all given the lossless frame archive; confirmation of Rust for the native engine; the first optimization worth advertising; and the certificate tooling expected of operators in network mode.
+The reference family choices, Rust native engine, operator TLS tooling, explicit pixel operations,
+optional pinned PyAV encoder and offline conversion commands are recorded in
+[implementation decisions](docs/decisions.md). Backend IDs remain stable as the advertised
+reference family set expands. Additional native families are deferred until generation coverage
+and real-weight GPU evidence justify them.
 
-The next implementation step is protocol 1.2 in the Python worker: multiple outputs, the upscale task with the `esrgan` family and loader capabilities, the conversion subcommand, automatic settings with authorized fallbacks and device identity, together with the conformance suite that every later backend must pass. The [implementation plan](docs/implementation-plan.md) sequences the rest.
+The original implementation stages are built. Automated CPU tests, fixtures and protocol
+conformance do not establish real model quality, CUDA memory fit or throughput. Prepared RTX 4090
+jobs require approved weights; only their recorded evidence may justify hardware acceptance or
+benchmark-gated optimization advertising. See the [compatibility record](docs/compatibility.md)
+and [review action items](docs/reviews/2026-10-31-action-items.md).

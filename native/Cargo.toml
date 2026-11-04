@@ -1,6 +1,6 @@
 [package]
 name = "media-engine-native"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Owned native media-worker engine (native-sdxl) for Media Runtime"
 license = "MIT"
@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 sdxl = { path = "sdxl", package = "media-engine-sdxl" }
+rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "=2.2.0"
 
 [features]
 cuda = ["sdxl/cuda"]

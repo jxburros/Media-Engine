@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 pub const BACKEND_ID: &str = "native-sdxl";
 pub const OWNERSHIP: &str = "engine";
@@ -97,7 +98,7 @@ impl Backend {
                 "uncertainty" => "no bundle validated or loaded in this session",
             }),
             // Compiled in, not discovered: the native binary's whole third-party set.
-            "dependencies" => obj! {"candle-core" => "0.9.2", "png" => "0.18.1"},
+            "dependencies" => obj! {"candle-core" => "0.9.2", "png" => "0.18.1", "rustls" => "0.23.35", "rustls-pemfile" => "2.2.0"},
             "max_concurrency" => 1i64,
             "optimizations" => Value::Array(vec![]),
             // bfloat16 runs on candle; nothing else is implemented by this engine yet.
@@ -293,9 +294,27 @@ pub struct State {
     pub active: Option<String>,
 }
 
+#[derive(Default)]
+struct Metrics {
+    executions: BTreeMap<(String, String), u64>,
+    phases: BTreeMap<(String, String), f64>,
+    phase: Option<(String, String, Instant)>,
+    load_seconds: f64,
+    busy_refusals: u64,
+}
+
+impl Metrics {
+    fn finish_phase(&mut self) {
+        if let Some((task, phase, started)) = self.phase.take() {
+            *self.phases.entry((task, phase)).or_default() += started.elapsed().as_secs_f64();
+        }
+    }
+}
+
 pub struct Worker {
     pub directory: PathBuf,
     pub catalog: BTreeMap<String, String>,
+    pub catalog_path: Option<PathBuf>,
     pub protocols: Vec<String>,
     pub session_id: String,
     pub max_retained: usize,
@@ -303,6 +322,7 @@ pub struct Worker {
     pub max_input_mb: u64,
     pub transport: Value,
     inner: Mutex<State>,
+    metrics: Mutex<Metrics>,
 }
 
 fn private_dir(path: &Path) -> std::io::Result<()> {
@@ -324,12 +344,14 @@ impl Worker {
         Ok(Worker {
             directory,
             catalog,
+            catalog_path: None,
             protocols: c::SUPPORTED_PROTOCOLS.iter().map(|s| s.to_string()).collect(),
             session_id: crate::sys::uuid4(),
             max_retained,
             max_storage_mb,
             max_input_mb,
             transport,
+            metrics: Mutex::new(Metrics::default()),
             inner: Mutex::new(State {
                 backend,
                 state: "ready".into(),
@@ -345,6 +367,36 @@ impl Worker {
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn current_catalog(&self) -> Result<BTreeMap<String, String>> {
+        let Some(path) = &self.catalog_path else { return Ok(self.catalog.clone()) };
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).and_then(|f| f.take((crate::http::MAX_JSON_BYTES + 1) as u64).read_to_end(&mut bytes))
+            .map_err(|_| fail(503, "catalog_unavailable", None))?;
+        if bytes.len() > crate::http::MAX_JSON_BYTES { return Err(fail(503, "catalog_unavailable", None)); }
+        crate::json::parse(&bytes).ok().and_then(|v| v.as_object().and_then(|m| {
+            m.iter().map(|(k, v)| v.as_str().filter(|p| p.starts_with('/')).map(|p| (k.clone(), p.to_string()))).collect::<Option<BTreeMap<_, _>>>()
+        })).ok_or_else(|| fail(503, "catalog_unavailable", None))
+    }
+
+    pub fn record_busy_refusal(&self) {
+        self.metrics.lock().unwrap().busy_refusals += 1;
+    }
+
+    pub fn metrics_text(&self) -> String {
+        let s = self.lock();
+        let metrics = self.metrics.lock().unwrap();
+        let mut text = format!("# TYPE media_engine_executions_total counter\n# TYPE media_engine_phase_seconds_total counter\n# TYPE media_engine_load_seconds_total counter\n# TYPE media_engine_busy_refusals_total counter\n# TYPE media_engine_busy gauge\nmedia_engine_load_seconds_total {:.9}\nmedia_engine_busy_refusals_total {}\nmedia_engine_busy {}\n", metrics.load_seconds, metrics.busy_refusals, u8::from(["busy", "loading", "unloading"].contains(&s.state.as_str())));
+        for ((task, state), count) in &metrics.executions {
+            text.push_str(&format!("media_engine_executions_total{{task=\"{}\",state=\"{}\"}} {}\n", task, state, count));
+        }
+        for ((task, phase), duration) in &metrics.phases {
+            text.push_str(&format!("media_engine_phase_seconds_total{{task=\"{}\",phase=\"{}\"}} {:.9}\n", task, phase, duration));
+        }
+        // Candle does not report allocated GPU memory: omit this gauge rather than invent zero.
+        text
     }
 
     fn capabilities_of(&self, s: &State) -> Value {
@@ -444,9 +496,10 @@ impl Worker {
             }
             Some(_) => return Err(bad("invalid_request", "authorized_fallbacks")),
         };
-        let root = c::bundle_path(&map["bundle"], &self.catalog, verify, &version)?;
+        let catalog = self.current_catalog()?;
+        let root = c::bundle_path(&map["bundle"], &catalog, verify, &version)?;
         let empty = Value::Array(vec![]);
-        let adapters = c::validate_adapters(map.get("adapters").unwrap_or(&empty), &self.catalog, &version, verify)?;
+        let adapters = c::validate_adapters(map.get("adapters").unwrap_or(&empty), &catalog, &version, verify)?;
         let plan = self.lock().backend.plan(&root, options, &adapters, &authorized)?;
         Ok((root, adapters, plan))
     }
@@ -493,7 +546,7 @@ impl Worker {
     pub fn validate_adapters_only(&self, body: &Value) -> Result<Value> {
         strict(body, &["protocol", "adapters"], &[])?;
         let version = c::protocol(body, &self.protocols)?;
-        let adapters = c::validate_adapters(&body["adapters"], &self.catalog, &version, true)?;
+        let adapters = c::validate_adapters(&body["adapters"], &self.current_catalog()?, &version, true)?;
         Ok(obj! {"valid" => true, "adapters" => Self::adapter_reports(&adapters)})
     }
 
@@ -544,6 +597,7 @@ impl Worker {
     }
 
     fn run_control(&self, operation_id: &str, action: &str, body: &Value) {
+        let started = Instant::now();
         let outcome = (|| -> std::result::Result<(), WorkerError> {
             let measurements = self.unload_backend();
             {
@@ -611,6 +665,7 @@ impl Worker {
             self.update_operation(&mut s, operation_id, fields);
             Ok(())
         })();
+        if action == "load" { self.metrics.lock().unwrap().load_seconds += started.elapsed().as_secs_f64(); }
         if let Err(e) = &outcome {
             self.unload_backend();
             let mut s = self.lock();
@@ -789,6 +844,15 @@ impl Worker {
         e.events.push(event);
         if kind == "stage" {
             e.stage = data["stage"].as_str().unwrap_or("").to_string();
+            let phase = if ["encoding", "sampling", "decoding", "packaging", "saving", "upscaling"].contains(&e.stage.as_str()) { e.stage.as_str() } else { "other" };
+            let mut metrics = self.metrics.lock().unwrap();
+            metrics.finish_phase();
+            metrics.phase = Some((e.task.clone(), phase.to_string(), Instant::now()));
+        }
+        if kind == "state" && data["state"].as_str().is_some_and(|state| TERMINAL.contains(&state)) {
+            let mut metrics = self.metrics.lock().unwrap();
+            metrics.finish_phase();
+            *metrics.executions.entry((e.task.clone(), data["state"].as_str().unwrap().to_string())).or_default() += 1;
         }
         if kind == "progress" {
             e.progress = data;
