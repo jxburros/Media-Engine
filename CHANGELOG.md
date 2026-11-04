@@ -1,17 +1,23 @@
 # Changelog
 
-## 1.1.0 — 2026-11-04 (development)
+## 1.1.0 — 2026-11-04
 
-Protocol 1.4 adds explicitly selected sampling, inpainting, deterministic image operations and
-optional MP4 output on the reference/fixture paths. Native remains protocol1.3 and gains mutual
-TLS, authenticated metrics and bounded HTTP/JSON handling. Additional work includes ephemeral
-previews, a load-scoped text cache, file-level artifact handles, offline ESRGAN/Kohya conversion,
-explicit CPU offload and shared release/CI/GPU validation jobs.
+Protocol 1.4 adds named sampling pairs, FLUX.1-schnell/SD3.5 image generation and
+inpainting, explicit pixel operations/Canny, ControlNet, VAE/textual-inversion/
+IP-Adapter conditioning, CLIP skip, previews and optional pinned H.264 MP4 encoding.
+Verified load identities include components, scales and options; memory admission
+accounts for resident components and authorized fallbacks. Add explicit CUDA
+CPU-offload modes, bounded text-encoding caching and offline ESRGAN/Kohya conversion.
 
-Validation so far: baseline100 Python tests (2 native opt-in skips), Rust17, native conformance
-and owned-pipeline oracle2, serving7, previews/cache3, conversions3 and offload2 passed on CPU.
-The broader generation backlog, schema/conformance updates and final integrated validation are
-still in development in this PR. GPU jobs are prepared; real-weight/CUDA results are not claimed.
+Native remains protocol 1.3 and gains mutual TLS, authenticated metrics, bounded
+HTTP parsing, confined Hugging Face snapshots and individual LoRA files. CI validates
+frozen dependencies, schemas, tiny-weight CPU inference, native conformance/oracles,
+CUDA compilation, packaging and previous-Runtime compatibility. Shared release
+workflows and configurable real-weight GPU evidence jobs are prepared.
+
+CPU/native tests and CUDA compilation pass; see [the compatibility record](docs/compatibility.md)
+for immutable tested commits and job links. No GPU inference or production-weight
+quality/benchmark result is claimed. Production releases remain a manual operation.
 
 ## 1.0.0 — 2026-10-31
 

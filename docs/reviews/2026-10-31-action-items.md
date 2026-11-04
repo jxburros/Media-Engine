@@ -18,7 +18,7 @@ Items marked **(decision)** wait on a decision in section D.
 
 ## A. P0: prove it works
 
-- [ ] **A1. Continuous integration.** Add `.github/workflows/ci.yml` running:
+- [x] **A1. Continuous integration.** Add `.github/workflows/ci.yml` running:
   - `PYTHONPATH=src python -m unittest discover -s tests -v` without the inference extra
   - the same with `uv sync --frozen --extra inference --extra inference-audio` on CPU torch, so the
     tiny random-weight bundles run
