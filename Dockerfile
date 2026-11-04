@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12.14-slim-bookworm AS python-base
 FROM python-base AS build
+# Bound retries and resume interrupted large CUDA wheels before checking hashes.
+# These build-only settings do not propagate to the runtime image.
+ENV PIP_RETRIES=5 PIP_RESUME_RETRIES=5 PIP_DEFAULT_TIMEOUT=60
 WORKDIR /source
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src src
 RUN --mount=type=secret,id=proxy_ca \
     if [ -f /run/secrets/proxy_ca ]; then export PIP_CERT=/run/secrets/proxy_ca SSL_CERT_FILE=/run/secrets/proxy_ca; fi; \
-    pip install --no-cache-dir uv==0.9.5 && uv export --frozen --no-dev --extra inference --extra inference-audio --extra inference-optimize --extra inference-video --no-emit-project --format requirements-txt > requirements.txt && \
+    python -m pip install --no-cache-dir pip==25.2 uv==0.9.5 && uv export --frozen --no-dev --extra inference --extra inference-audio --extra inference-optimize --extra inference-video --no-emit-project --format requirements-txt > requirements.txt && \
     pip wheel --no-deps --wheel-dir /wheels . && \
     pip wheel --require-hashes --wheel-dir /wheels -r requirements.txt
 FROM python-base AS runtime

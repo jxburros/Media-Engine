@@ -19,6 +19,11 @@ for the `release` environment; its name alone does not establish protection. The
 profile verifies SHA-256 and GitHub upload metadata; it is not a signed updater protocol.
 No release was published by implementing these workflows.
 
+The Python image builder pins pip 25.2 and uv 0.9.5. Interrupted wheel downloads
+can resume with at most five attempts and a 60-second socket timeout. The builder
+continues to require the frozen lockfile's hashes; download recovery never accepts
+different artifact bytes. The runtime image installs its wheels offline.
+
 ## GPU jobs
 
 Provision a trusted runner with labels `self-hosted, linux, x64, media-gpu`, an RTX 4090,

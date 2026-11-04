@@ -2,6 +2,9 @@
 
 ## 1.1.0 — 2026-11-04
 
+Container builds pin pip 25.2 and use bounded resumable downloads for large CUDA
+wheels. Incomplete transfers retry without relaxing the frozen SHA-256 checks.
+
 Protocol 1.4 adds named sampling pairs, FLUX.1-schnell/SD3.5 image generation and
 inpainting, explicit pixel operations/Canny, ControlNet, VAE/textual-inversion/
 IP-Adapter conditioning, CLIP skip, previews and optional pinned H.264 MP4 encoding.

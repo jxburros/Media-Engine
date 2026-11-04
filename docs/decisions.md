@@ -1,5 +1,12 @@
 # Implementation decisions and dependency ledger
 
+The container build stage pins `pip==25.2` for Content-Length-aware download
+resumption. Both connection and resume retries are bounded at five, with a 60-second
+socket timeout. This addresses truncated large CUDA-wheel transfers that pip 25.0.1
+reported as hash mismatches. The frozen requirements still require SHA-256 matches;
+genuine content mismatches fail. Pip is build tooling, not an inference dependency,
+and these retry settings do not propagate to the runtime image.
+
 Runtime-wide decisions for 0.1.0 through 0.3.0 are recorded in Media Runtime's
 `docs/decisions.md`. This file holds the dependency ledger the dependency policy in
 [engine-spec.md](../engine-spec.md#dependency-policy) requires and an entry per release from
